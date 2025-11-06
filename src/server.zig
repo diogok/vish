@@ -8,8 +8,8 @@ pub const ListenOptions = struct {
     read_timeout_in_millis: u32 = 1000,
     write_timeout_in_millis: u32 = 1000,
 
-    read_buffer_size: usize = 4 * 1024,
-    write_buffer_size: usize = 4 * 1024,
+    read_buffer_size: usize = 1 * 1024,
+    write_buffer_size: usize = 1 * 1024,
 };
 
 pub const Server = struct {
