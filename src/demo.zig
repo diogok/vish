@@ -2,7 +2,7 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer std.debug.assert(gpa.deinit() != .leak);
     const allocator = gpa.allocator();
-    //const allocator = std.heap.page_allocator;
+    //const allocator = std.heap.smp_allocator; // for a faster allocator
 
     const ip = "127.0.0.1";
     const port: u16 = 8080;

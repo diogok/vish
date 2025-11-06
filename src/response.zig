@@ -105,8 +105,10 @@ pub const Response = struct {
         writer: *std.Io.Writer,
         body: []const u8,
     ) !void {
-        if (!self.sent_headers) {
+        if (!self.sent_status) {
             try self.sendStatus();
+        }
+        if (!self.sent_headers) {
             try self.sendHeaders();
         }
         _ = try writer.write(body);
