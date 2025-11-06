@@ -23,7 +23,7 @@ pub const Method = enum {
                 return error.InvalidHTTPMethod;
             }
         } else {
-            return error.InvalidHTTPMethod;
+            return error.NoData;
         }
     }
 

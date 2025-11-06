@@ -152,7 +152,9 @@ pub const Connection = struct {
 
     pub fn next(self: @This()) !?Request {
         return Request.read(self.server.allocator, self.net_reader.interface()) catch |err| {
-            if (self.net_reader.getError()) |net_err| {
+            if (err == error.NoData) {
+                return null;
+            } else if (self.net_reader.getError()) |net_err| {
                 switch (net_err) {
                     error.WouldBlock, // timeout waiting
                     error.ConnectionResetByPeer, // disconnect by client

@@ -1,4 +1,4 @@
-pub const Loop = struct {
+pub const ThreadPoolLoop = struct {
     allocator: std.mem.Allocator,
 
     thread_pool: *std.Thread.Pool,
@@ -128,6 +128,58 @@ pub const Loop = struct {
         }
     }
 };
+
+pub const SingleThreadLoop = struct {
+    allocator: std.mem.Allocator,
+    active: bool,
+
+    pub fn init(allocator: std.mem.Allocator) !@This() {
+        return @This(){
+            .allocator = allocator,
+            .active = false,
+        };
+    }
+
+    pub fn deinit(self: *@This()) void {
+        self.stop();
+    }
+
+    pub fn stop(self: *@This()) void {
+        self.active = false;
+    }
+
+    pub fn run(
+        self: *@This(),
+        server: *Server,
+        handler: *Handler,
+    ) !void {
+        self.active = true;
+        while (self.active) {
+            if (try server.accept()) |connection| {
+                defer connection.deinit();
+                connection: while (self.active) {
+                    if (try connection.next()) |req| {
+                        defer req.deinit(self.allocator);
+                        var res = Response.fromRequest(req);
+                        try handler.handle(connection, req, &res);
+                        try connection.writer().flush();
+                        if (std.ascii.eqlIgnoreCase(req.headers.connection, "close") or
+                            std.ascii.eqlIgnoreCase(res.headers.connection, "close"))
+                        {
+                            break :connection;
+                        }
+                    } else {
+                        break :connection;
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn wait(_: *@This()) void {}
+};
+
+pub const Loop = if (@import("builtin").single_threaded) SingleThreadLoop else ThreadPoolLoop;
 
 pub fn runAndWait(
     allocator: std.mem.Allocator,
