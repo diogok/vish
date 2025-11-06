@@ -1,0 +1,13 @@
+.{
+    .name = .http,
+    .fingerprint = 0x97780db2deb06af0,
+    .version = "0.0.0",
+    .dependencies = .{},
+    .paths = .{
+        "src",
+        "README.md",
+        "LICENSE",
+        "build.zig",
+        "build.zig.zon",
+    },
+}
