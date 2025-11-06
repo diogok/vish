@@ -20,7 +20,7 @@ pub const MyHandler = struct {
         req: http.Request,
         res: *http.Response,
     ) http.HandleError!void {
-        log.info("Request: {any}", .{req});
+        log.debug("Request: {any}", .{req});
 
         res.body = "hello";
 
@@ -34,7 +34,6 @@ const log = std.log.scoped(.demo);
 
 pub const std_options: std.Options = .{
     .log_scope_levels = &[_]std.log.ScopeLevel{
-        //.{ .scope = .demo, .level = .err },
-        //.{ .scope = .http, .level = .err },
+        .{ .scope = .http, .level = .err },
     },
 };

@@ -40,20 +40,14 @@ pub const Loop = struct {
         self.active = true;
         self.thread_pool.spawnWg(self.wait_group, @This().waitDefaultSignal, .{ self, server });
         self.thread_pool.spawnWg(self.wait_group, @This().accept, .{ self, server, handler });
-        //_ = try std.Thread.spawn(.{}, @This().waitDefaultSignal, .{ self, server });
-        //_ = try std.Thread.spawn(.{}, @This().accept, .{ self, server, handler });
     }
 
     pub fn wait(self: *@This()) void {
         self.thread_pool.waitAndWork(self.wait_group);
-        //self.wait_group.wait();
         self.active = false;
     }
 
     fn waitDefaultSignal(self: *@This(), server: *Server) void {
-        //self.wait_group.start();
-        //defer self.wait_group.finish();
-
         // TODO: what about when not using default signals?
         log.info("Waiting on default signal", .{});
         signal.wait();
@@ -68,8 +62,9 @@ pub const Loop = struct {
         server: *Server,
         handler: *Handler,
     ) void {
-        //self.wait_group.start();
-        //defer self.wait_group.finish();
+        log.debug("Accepting connections", .{});
+        defer log.debug("Done accepting connections", .{});
+
         while (self.active) {
             log.debug("Waiting connection...", .{});
             const connection = server.accept() catch |err| {
@@ -87,20 +82,8 @@ pub const Loop = struct {
                         handler,
                     },
                 );
-                //_ = std.Thread.spawn(
-                //    .{},
-                //    @This().onConnection,
-                //    .{
-                //        self,
-                //        conn,
-                //        handler,
-                //    },
-                //) catch |err| {
-                //    log.err("Failed to spawn thread for connection: {any}", .{err});
-                //};
             }
         }
-        log.info("Done accepting connections", .{});
     }
 
     fn onConnection(
@@ -108,11 +91,9 @@ pub const Loop = struct {
         connection: Connection,
         handler: *Handler,
     ) void {
-        //self.wait_group.start();
-        //defer self.wait_group.finish();
-
         log.info("Connection started", .{});
         defer connection.deinit();
+        defer log.info("Done with connection", .{});
 
         while (self.active) {
             const request = connection.next() catch |err| {
@@ -136,8 +117,8 @@ pub const Loop = struct {
                     log.err("Writer flush error: {any}", .{err});
                 };
 
-                if (!std.ascii.eqlIgnoreCase(req.headers.connection, "keep-alive") or
-                    !std.ascii.eqlIgnoreCase(res.headers.connection, "keep-alive"))
+                if (std.ascii.eqlIgnoreCase(req.headers.connection, "close") or
+                    std.ascii.eqlIgnoreCase(res.headers.connection, "close"))
                 {
                     return;
                 }
@@ -145,8 +126,6 @@ pub const Loop = struct {
                 return;
             }
         }
-
-        log.info("Done with connection", .{});
     }
 };
 
