@@ -37,7 +37,7 @@ pub const URI = struct {
     query: []const u8 = "",
 
     pub fn read(allocator: std.mem.Allocator, reader: *std.Io.Reader) !URI {
-        const bytes0 = (try reader.takeDelimiter(' '));
+        const bytes0 = try reader.takeDelimiter(' ');
         if (bytes0) |bytes| {
             if (std.mem.indexOf(u8, bytes, "?")) |query_start| {
                 const path = try allocator.dupe(u8, bytes[0..query_start]);
@@ -59,7 +59,7 @@ pub const Version = enum {
     HTTP_1_1,
 
     pub fn read(reader: *std.Io.Reader) !Version {
-        const bytes0 = (try reader.takeDelimiter('\n'));
+        const bytes0 = try reader.takeDelimiter('\n');
         if (bytes0) |bytes| {
             if (std.ascii.eqlIgnoreCase(bytes, "HTTP/1.1\r")) {
                 return .HTTP_1_1;

@@ -8,7 +8,7 @@ pub const ThreadPoolLoop = struct {
 
     pub fn init(allocator: std.mem.Allocator) !@This() {
         var pool = try allocator.create(std.Thread.Pool);
-        try pool.init(.{ .allocator = allocator, .n_jobs = 102 });
+        try pool.init(.{ .allocator = allocator, .n_jobs = 256 });
 
         const wg = try allocator.create(std.Thread.WaitGroup);
         wg.* = std.Thread.WaitGroup{};
