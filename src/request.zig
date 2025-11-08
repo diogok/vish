@@ -8,22 +8,26 @@ pub const Method = enum {
     pub fn read(reader: *std.Io.Reader) !Method {
         const bytes0 = try reader.takeDelimiter(' ');
         if (bytes0) |bytes| {
-            if (std.mem.eql(u8, bytes, "GET")) {
-                return .GET;
-            } else if (std.mem.eql(u8, bytes, "POST")) {
-                return .POST;
-            } else if (std.mem.eql(u8, bytes, "PUT")) {
-                return .PUT;
-            } else if (std.mem.eql(u8, bytes, "DELETE")) {
-                return .DELETE;
-            } else if (std.mem.eql(u8, bytes, "PATCH")) {
-                return .PATCH;
-            } else {
-                log.err("Invalid method: {s}", .{bytes});
-                return error.InvalidHTTPMethod;
-            }
+            return @This().parse(bytes);
         } else {
             return error.NoData;
+        }
+    }
+
+    pub fn parse(bytes: []const u8) !Method {
+        if (std.mem.eql(u8, bytes, "GET")) {
+            return .GET;
+        } else if (std.mem.eql(u8, bytes, "POST")) {
+            return .POST;
+        } else if (std.mem.eql(u8, bytes, "PUT")) {
+            return .PUT;
+        } else if (std.mem.eql(u8, bytes, "DELETE")) {
+            return .DELETE;
+        } else if (std.mem.eql(u8, bytes, "PATCH")) {
+            return .PATCH;
+        } else {
+            log.err("Invalid method: {s}", .{bytes});
+            return error.InvalidHTTPMethod;
         }
     }
 
@@ -39,16 +43,19 @@ pub const URI = struct {
     pub fn read(allocator: std.mem.Allocator, reader: *std.Io.Reader) !URI {
         const bytes0 = try reader.takeDelimiter(' ');
         if (bytes0) |bytes| {
-            if (std.mem.indexOf(u8, bytes, "?")) |query_start| {
-                const path = try allocator.dupe(u8, bytes[0..query_start]);
-                const query = try allocator.dupe(u8, bytes[query_start + 1 .. bytes.len]);
-                return .{ .path = path, .query = query };
-            } else {
-                const path = try allocator.dupe(u8, bytes);
-                return .{ .path = path };
-            }
+            return @This().parse(allocator, bytes);
         } else {
             return error.InvalidURI;
+        }
+    }
+    pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) !URI {
+        if (std.mem.indexOfScalar(u8, bytes, '?')) |query_start| {
+            const path = try allocator.dupe(u8, bytes[0..query_start]);
+            const query = try allocator.dupe(u8, bytes[query_start + 1 .. bytes.len]);
+            return .{ .path = path, .query = query };
+        } else {
+            const path = try allocator.dupe(u8, bytes);
+            return .{ .path = path };
         }
     }
 };
@@ -61,17 +68,21 @@ pub const Version = enum {
     pub fn read(reader: *std.Io.Reader) !Version {
         const bytes0 = try reader.takeDelimiter('\n');
         if (bytes0) |bytes| {
-            if (std.ascii.eqlIgnoreCase(bytes, "HTTP/1.1\r")) {
-                return .HTTP_1_1;
-            } else if (std.ascii.eqlIgnoreCase(bytes, "HTTP/1.0\r")) {
-                return .HTTP_1_0;
-            } else if (std.ascii.eqlIgnoreCase(bytes, "HTTP/0.9\r")) {
-                return .HTTP_0_9;
-            } else {
-                log.err("Invalid HTTP version: {s}", .{bytes});
-                return error.InvalidHTTPVersion;
-            }
+            return @This().parse(bytes[0 .. bytes.len - 1]);
         } else {
+            return error.InvalidHTTPVersion;
+        }
+    }
+
+    pub fn parse(bytes: []const u8) !Version {
+        if (std.ascii.eqlIgnoreCase(bytes, "HTTP/1.1")) {
+            return .HTTP_1_1;
+        } else if (std.ascii.eqlIgnoreCase(bytes, "HTTP/1.0")) {
+            return .HTTP_1_0;
+        } else if (std.ascii.eqlIgnoreCase(bytes, "HTTP/0.9")) {
+            return .HTTP_0_9;
+        } else {
+            log.err("Invalid HTTP version: {s}", .{bytes});
             return error.InvalidHTTPVersion;
         }
     }
@@ -109,28 +120,34 @@ pub const Headers = struct { // how to make customizable?
 
     pub fn read(allocator: std.mem.Allocator, reader: *std.Io.Reader) !Headers {
         var target = Headers{};
+        // TODO: config max line?
+        var line_buffer: [256]u8 = undefined;
 
         while (true) {
             const maybe_line = try reader.takeDelimiter('\n');
             if (maybe_line == null) {
+                @branchHint(.unlikely);
                 continue;
             }
-            const line = try allocator.dupe(u8, maybe_line.?);
-            defer allocator.free(line);
-            //const line = maybe_line.?;
+
+            // somehow I can't just use maybe_line
+            std.mem.copyForwards(u8, &line_buffer, maybe_line.?);
+            var line = line_buffer[0..maybe_line.?.len];
 
             if (line.len == 1) {
                 // last header line
                 break;
             }
 
-            const maybe_separator = std.ascii.indexOfIgnoreCase(line, ":");
+            const maybe_separator = std.mem.indexOfScalar(u8, line, ':');
             if (maybe_separator == null) {
+                @branchHint(.unlikely);
                 continue;
             }
-            const separator = maybe_separator.?;
+            const separator_pos = maybe_separator.?;
 
-            var key = line[0..separator];
+            const key: []u8 = line[0..separator_pos];
+            const value: []u8 = line[separator_pos + 1 .. line.len - 1];
             for (key, 0..) |b, i| {
                 if (b == '-') {
                     key[i] = '_';
@@ -141,8 +158,8 @@ pub const Headers = struct { // how to make customizable?
 
             inline for (std.meta.fields(Headers)) |field| {
                 if (std.mem.eql(u8, field.name, key)) {
-                    const value = std.mem.trim(u8, line[separator + 1 .. line.len - 1], " ");
-                    @field(target, field.name) = try allocator.dupe(u8, value);
+                    const clean_value = std.mem.trim(u8, value, " ");
+                    @field(target, field.name) = try allocator.dupe(u8, clean_value);
                 }
             }
         }
@@ -178,9 +195,9 @@ pub const Request = struct {
 
         return .{
             .version = version,
-            .headers = headers,
             .method = method,
             .uri = uri,
+            .headers = headers,
             .body = "",
         };
     }
