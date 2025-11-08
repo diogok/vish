@@ -101,30 +101,47 @@ pub const Loop = struct {
                 return;
             };
             if (request) |req| {
-                defer req.deinit(connection.server.allocator);
-
-                log.debug("Request: {any}", .{req});
-
-                var res = Response.fromRequest(req);
-
-                handler.handle(connection, req, &res) catch |err| {
-                    log.err("Handle error: {any}", .{err});
-                };
-
-                log.debug("Response: {any}", .{res});
-
-                connection.writer().flush() catch |err| {
-                    log.err("Writer flush error: {any}", .{err});
-                };
-
-                if (std.ascii.eqlIgnoreCase(req.headers.connection, "close") or
-                    std.ascii.eqlIgnoreCase(res.headers.connection, "close"))
-                {
-                    return;
+                const conn_header = self.onRequest(connection, handler, req);
+                switch (conn_header) {
+                    .close => {
+                        return;
+                    },
+                    .keep => {},
                 }
             } else {
                 return;
             }
+        }
+    }
+
+    fn onRequest(
+        _: *@This(),
+        connection: Connection,
+        handler: *Handler,
+        req: Request,
+    ) enum { close, keep } {
+        defer req.deinit(connection.server.allocator);
+
+        log.debug("Request: {any}", .{req});
+
+        var res = Response.fromRequest(req);
+
+        handler.handle(connection, req, &res) catch |err| {
+            log.err("Handle error: {any}", .{err});
+        };
+
+        log.debug("Response: {any}", .{res});
+
+        connection.writer().flush() catch |err| {
+            log.err("Writer flush error: {any}", .{err});
+        };
+
+        if (std.ascii.eqlIgnoreCase(req.headers.connection, "close") or
+            std.ascii.eqlIgnoreCase(res.headers.connection, "close"))
+        {
+            return .close;
+        } else {
+            return .keep;
         }
     }
 };
