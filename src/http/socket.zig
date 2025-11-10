@@ -1,3 +1,5 @@
+//! Utilities to configure the socket
+
 /// Set send and receive timeout on the socket.
 pub fn setTimeout(
     fd: std.posix.socket_t,
@@ -65,6 +67,7 @@ pub fn wait(fd: std.posix.socket_t, timeout_in_ms: u32) !void {
     return;
 }
 
+/// Set common server flags: keepalive and nodelay, according to options
 pub fn setServerFlags(fd: std.posix.socket_t, options: struct { tcp_keep_alive: bool, tcp_no_delay: bool }) !void {
     switch (builtin.os.tag) {
         .linux => {

@@ -22,6 +22,7 @@ pub const Loop = struct {
     }
 
     pub fn deinit(self: *@This()) void {
+        log.warn("Deinit loop", .{});
         self.stop();
         self.thread_pool.deinit();
         self.allocator.destroy(self.thread_pool);
@@ -29,37 +30,27 @@ pub const Loop = struct {
     }
 
     pub fn stop(self: *@This()) void {
+        log.warn("Shutdown loop", .{});
         self.active = false;
     }
 
-    pub fn run(
+    pub fn start(
         self: *@This(),
-        server: *Server,
+        server: *http.Server,
         handler: *Handler,
     ) !void {
         self.active = true;
-        self.thread_pool.spawnWg(self.wait_group, @This().waitDefaultSignal, .{ self, server });
         self.thread_pool.spawnWg(self.wait_group, @This().accept, .{ self, server, handler });
+        log.info("Started", .{});
     }
 
     pub fn wait(self: *@This()) void {
         self.thread_pool.waitAndWork(self.wait_group);
-        self.active = false;
-    }
-
-    fn waitDefaultSignal(self: *@This(), server: *Server) void {
-        // TODO: what about when not using default signals?
-        log.info("Waiting on default signal", .{});
-        signal.wait();
-        log.info("Stopping on default signal", .{});
-
-        server.stop();
-        self.active = false;
     }
 
     fn accept(
         self: *@This(),
-        server: *Server,
+        server: *http.Server,
         handler: *Handler,
     ) void {
         log.debug("Accepting connections", .{});
@@ -88,13 +79,13 @@ pub const Loop = struct {
 
     fn onConnection(
         self: *@This(),
-        connection: Connection,
+        connection: http.Connection,
         handler: *Handler,
     ) void {
-        log.info("Connection started", .{});
         defer connection.deinit();
         defer log.info("Done with connection", .{});
 
+        log.info("Connection started", .{});
         while (self.active) {
             const request = connection.next() catch |err| {
                 log.err("Error reading request: {any}", .{err});
@@ -116,15 +107,15 @@ pub const Loop = struct {
 
     fn onRequest(
         _: *@This(),
-        connection: Connection,
+        connection: http.Connection,
         handler: *Handler,
-        req: Request,
+        req: http.Request,
     ) enum { close, keep } {
         defer req.deinit(connection.server.allocator);
 
         log.debug("Request: {any}", .{req});
 
-        var res = Response.fromRequest(req);
+        var res = http.Response.fromRequest(req);
 
         handler.handle(connection, req, &res) catch |err| {
             log.err("Handle error: {any}", .{err});
@@ -146,43 +137,11 @@ pub const Loop = struct {
     }
 };
 
-pub fn runAndWait(
-    allocator: std.mem.Allocator,
-    address: std.net.Address,
-    handler: *Handler,
-    options: ListenOptions,
-) !void {
-    var server = Server.init(allocator, address, options);
-    defer server.deinit();
-
-    try server.listen();
-
-    log.debug("Listening on {any}:{d}", .{ address, address.getPort() });
-
-    signal.registerDefaultHandlers();
-
-    var loop = try Loop.init(allocator);
-    defer loop.deinit();
-
-    try loop.run(&server, handler);
-
-    log.info("waiting", .{});
-    loop.wait();
-
-    log.info("the end.", .{});
-}
-
 const log = std.log.scoped(.http);
 
 const std = @import("std");
 const testing = std.testing;
 
-const signal = @import("signal.zig");
-const Server = @import("server.zig").Server;
-const Connection = @import("server.zig").Connection;
-const ListenOptions = @import("server.zig").ListenOptions;
-
-const Request = @import("request.zig").Request;
-const Response = @import("response.zig").Response;
+const http = @import("../http/server.zig");
 
 const Handler = @import("handler.zig").Handler;

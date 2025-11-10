@@ -32,9 +32,9 @@ pub const Server = struct {
     }
 
     pub fn deinit(self: *@This()) void {
+        log.warn("Deinit server", .{});
         if (self.server) |server| {
-            log.warn("Shutdown!", .{});
-            std.posix.shutdown(server.stream.handle, .both) catch {};
+            self.stop();
             server.deinit();
             self.allocator.destroy(self.server.?);
             self.server = null;
@@ -43,6 +43,7 @@ pub const Server = struct {
 
     pub fn stop(self: *@This()) void {
         if (self.server) |server| {
+            log.warn("Shutdown server", .{});
             std.posix.shutdown(server.stream.handle, .both) catch {};
         }
     }
@@ -65,6 +66,7 @@ pub const Server = struct {
         );
 
         self.server = server;
+        log.info("Listening", .{});
     }
 
     pub fn accept(self: *@This()) !?Connection {
@@ -182,4 +184,6 @@ const std = @import("std");
 const testing = std.testing;
 
 const socket = @import("socket.zig");
-const Request = @import("request.zig").Request;
+
+pub const Request = @import("request.zig").Request;
+pub const Response = @import("response.zig").Response;

@@ -8,9 +8,20 @@ pub fn main() !void {
     const port: u16 = 8080;
     const address = try std.net.Address.resolveIp(ip, port);
 
+    var server = http.Server.init(allocator, address, .{});
+    defer server.deinit();
+    try server.listen();
+
     var handler = http.Handler.wrap(MyHandler{}).init();
 
-    try http.runAndWait(allocator, address, (&handler).interface(), .{});
+    var loop = try http.Loop.init(allocator);
+    defer loop.deinit();
+    try loop.start(&server, (&handler).interface());
+
+    http.waitSignal();
+    loop.stop();
+    loop.wait();
+    server.stop();
 }
 
 pub const MyHandler = struct {
@@ -34,6 +45,6 @@ const log = std.log.scoped(.demo);
 
 pub const std_options: std.Options = .{
     .log_scope_levels = &[_]std.log.ScopeLevel{
-        .{ .scope = .http, .level = .err },
+        .{ .scope = .http, .level = .warn },
     },
 };

@@ -55,6 +55,6 @@ const log = std.log.scoped(.http);
 const std = @import("std");
 const testing = std.testing;
 
-const Request = @import("request.zig").Request;
-const Response = @import("response.zig").Response;
-const Connection = @import("server.zig").Connection;
+const Request = @import("../http/request.zig").Request;
+const Response = @import("../http/response.zig").Response;
+const Connection = @import("../http/server.zig").Connection;

@@ -1,13 +1,13 @@
 //! Nothing yet
 
-const request = @import("request.zig");
-const response = @import("response.zig");
-const socket = @import("socket.zig");
-const server = @import("server.zig");
+const request = @import("http/request.zig");
+const response = @import("http/response.zig");
+const socket = @import("http/socket.zig");
+const server = @import("http/server.zig");
 
-const signal = @import("signal.zig");
-const handler = @import("handler.zig");
-const loop = @import("loop.zig");
+const handler = @import("loop/handler.zig");
+const loop = @import("loop/loop.zig");
+const signal = @import("loop/signal.zig");
 
 pub const Request = request.Request;
 pub const Response = response.Response;
@@ -19,9 +19,8 @@ pub const ListenOptions = server.ListenOptions;
 pub const Handler = handler.Handler;
 pub const HandleError = handler.Error;
 pub const Loop = loop.Loop;
-pub const runAndWait = loop.runAndWait;
 
-pub const registerDefaultHandlers = signal.registerDefaultHandlers;
+pub const waitSignal = signal.wait;
 
 test {
     _ = request;
@@ -29,7 +28,7 @@ test {
     _ = socket;
     _ = server;
 
-    //_ = signal;
+    _ = signal;
     _ = handler;
     _ = loop;
 }
