@@ -92,7 +92,7 @@ pub const Loop = struct {
                 return;
             };
             if (request) |req| {
-                const conn_header = self.onRequest(connection, handler, req);
+                const conn_header = self.onRequest(handler, req);
                 switch (conn_header) {
                     .close => {
                         return;
@@ -107,23 +107,22 @@ pub const Loop = struct {
 
     fn onRequest(
         _: *@This(),
-        connection: http.Connection,
         handler: *Handler,
         req: http.Request,
     ) enum { close, keep } {
-        defer req.deinit(connection.server.allocator);
+        defer req.deinit();
 
         log.debug("Request: {any}", .{req});
 
         var res = http.Response.fromRequest(req);
 
-        handler.handle(connection, req, &res) catch |err| {
+        handler.handle(req, &res) catch |err| {
             log.err("Handle error: {any}", .{err});
         };
 
         log.debug("Response: {any}", .{res});
 
-        connection.writer().flush() catch |err| {
+        req.writer.flush() catch |err| {
             log.err("Writer flush error: {any}", .{err});
         };
 

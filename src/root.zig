@@ -22,6 +22,8 @@ pub const Loop = loop.Loop;
 
 pub const waitSignal = signal.wait;
 
+pub const utils = @import("utils/root.zig");
+
 test {
     _ = request;
     _ = response;
@@ -31,4 +33,6 @@ test {
     _ = signal;
     _ = handler;
     _ = loop;
+
+    _ = utils;
 }

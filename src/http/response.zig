@@ -25,38 +25,38 @@ pub const Response = struct {
     sent_status: bool = false,
     sent_headers: bool = false,
 
+    writer: *std.Io.Writer,
+
     pub fn fromRequest(src: Request) @This() {
         return .{
             .version = src.version,
             .headers = .{
                 .connection = src.headers.connection,
             },
+            .writer = src.writer,
         };
     }
 
-    pub fn send(self: *@This(), writer: *std.Io.Writer) !void {
-        try self.sendStatus(writer, self.version, self.status);
-        try self.sendHeaders(writer, self.headers);
+    pub fn send(self: *@This()) !void {
+        try self.sendStatus();
+        try self.sendHeaders();
         if (self.body.len != 0) {
-            try self.sendBody(writer, self.body);
+            try self.sendBody();
         }
     }
 
     fn sendStatus(
         self: *@This(),
-        writer: *std.Io.Writer,
-        version: request.Version,
-        code: Status,
     ) !void {
         var code_txt: [24]u8 = undefined;
-        _ = std.mem.replace(u8, @tagName(code), "_", " ", &code_txt);
-        const code_name = code_txt[0..@tagName(code).len];
+        _ = std.mem.replace(u8, @tagName(self.status), "_", " ", &code_txt);
+        const code_name = code_txt[0..@tagName(self.status).len];
 
-        try writer.print(
+        try self.writer.print(
             "{s} {d} {s}\r\n",
             .{
-                version.string(),
-                code.int(),
+                self.version.string(),
+                self.status.int(),
                 code_name,
             },
         );
@@ -65,8 +65,6 @@ pub const Response = struct {
 
     fn sendHeaders(
         self: *@This(),
-        writer: *std.Io.Writer,
-        headers: Headers,
     ) !void {
         // set content-length if not set and we have a string body
         var buffer: [10]u8 = undefined;
@@ -74,12 +72,12 @@ pub const Response = struct {
             self.headers.content_length = try std.fmt.bufPrint(&buffer, "{d}", .{self.body.len});
         }
         inline for (std.meta.fields(Headers)) |field| {
-            if (@field(headers, field.name).len > 0) {
+            if (@field(self.headers, field.name).len > 0) {
                 const headerName = comptime capitalize(field.name);
-                try self.sendHeader(writer, &headerName, @field(headers, field.name));
+                try self.sendHeader(self.writer, &headerName, @field(self.headers, field.name));
             }
         }
-        _ = try writer.write("\r\n");
+        _ = try self.writer.write("\r\n");
         self.sent_headers = true;
     }
 
@@ -92,17 +90,12 @@ pub const Response = struct {
         try writer.print("{s}: {s}\r\n", .{ header, value });
     }
 
-    fn sendBody(
-        _: *@This(),
-        writer: *std.Io.Writer,
-        body: []const u8,
-    ) !void {
-        _ = try writer.write(body);
+    fn sendBody(self: *@This()) !void {
+        _ = try self.writer.write(self.body);
     }
 
     pub fn writeBody(
         self: *@This(),
-        writer: *std.Io.Writer,
         body: []const u8,
     ) !void {
         if (!self.sent_status) {
@@ -111,7 +104,7 @@ pub const Response = struct {
         if (!self.sent_headers) {
             try self.sendHeaders();
         }
-        _ = try writer.write(body);
+        _ = try self.writer.write(body);
     }
 };
 
@@ -123,8 +116,9 @@ test "basic response writing" {
         .status = .Not_Found,
         .headers = .{ .content_type = "text/plain" },
         .body = "hello",
+        .writer = &writer,
     };
-    try res.send(&writer);
+    try res.send();
 
     const content = buffer[0..writer.end];
 

@@ -175,9 +175,14 @@ pub const Request = struct {
     headers: Headers,
     body: []const u8,
 
+    reader: *std.Io.Reader,
+    writer: *std.Io.Writer,
+    allocator: std.mem.Allocator,
+
     pub fn read(
         allocator: std.mem.Allocator,
         reader: *std.Io.Reader,
+        writer: *std.Io.Writer,
     ) !@This() {
         const method = try Method.read(reader);
 
@@ -199,15 +204,19 @@ pub const Request = struct {
             .uri = uri,
             .headers = headers,
             .body = "",
+
+            .reader = reader,
+            .writer = writer,
+            .allocator = allocator,
         };
     }
 
-    pub fn deinit(self: @This(), allocator: std.mem.Allocator) void {
-        allocator.free(self.body);
-        allocator.free(self.uri.path);
-        allocator.free(self.uri.query);
+    pub fn deinit(self: @This()) void {
+        self.allocator.free(self.body);
+        self.allocator.free(self.uri.path);
+        self.allocator.free(self.uri.query);
 
-        self.headers.free(allocator);
+        self.headers.free(self.allocator);
     }
 };
 
@@ -215,9 +224,10 @@ test "Parse basic http request with body" {
     const request = "POST /foo/bar?fuz=baz HTTP/1.1\r\nContent-Type: application/form-data\r\nContent-Length: 9 \r\n\r\nkey=value";
 
     var reader = std.Io.Reader.fixed(request);
+    var writer = std.Io.Writer.Discarding.init(&[_]u8{});
 
-    const req = try Request.read(testing.allocator, &reader);
-    defer req.deinit(testing.allocator);
+    const req = try Request.read(testing.allocator, &reader, &writer.writer);
+    defer req.deinit();
 
     try testing.expectEqual(req.method, .POST);
     try testing.expectEqualStrings("/foo/bar", req.uri.path);
@@ -231,9 +241,10 @@ test "Parse http request without body" {
     const request = "POST /foo/bar?fuz=baz HTTP/1.1\r\nContent-Type: application/form-data\r\nContent-Length: 0 \r\n\r\n";
 
     var reader = std.Io.Reader.fixed(request);
+    var writer = std.Io.Writer.Discarding.init(&[_]u8{});
 
-    const req = try Request.read(testing.allocator, &reader);
-    defer req.deinit(testing.allocator);
+    const req = try Request.read(testing.allocator, &reader, &writer.writer);
+    defer req.deinit();
 
     try testing.expectEqual(req.method, .POST);
     try testing.expectEqualStrings("/foo/bar", req.uri.path);
@@ -247,9 +258,10 @@ test "Parse http request without headers, body" {
     const request = "POST /foo/bar?fuz=baz HTTP/1.1\r\n\r\n";
 
     var reader = std.Io.Reader.fixed(request);
+    var writer = std.Io.Writer.Discarding.init(&[_]u8{});
 
-    const req = try Request.read(testing.allocator, &reader);
-    defer req.deinit(testing.allocator);
+    const req = try Request.read(testing.allocator, &reader, &writer.writer);
+    defer req.deinit();
 
     try testing.expectEqual(req.method, .POST);
     try testing.expectEqualStrings("/foo/bar", req.uri.path);
@@ -263,9 +275,10 @@ test "Parse http request without headers, body and qs" {
     const request = "POST /foo/bar HTTP/1.1\r\n\r\n";
 
     var reader = std.Io.Reader.fixed(request);
+    var writer = std.Io.Writer.Discarding.init(&[_]u8{});
 
-    const req = try Request.read(testing.allocator, &reader);
-    defer req.deinit(testing.allocator);
+    const req = try Request.read(testing.allocator, &reader, &writer.writer);
+    defer req.deinit();
 
     try testing.expectEqual(req.method, .POST);
     try testing.expectEqualStrings("/foo/bar", req.uri.path);

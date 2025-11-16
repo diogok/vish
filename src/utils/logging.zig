@@ -1,0 +1,86 @@
+pub const Common = struct {
+    handler: *Handler,
+
+    pub fn init(handler: *Handler) @This() {
+        return .{ .handler = handler };
+    }
+
+    pub fn handle(
+        self: @This(),
+        req: Request,
+        res: *Response,
+    ) HandlerError!void {
+        try self.handler.handle(req, res);
+
+        const date = get_current_date();
+
+        const fmt = "{s} - - [{s}] \"{s} {s} {s}\" {d} {s}\n";
+        const args = .{
+            "", // should be client address
+            date,
+            req.method.string(),
+            req.uri.path,
+            req.version.string(),
+            res.status.int(),
+            res.headers.content_length,
+        };
+
+        var stdout_buffer: [1024]u8 = undefined;
+        var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+        const stdout = &stdout_writer.interface;
+
+        stdout.print(fmt, args) catch {};
+    }
+};
+
+test "common logs" {
+    const MyHandler = struct {
+        called: bool = false,
+
+        pub fn handle(
+            self: *@This(),
+            req: Request,
+            res: *Response,
+        ) HandlerError!void {
+            _ = req;
+            _ = res;
+            self.called = true;
+        }
+    };
+    var my_handler = MyHandler{};
+
+    var wrapper_handler = Handler.wrap(MyHandler).init(&my_handler);
+    const handler = (&wrapper_handler).interface();
+
+    var logger = Common.init(handler);
+
+    var writer = std.Io.Writer.Discarding.init(&[_]u8{});
+
+    const req: Request = .{
+        .version = .HTTP_1_1,
+        .method = .GET,
+        .uri = .{
+            .path = "/",
+        },
+        .headers = .{},
+        .body = "",
+        .reader = .ending,
+        .writer = &writer.writer,
+        .allocator = testing.allocator,
+    };
+    var res = Response.fromRequest(req);
+    try logger.handle(req, &res);
+
+    try testing.expect(my_handler.called);
+}
+
+const std = @import("std");
+const testing = std.testing;
+
+const Connection = @import("../http/server.zig").Connection;
+const Request = @import("../http/request.zig").Request;
+const Response = @import("../http/response.zig").Response;
+const Handler = @import("../loop/handler.zig").Handler;
+const HandlerError = @import("../loop/handler.zig").Error;
+
+const get_current_date = @import("timestamp.zig").get_current_date;

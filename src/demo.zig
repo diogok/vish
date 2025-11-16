@@ -1,8 +1,8 @@
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer std.debug.assert(gpa.deinit() != .leak);
-    const allocator = gpa.allocator();
-    //const allocator = std.heap.smp_allocator; // for a faster allocator
+    //var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    //defer std.debug.assert(gpa.deinit() != .leak);
+    //const allocator = gpa.allocator();
+    const allocator = std.heap.smp_allocator; // for a faster allocator
 
     const ip = "127.0.0.1";
     const port: u16 = 8080;
@@ -12,7 +12,8 @@ pub fn main() !void {
     defer server.deinit();
     try server.listen();
 
-    var handler = http.Handler.wrap(MyHandler{}).init();
+    var my_handler = MyHandler{};
+    var handler = http.Handler.wrap(MyHandler).init(&my_handler);
 
     var loop = try http.Loop.init(allocator);
     defer loop.deinit();
@@ -27,7 +28,6 @@ pub fn main() !void {
 pub const MyHandler = struct {
     pub fn handle(
         _: @This(),
-        conn: http.Connection,
         req: http.Request,
         res: *http.Response,
     ) http.HandleError!void {
@@ -35,7 +35,7 @@ pub const MyHandler = struct {
 
         res.body = "hello";
 
-        try res.send(conn.writer());
+        try res.send();
     }
 };
 

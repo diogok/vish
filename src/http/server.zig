@@ -153,7 +153,11 @@ pub const Connection = struct {
     }
 
     pub fn next(self: @This()) !?Request {
-        return Request.read(self.server.allocator, self.net_reader.interface()) catch |err| {
+        return Request.read(
+            self.server.allocator,
+            self.net_reader.interface(),
+            &self.net_writer.interface,
+        ) catch |err| {
             if (err == error.NoData) {
                 return null;
             } else if (self.net_reader.getError()) |net_err| {
@@ -171,10 +175,6 @@ pub const Connection = struct {
                 return err;
             }
         };
-    }
-
-    pub fn writer(self: @This()) *std.Io.Writer {
-        return &self.net_writer.interface;
     }
 };
 

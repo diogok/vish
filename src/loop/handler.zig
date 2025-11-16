@@ -1,5 +1,5 @@
 pub const VTable = struct {
-    handle: *const fn (h: *Handler, conn: Connection, req: Request, res: *Response) Error!void,
+    handle: *const fn (h: *Handler, req: Request, res: *Response) Error!void,
 };
 
 pub const Error = error{
@@ -12,22 +12,20 @@ pub const Handler = struct {
 
     pub fn handle(
         self: *@This(),
-        conn: Connection,
         req: Request,
         res: *Response,
     ) Error!void {
-        return self.vtable.handle(self, conn, req, res);
+        return self.vtable.handle(self, req, res);
     }
 
-    pub fn wrap(handler: anytype) type {
-        const HandlerType = @TypeOf(handler);
+    pub fn wrap(HandlerType: type) type {
         return struct {
             const Self = @This();
 
-            handler: HandlerType,
+            handler: *HandlerType,
             interface_state: Handler,
 
-            pub fn init() Self {
+            pub fn init(handler: *HandlerType) Self {
                 return .{
                     .handler = handler,
                     .interface_state = .{
@@ -42,9 +40,9 @@ pub const Handler = struct {
                 return &r.interface_state;
             }
 
-            pub fn handle(h: *Handler, conn: Connection, req: Request, res: *Response) Error!void {
+            pub fn handle(h: *Handler, req: Request, res: *Response) Error!void {
                 const self: *Self = @alignCast(@fieldParentPtr("interface_state", h));
-                try self.handler.handle(conn, req, res);
+                try self.handler.handle(req, res);
             }
         };
     }
@@ -57,4 +55,3 @@ const testing = std.testing;
 
 const Request = @import("../http/request.zig").Request;
 const Response = @import("../http/response.zig").Response;
-const Connection = @import("../http/server.zig").Connection;
