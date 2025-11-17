@@ -218,7 +218,22 @@ pub const Request = struct {
 
         self.headers.free(self.allocator);
     }
+
+    pub const example: Request = .{
+        .version = .HTTP_1_1,
+        .method = .GET,
+        .uri = .{
+            .path = "/",
+        },
+        .headers = .{},
+        .body = "",
+        .reader = .ending,
+        .writer = &discarding.writer,
+        .allocator = testing.allocator,
+    };
 };
+
+var discarding = std.Io.Writer.Discarding.init(&[_]u8{});
 
 test "Parse basic http request with body" {
     const request = "POST /foo/bar?fuz=baz HTTP/1.1\r\nContent-Type: application/form-data\r\nContent-Length: 9 \r\n\r\nkey=value";

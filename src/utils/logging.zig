@@ -1,11 +1,19 @@
 pub const Common = struct {
     handler: *Handler,
+    interface_state: Handler,
 
     pub fn init(handler: *Handler) @This() {
-        return .{ .handler = handler };
+        return .{
+            .handler = handler,
+            .interface_state = .{
+                .vtable = &.{
+                    .handle = @This().handle,
+                },
+            },
+        };
     }
 
-    pub fn handle(
+    pub fn log(
         self: @This(),
         req: Request,
         res: *Response,
@@ -30,6 +38,15 @@ pub const Common = struct {
         const stdout = &stdout_writer.interface;
 
         stdout.print(fmt, args) catch {};
+    }
+
+    pub fn interface(r: *@This()) *Handler {
+        return &r.interface_state;
+    }
+
+    pub fn handle(h: *Handler, req: Request, res: *Response) HandlerError!void {
+        const self: *@This() = @alignCast(@fieldParentPtr("interface_state", h));
+        try self.log(req, res);
     }
 };
 
@@ -69,7 +86,7 @@ test "common logs" {
         .allocator = testing.allocator,
     };
     var res = Response.fromRequest(req);
-    try logger.handle(req, &res);
+    try logger.interface().handle(req, &res);
 
     try testing.expect(my_handler.called);
 }
@@ -77,7 +94,6 @@ test "common logs" {
 const std = @import("std");
 const testing = std.testing;
 
-const Connection = @import("../http/server.zig").Connection;
 const Request = @import("../http/request.zig").Request;
 const Response = @import("../http/response.zig").Response;
 const Handler = @import("../loop/handler.zig").Handler;

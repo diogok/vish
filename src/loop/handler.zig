@@ -5,6 +5,7 @@ pub const VTable = struct {
 pub const Error = error{
     WriteFailed,
     NoSpaceLeft,
+    Skipped,
 };
 
 pub const Handler = struct {
