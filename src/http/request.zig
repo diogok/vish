@@ -219,6 +219,10 @@ pub const Request = struct {
         self.headers.free(self.allocator);
     }
 
+    pub fn getContentLength(self: @This()) usize {
+        return std.fmt.parseInt(usize, self.headers.content_length, 10) catch 0;
+    }
+
     pub const example: Request = .{
         .version = .HTTP_1_1,
         .method = .GET,

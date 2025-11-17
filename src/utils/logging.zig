@@ -14,7 +14,7 @@ pub const Common = struct {
     }
 
     pub fn log(
-        self: @This(),
+        self: *@This(),
         req: Request,
         res: *Response,
     ) HandlerError!void {
@@ -38,6 +38,10 @@ pub const Common = struct {
         const stdout = &stdout_writer.interface;
 
         stdout.print(fmt, args) catch {};
+
+        if (!@import("builtin").is_test) {
+            stdout.flush() catch {};
+        }
     }
 
     pub fn interface(r: *@This()) *Handler {

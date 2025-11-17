@@ -25,6 +25,8 @@ pub const Response = struct {
     sent_status: bool = false,
     sent_headers: bool = false,
 
+    buffer: [9]u8 = undefined,
+
     writer: *std.Io.Writer,
 
     pub fn fromRequest(src: Request) @This() {
@@ -67,9 +69,8 @@ pub const Response = struct {
         self: *@This(),
     ) !void {
         // set content-length if not set and we have a string body
-        var buffer: [10]u8 = undefined;
         if (self.headers.content_length.len == 0 and self.body.len > 0) {
-            self.headers.content_length = try std.fmt.bufPrint(&buffer, "{d}", .{self.body.len});
+            self.headers.content_length = try std.fmt.bufPrint(&self.buffer, "{d}", .{self.body.len});
         }
         inline for (std.meta.fields(Headers)) |field| {
             if (@field(self.headers, field.name).len > 0) {
@@ -92,6 +93,13 @@ pub const Response = struct {
 
     fn sendBody(self: *@This()) !void {
         _ = try self.writer.write(self.body);
+    }
+
+    pub fn setContentLength(
+        self: *@This(),
+        len: usize,
+    ) void {
+        self.headers.content_length = std.fmt.bufPrint(&self.buffer, "{d}", .{len}) catch "0";
     }
 
     pub fn writeBody(

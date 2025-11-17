@@ -6,6 +6,10 @@ pub const Error = error{
     WriteFailed,
     NoSpaceLeft,
     Skipped,
+
+    Internal,
+    BadRequest,
+    Unauthorized,
 };
 
 pub const Handler = struct {
