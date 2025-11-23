@@ -24,6 +24,7 @@ pub const Response = struct {
 
     sent_status: bool = false,
     sent_headers: bool = false,
+    sent_newline: bool = false,
 
     buffer: [9]u8 = undefined,
 
@@ -43,6 +44,7 @@ pub const Response = struct {
         try self.sendStatus();
         try self.sendHeaders();
         if (self.body.len != 0) {
+            try self.sendNewline();
             try self.sendBody();
         }
     }
@@ -78,8 +80,14 @@ pub const Response = struct {
                 try self.sendHeader(self.writer, &headerName, @field(self.headers, field.name));
             }
         }
-        _ = try self.writer.write("\r\n");
         self.sent_headers = true;
+    }
+
+    fn sendNewline(
+        self: *@This(),
+    ) !void {
+        _ = try self.writer.write("\r\n");
+        self.sent_newline = true;
     }
 
     fn sendHeader(
@@ -102,17 +110,35 @@ pub const Response = struct {
         self.headers.content_length = std.fmt.bufPrint(&self.buffer, "{d}", .{len}) catch "0";
     }
 
-    pub fn writeBody(
+    pub fn writeChunk(
         self: *@This(),
-        body: []const u8,
+        chunk: []const u8,
     ) !void {
         if (!self.sent_status) {
             try self.sendStatus();
         }
-        if (!self.sent_headers) {
-            try self.sendHeaders();
+        if (self.headers.transfer_encoding.len == 0) {
+            self.headers.transfer_encoding = "chunked";
+            if (!self.sent_headers) {
+                try self.sendHeaders();
+                try self.sendNewline();
+            } else {
+                try self.sendHeader(self.writer, "Transfer-Encoding", "chunked");
+                try self.sendNewline();
+            }
         }
-        _ = try self.writer.write(body);
+        try self.writer.print("{d}\r\n", .{chunk.len});
+        _ = try self.writer.write(chunk);
+        _ = try self.writer.write("\r\n");
+    }
+
+    pub fn end(self: *@This()) !void {
+        if (!self.sent_newline) {
+            try self.sendNewline();
+        }
+        if (std.ascii.eqlIgnoreCase("chunked", self.headers.transfer_encoding)) {
+            _ = try self.writer.write("0\r\n\r\n");
+        }
     }
 };
 
@@ -131,6 +157,24 @@ test "basic response writing" {
     const content = buffer[0..writer.end];
 
     try testing.expectEqualStrings("HTTP/1.1 404 Not Found\r\nContent-Length: 5\r\nContent-Type: text/plain\r\n\r\nhello", content);
+}
+
+test "chunked response writing" {
+    var buffer: [4 * 1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+
+    var res = Response{
+        .status = .OK,
+        .headers = .{ .content_type = "text/plain" },
+        .writer = &writer,
+    };
+    try res.send();
+    try res.writeChunk("hello");
+    try res.end();
+
+    const content = buffer[0..writer.end];
+
+    try testing.expectEqualStrings("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n", content);
 }
 
 fn capitalize(comptime name: []const u8) [name.len]u8 {
@@ -155,6 +199,7 @@ fn capitalize(comptime name: []const u8) [name.len]u8 {
 test "capitalize" {
     try testing.expectEqualStrings("Content-Length", &capitalize("content_length"));
 }
+
 const std = @import("std");
 const testing = std.testing;
 
