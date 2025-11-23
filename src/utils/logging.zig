@@ -75,20 +75,7 @@ test "common logs" {
 
     var logger = Common.init(handler);
 
-    var writer = std.Io.Writer.Discarding.init(&[_]u8{});
-
-    const req: Request = .{
-        .version = .HTTP_1_1,
-        .method = .GET,
-        .uri = .{
-            .path = "/",
-        },
-        .headers = .{},
-        .body = "",
-        .reader = .ending,
-        .writer = &writer.writer,
-        .allocator = testing.allocator,
-    };
+    const req: Request = .example;
     var res = Response.fromRequest(req);
     try logger.interface().handle(req, &res);
 

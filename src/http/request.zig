@@ -173,7 +173,6 @@ pub const Request = struct {
     uri: URI,
     version: Version,
     headers: Headers,
-    body: []const u8,
 
     reader: *std.Io.Reader,
     writer: *std.Io.Writer,
@@ -195,15 +194,11 @@ pub const Request = struct {
         const headers = try Headers.read(allocator, reader);
         errdefer headers.free(allocator);
 
-        //const body = try readBody(allocator, reader, headers, 9999);
-        //errdefer allocator.free(body);
-
         return .{
             .version = version,
             .method = method,
             .uri = uri,
             .headers = headers,
-            .body = "",
 
             .reader = reader,
             .writer = writer,
@@ -212,15 +207,13 @@ pub const Request = struct {
     }
 
     pub fn deinit(self: @This()) void {
-        self.allocator.free(self.body);
         self.allocator.free(self.uri.path);
         self.allocator.free(self.uri.query);
-
         self.headers.free(self.allocator);
     }
 
-    pub fn getContentLength(self: @This()) usize {
-        return std.fmt.parseInt(usize, self.headers.content_length, 10) catch 0;
+    pub fn bodyReader(self: @This(), buffer: []u8) BodyReader {
+        return BodyReader.init(self.headers, self.reader, buffer);
     }
 
     pub const example: Request = .{
@@ -230,7 +223,6 @@ pub const Request = struct {
             .path = "/",
         },
         .headers = .{},
-        .body = "",
         .reader = .ending,
         .writer = &discarding.writer,
         .allocator = testing.allocator,
@@ -253,7 +245,12 @@ test "Parse basic http request with body" {
     try testing.expectEqualStrings("fuz=baz", req.uri.query);
     try testing.expectEqualStrings("application/form-data", req.headers.content_type);
     try testing.expectEqualStrings("9", req.headers.content_length);
-    //try testing.expectEqualStrings("key=value", req.body);
+
+    var body_reader = req.bodyReader(&[0]u8{});
+    var b_reader = body_reader.interface();
+    const body = try b_reader.allocRemaining(testing.allocator, .unlimited);
+    defer testing.allocator.free(body);
+    try testing.expectEqualStrings("key=value", body);
 }
 
 test "Parse http request without body" {
@@ -270,7 +267,12 @@ test "Parse http request without body" {
     try testing.expectEqualStrings("fuz=baz", req.uri.query);
     try testing.expectEqualStrings("application/form-data", req.headers.content_type);
     try testing.expectEqualStrings("0", req.headers.content_length);
-    try testing.expectEqualStrings("", req.body);
+
+    var body_reader = req.bodyReader(&[0]u8{});
+    var b_reader = body_reader.interface();
+    const body = try b_reader.allocRemaining(testing.allocator, .unlimited);
+    defer testing.allocator.free(body);
+    try testing.expectEqualStrings("", body);
 }
 
 test "Parse http request without headers, body" {
@@ -287,7 +289,12 @@ test "Parse http request without headers, body" {
     try testing.expectEqualStrings("fuz=baz", req.uri.query);
     try testing.expectEqualStrings("", req.headers.content_type);
     try testing.expectEqualStrings("", req.headers.content_length);
-    try testing.expectEqualStrings("", req.body);
+
+    var body_reader = req.bodyReader(&[0]u8{});
+    var b_reader = body_reader.interface();
+    const body = try b_reader.allocRemaining(testing.allocator, .unlimited);
+    defer testing.allocator.free(body);
+    try testing.expectEqualStrings("", body);
 }
 
 test "Parse http request without headers, body and qs" {
@@ -304,8 +311,109 @@ test "Parse http request without headers, body and qs" {
     try testing.expectEqualStrings("", req.uri.query);
     try testing.expectEqualStrings("", req.headers.content_type);
     try testing.expectEqualStrings("", req.headers.content_length);
-    try testing.expectEqualStrings("", req.body);
 }
+
+test "Parse http request with chunked body" {
+    const request = "POST / HTTP/1.1\r\nContent-Type: application/form-data\r\nTransfer-Encoding: chunked \r\n\r\n4\r\nkey=\r\n5\r\nvalue\r\n0\r\n\r\n";
+
+    var reader = std.Io.Reader.fixed(request);
+    var writer = std.Io.Writer.Discarding.init(&[_]u8{});
+
+    const req = try Request.read(testing.allocator, &reader, &writer.writer);
+    defer req.deinit();
+
+    try testing.expectEqual(req.method, .POST);
+    try testing.expectEqualStrings("/", req.uri.path);
+
+    var body_reader = req.bodyReader(&[0]u8{});
+    var b_reader = body_reader.interface();
+    const body = try b_reader.allocRemaining(testing.allocator, .unlimited);
+    defer testing.allocator.free(body);
+    try testing.expectEqualStrings("key=value", body);
+}
+
+pub const BodyReader = struct {
+    reader: *std.Io.Reader,
+
+    limited_reader: std.Io.Reader.Limited,
+
+    chunked: bool = false,
+    chunked_interface: std.Io.Reader,
+    chunk: []u8 = "",
+    pos: usize = 0,
+
+    pub fn init(headers: Headers, reader: *std.Io.Reader, buffer: []u8) @This() {
+        const content_len = std.fmt.parseInt(
+            usize,
+            headers.content_length,
+            10,
+        ) catch 0;
+
+        const limited_reader = std.Io.Reader.Limited.init(
+            reader,
+            .limited(content_len),
+            buffer,
+        );
+
+        const chunked = std.ascii.eqlIgnoreCase("chunked", headers.transfer_encoding);
+
+        return @This(){
+            .reader = reader,
+
+            .limited_reader = limited_reader,
+
+            .chunked = chunked,
+            .chunked_interface = .{
+                .vtable = &.{
+                    .stream = @This().streamChunked,
+                },
+                .end = 0,
+                .seek = 0,
+                .buffer = buffer,
+            },
+        };
+    }
+
+    pub fn interface(self: *@This()) *std.Io.Reader {
+        if (!self.chunked) {
+            return &self.limited_reader.interface;
+        } else {
+            return &self.chunked_interface;
+        }
+    }
+
+    fn readChunk(self: *@This()) std.Io.Reader.Error!void {
+        const line0 = self.reader.takeDelimiter('\n') catch return error.ReadFailed;
+        if (line0 == null or line0.?.len == 1) {
+            return error.EndOfStream;
+        }
+        const len = std.fmt.parseInt(usize, line0.?[0 .. line0.?.len - 1], 10) catch 0;
+        if (len == 0) {
+            self.reader.toss(2); // \r\n
+            return error.EndOfStream;
+        }
+        self.chunk = try self.reader.take(len);
+        self.reader.toss(2); // \r\n
+        self.pos = 0;
+    }
+
+    fn streamChunked(
+        reader: *std.Io.Reader,
+        writer: *std.Io.Writer,
+        limit: std.Io.Limit,
+    ) std.Io.Reader.StreamError!usize {
+        const self: *@This() = @alignCast(@fieldParentPtr("chunked_interface", reader));
+
+        if (self.pos == self.chunk.len) {
+            try self.readChunk();
+        }
+
+        const wrote = try writer.write(limit.slice(self.chunk[self.pos..]));
+        self.pos += wrote;
+
+        return wrote;
+    }
+};
 
 const std = @import("std");
 const testing = std.testing;

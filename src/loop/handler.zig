@@ -3,8 +3,12 @@ pub const VTable = struct {
 };
 
 pub const Error = error{
+    StreamTooLong,
+    OutOfMemory,
+    ReadFailed,
     WriteFailed,
     NoSpaceLeft,
+
     Skipped,
 
     Internal,

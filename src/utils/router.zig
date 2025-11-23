@@ -85,7 +85,11 @@ test "struct router" {
             res.body = "baz";
         }
         pub fn @"POST /echo"(_: *@This(), req: Request, res: *Response) !void {
-            res.body = req.body;
+            var buffer: [1024]u8 = undefined;
+            var body_reader = req.bodyReader(&buffer);
+            var reader = body_reader.interface();
+            res.body = try reader.allocRemaining(testing.allocator, .unlimited);
+            //defer testing.allocator.free(res.body);
         }
         pub fn @"GET /echo/?"(_: *@This(), _: Request, res: *Response, params: []const []const u8) !void {
             res.body = params[0];
@@ -115,24 +119,27 @@ test "struct router" {
     try router.interface().handle(req, &res);
     try testing.expectEqualStrings("baz", res.body);
 
+    var echo = std.Io.Reader.fixed("echo");
     req.method = .POST;
     req.uri.path = "/echo";
-    req.body = "echo";
+    req.headers.content_length = "4";
+    req.reader = &echo;
     res = .fromRequest(req);
     try router.interface().handle(req, &res);
     try testing.expectEqualStrings("echo", res.body);
+    testing.allocator.free(res.body);
 
     req.method = .GET;
     req.uri.path = "/echo";
-    req.body = "echo";
     res = .fromRequest(req);
     const err = router.interface().handle(req, &res);
     try testing.expectEqualStrings("", res.body);
     try testing.expectError(error.Skipped, err);
 
+    var world = std.Io.Reader.fixed("world");
     req.method = .GET;
     req.uri.path = "/echo/hello";
-    req.body = "world";
+    req.reader = &world;
     res = .fromRequest(req);
     try router.interface().handle(req, &res);
     try testing.expectEqualStrings("hello", res.body);
@@ -158,7 +165,6 @@ pub const PrefixRouter = struct {
     pub fn route(self: *@This(), src_req: Request, res: *Response) HandlerError!void {
         if (std.mem.startsWith(u8, src_req.uri.path, self.prefix)) {
             const req = Request{
-                .body = src_req.body,
                 .method = src_req.method,
                 .headers = src_req.headers,
                 .version = src_req.version,
