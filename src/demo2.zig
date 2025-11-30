@@ -7,7 +7,11 @@ pub fn main() !void {
     const port: u16 = 8080;
     const address = try std.net.Address.resolveIp(ip, port);
 
-    var server = http.Server.init(allocator, address, .{});
+    var server = http.Server.init(
+        allocator,
+        address,
+        .{},
+    );
     defer server.deinit();
     try server.listen();
 
@@ -21,14 +25,11 @@ pub fn main() !void {
 
     var handler = http.utils.logging.Common.init(combined_handlers.interface());
 
-    var loop = try http.Loop.init(allocator);
+    var loop = try http.Loop.init(allocator, &server, handler.interface());
     defer loop.deinit();
-    try loop.start(&server, handler.interface());
+    try loop.start();
 
-    http.waitSignal();
-    loop.stop();
-    loop.wait();
-    server.stop();
+    http.waitInterrupt();
 }
 
 pub const MyHandler = struct {
@@ -97,15 +98,11 @@ pub const MyHandler = struct {
         };
         var params = Params{};
         var buf: [1024]u8 = undefined;
-        var body_reader = std.Io.Reader.Limited.init(
-            req.reader,
-            .limited(req.getContentLength()),
-            &buf,
-        );
+        var body_reader = req.bodyReader(&buf);
 
         http.utils.formdata.read_formdata(
             self.allocator,
-            &body_reader.interface,
+            body_reader.interface(),
             &params,
         ) catch |err| {
             log.err("error reading body: {any}", .{err});

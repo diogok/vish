@@ -20,7 +20,7 @@ pub const Handler = handler.Handler;
 pub const HandleError = handler.Error;
 pub const Loop = loop.Loop;
 
-pub const waitSignal = signal.wait;
+pub const waitInterrupt = signal.wait;
 
 pub const utils = @import("utils/root.zig");
 

@@ -43,7 +43,7 @@ pub const Server = struct {
 
     pub fn stop(self: *@This()) void {
         if (self.server) |server| {
-            log.warn("Shutdown server", .{});
+            log.warn("Stop server", .{});
             std.posix.shutdown(server.stream.handle, .both) catch {};
         }
     }

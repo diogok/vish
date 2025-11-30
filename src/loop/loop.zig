@@ -6,7 +6,14 @@ pub const Loop = struct {
 
     active: bool,
 
-    pub fn init(allocator: std.mem.Allocator) !@This() {
+    server: *http.Server,
+    handler: *Handler,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        server: *http.Server,
+        handler: *Handler,
+    ) !@This() {
         var pool = try allocator.create(std.Thread.Pool);
         try pool.init(.{ .allocator = allocator });
 
@@ -18,29 +25,30 @@ pub const Loop = struct {
             .thread_pool = pool,
             .wait_group = wg,
             .active = false,
+            .server = server,
+            .handler = handler,
         };
     }
 
     pub fn deinit(self: *@This()) void {
         log.warn("Deinit loop", .{});
         self.stop();
+        self.wait();
         self.thread_pool.deinit();
         self.allocator.destroy(self.thread_pool);
         self.allocator.destroy(self.wait_group);
     }
 
     pub fn stop(self: *@This()) void {
-        log.warn("Shutdown loop", .{});
+        log.warn("Stop loop", .{});
         self.active = false;
     }
 
     pub fn start(
         self: *@This(),
-        server: *http.Server,
-        handler: *Handler,
     ) !void {
         self.active = true;
-        self.thread_pool.spawnWg(self.wait_group, @This().accept, .{ self, server, handler });
+        self.thread_pool.spawnWg(self.wait_group, @This().accept, .{ self, self.server, self.handler });
         log.info("Started", .{});
     }
 
@@ -117,7 +125,17 @@ pub const Loop = struct {
         var res = http.Response.fromRequest(req);
 
         handler.handle(req, &res) catch |err| {
-            log.err("Handle error: {any}", .{err});
+            switch (err) {
+                error.Skipped => {
+                    res.status = .Not_Found;
+                    res.send() catch |err2| {
+                        log.err("Send Not Found error: {any}", .{err2});
+                    };
+                },
+                else => {
+                    log.err("Handle error: {any}", .{err});
+                },
+            }
         };
 
         log.debug("Response: {any}", .{res});
