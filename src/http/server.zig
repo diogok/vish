@@ -32,7 +32,7 @@ pub const Server = struct {
     }
 
     pub fn deinit(self: *@This()) void {
-        log.warn("Deinit server", .{});
+        log.info("Deinit server", .{});
         if (self.server) |server| {
             self.stop();
             server.deinit();
@@ -43,7 +43,7 @@ pub const Server = struct {
 
     pub fn stop(self: *@This()) void {
         if (self.server) |server| {
-            log.warn("Stop server", .{});
+            log.info("Stop server", .{});
             std.posix.shutdown(server.stream.handle, .both) catch {};
         }
     }
@@ -66,7 +66,31 @@ pub const Server = struct {
         );
 
         self.server = server;
-        log.info("Listening", .{});
+
+        const addr = self.getAddressStringAlloc(self.allocator) catch null;
+        if (addr) |add| {
+            defer self.allocator.free(add);
+            log.info("Listening on {s}", .{add});
+        }
+    }
+
+    pub fn getAddress(self: @This()) ?std.net.Address {
+        if (self.server) |svr| {
+            return svr.listen_address;
+        } else {
+            return null;
+        }
+    }
+
+    pub fn getAddressStringAlloc(self: *@This(), allocator: std.mem.Allocator) !?[]const u8 {
+        if (self.getAddress()) |addr| {
+            var alloc_writer = std.Io.Writer.Allocating.init(allocator);
+            defer alloc_writer.deinit();
+            addr.format(&alloc_writer.writer) catch return null;
+            return try alloc_writer.toOwnedSlice();
+        } else {
+            return null;
+        }
     }
 
     pub fn accept(self: *@This()) !?Connection {

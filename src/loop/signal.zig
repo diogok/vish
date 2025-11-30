@@ -10,12 +10,12 @@ pub fn wait() void {
     std.posix.sigaction(std.c.SIG.INT, sigact, null);
     std.posix.sigaction(std.c.SIG.HUP, sigact, null);
 
-    log.warn("Waiting for stop signal.", .{});
+    log.info("Waiting for stop signal.", .{});
     std.Thread.Futex.wait(&interruptSignal, 0);
 }
 
 fn receive(sig: c_int) callconv(.c) void {
-    log.warn("Signal received: {d}", .{sig});
+    log.info("Signal received: {d}", .{sig});
     switch (sig) {
         std.c.SIG.INT, std.c.SIG.HUP => {
             std.Thread.Futex.wake(&interruptSignal, 1);

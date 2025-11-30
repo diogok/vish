@@ -31,7 +31,7 @@ pub const Loop = struct {
     }
 
     pub fn deinit(self: *@This()) void {
-        log.warn("Deinit loop", .{});
+        log.info("Deinit loop", .{});
         self.stop();
         self.wait();
         self.thread_pool.deinit();
@@ -40,7 +40,7 @@ pub const Loop = struct {
     }
 
     pub fn stop(self: *@This()) void {
-        log.warn("Stop loop", .{});
+        log.info("Stop loop", .{});
         self.active = false;
     }
 
