@@ -15,6 +15,14 @@ pub const Status = enum(u16) {
     }
 };
 
+pub const Headers = struct { // how to make customizable?
+    transfer_encoding: []const u8 = "", // make it enum
+    content_length: []const u8 = "", // make it usize
+    content_type: []const u8 = "",
+    connection: []const u8 = "", // make it enum
+    location: []const u8 = "",
+};
+
 pub const Response = struct {
     version: request.Version = .HTTP_1_1,
 
@@ -204,7 +212,6 @@ const std = @import("std");
 const testing = std.testing;
 
 const request = @import("request.zig");
-const Headers = request.Headers;
 const Request = request.Request;
 
 const log = std.log.scoped(.http);

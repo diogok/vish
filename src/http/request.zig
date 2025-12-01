@@ -107,7 +107,6 @@ pub const Headers = struct { // how to make customizable?
     content_length: []const u8 = "", // make it usize
     content_type: []const u8 = "",
     connection: []const u8 = "", // make it enum
-    location: []const u8 = "",
     accept: []const u8 = "",
 
     // maybe add a map for non stantard headers?
