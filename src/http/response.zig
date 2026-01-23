@@ -6,6 +6,7 @@ pub const Status = enum(u16) {
     Not_Modified = 304,
     Temporary_Redirect = 307,
     Permanent_Redirect = 308,
+    Bad_Request = 400,
     Not_Found = 404,
     Internal_Server_Error = 500,
     // TODO: rest of standard codes
