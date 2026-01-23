@@ -7,12 +7,12 @@ pub const Loop = struct {
     active: bool,
 
     server: *http.Server,
-    handler: *Handler,
+    handler: Handler,
 
     pub fn init(
         allocator: std.mem.Allocator,
         server: *http.Server,
-        handler: *Handler,
+        handler: Handler,
     ) !@This() {
         var pool = try allocator.create(std.Thread.Pool);
         try pool.init(.{ .allocator = allocator });
@@ -59,7 +59,7 @@ pub const Loop = struct {
     fn accept(
         self: *@This(),
         server: *http.Server,
-        handler: *Handler,
+        handler: Handler,
     ) void {
         log.debug("Accepting connections", .{});
         defer log.debug("Done accepting connections", .{});
@@ -88,7 +88,7 @@ pub const Loop = struct {
     fn onConnection(
         self: *@This(),
         connection: http.Connection,
-        handler: *Handler,
+        handler: Handler,
     ) void {
         defer connection.deinit();
         defer log.info("Done with connection", .{});
@@ -115,7 +115,7 @@ pub const Loop = struct {
 
     fn onRequest(
         _: *@This(),
-        handler: *Handler,
+        handler: Handler,
         req: http.Request,
     ) enum { close, keep } {
         defer req.deinit();

@@ -1,20 +1,12 @@
 pub const Common = struct {
-    handler: *Handler,
-    interface_state: Handler,
+    handler: Handler,
 
-    pub fn init(handler: *Handler) @This() {
-        return .{
-            .handler = handler,
-            .interface_state = .{
-                .vtable = &.{
-                    .handle = @This().handle,
-                },
-            },
-        };
+    pub fn init(handler: Handler) @This() {
+        return .{ .handler = handler };
     }
 
     pub fn log(
-        self: *@This(),
+        self: @This(),
         req: Request,
         res: *Response,
     ) HandlerError!void {
@@ -44,12 +36,15 @@ pub const Common = struct {
         }
     }
 
-    pub fn interface(r: *@This()) *Handler {
-        return &r.interface_state;
+    pub fn interface(self: *@This()) Handler {
+        return .{
+            .ptr = self,
+            .vtable = &.{ .handle = handle },
+        };
     }
 
-    pub fn handle(h: *Handler, req: Request, res: *Response) HandlerError!void {
-        const self: *@This() = @alignCast(@fieldParentPtr("interface_state", h));
+    fn handle(h: Handler, req: Request, res: *Response) HandlerError!void {
+        const self: *@This() = @ptrCast(@alignCast(h.ptr));
         try self.log(req, res);
     }
 };
@@ -70,8 +65,8 @@ test "common logs" {
     };
     var my_handler = MyHandler{};
 
-    var wrapper_handler = Handler.wrap(MyHandler).init(&my_handler);
-    const handler = (&wrapper_handler).interface();
+    const wrapper_handler = Handler.wrap(MyHandler).init(&my_handler);
+    const handler = wrapper_handler.interface();
 
     var logger = Common.init(handler);
 

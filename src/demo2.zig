@@ -18,7 +18,7 @@ pub fn main() !void {
     var my_handler = MyHandler{
         .allocator = allocator,
     };
-    var struct_handler = http.utils.router.StructRouter(MyHandler).init(&my_handler);
+    const struct_handler = http.utils.router.StructRouter(MyHandler).init(&my_handler);
     var combined_handlers = http.utils.router.CombinedRouter.init(&.{
         struct_handler.interface(),
     });

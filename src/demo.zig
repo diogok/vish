@@ -17,12 +17,12 @@ pub fn main() !void {
     try server.listen();
 
     var my_handler = MyHandler{};
-    var handler = http.Handler.wrap(MyHandler).init(&my_handler);
+    const handler = http.Handler.wrap(MyHandler).init(&my_handler);
 
     var loop = try http.Loop.init(
         allocator,
         &server,
-        (&handler).interface(),
+        handler.interface(),
     );
     defer loop.deinit();
     try loop.start();

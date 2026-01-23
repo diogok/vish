@@ -1,22 +1,12 @@
 pub fn StructRouter(comptime HandlerType: type) type {
     return struct {
-        const Self = @This();
-
         handler: *HandlerType,
-        interface_state: Handler,
 
         pub fn init(handler: *HandlerType) @This() {
-            return .{
-                .handler = handler,
-                .interface_state = .{
-                    .vtable = &.{
-                        .handle = Self.handle,
-                    },
-                },
-            };
+            return .{ .handler = handler };
         }
 
-        pub fn route(self: *@This(), req: Request, res: *Response) HandlerError!void {
+        pub fn route(self: @This(), req: Request, res: *Response) HandlerError!void {
             var path = req.uri.path;
             if (path.len == 0) {
                 path = "/";
@@ -62,12 +52,16 @@ pub fn StructRouter(comptime HandlerType: type) type {
             return error.Skipped;
         }
 
-        pub fn interface(r: *@This()) *Handler {
-            return &r.interface_state;
+        pub fn interface(self: @This()) Handler {
+            return .{
+                .ptr = self.handler,
+                .vtable = &.{ .handle = handle },
+            };
         }
 
-        pub fn handle(h: *Handler, req: Request, res: *Response) HandlerError!void {
-            const self: *Self = @alignCast(@fieldParentPtr("interface_state", h));
+        fn handle(h: Handler, req: Request, res: *Response) HandlerError!void {
+            const concrete: *HandlerType = @ptrCast(@alignCast(h.ptr));
+            const self = @This(){ .handler = concrete };
             try self.route(req, res);
         }
     };
@@ -147,22 +141,16 @@ test "struct router" {
 
 pub const PrefixRouter = struct {
     prefix: []const u8,
-    handler: *Handler,
-    interface_state: Handler,
+    handler: Handler,
 
-    pub fn init(prefix: []const u8, handler: *Handler) @This() {
+    pub fn init(prefix: []const u8, handler: Handler) @This() {
         return .{
             .prefix = prefix,
             .handler = handler,
-            .interface_state = .{
-                .vtable = &.{
-                    .handle = @This().handle,
-                },
-            },
         };
     }
 
-    pub fn route(self: *@This(), src_req: Request, res: *Response) HandlerError!void {
+    pub fn route(self: @This(), src_req: Request, res: *Response) HandlerError!void {
         if (std.mem.startsWith(u8, src_req.uri.path, self.prefix)) {
             const req = Request{
                 .method = src_req.method,
@@ -182,12 +170,15 @@ pub const PrefixRouter = struct {
         }
     }
 
-    pub fn interface(r: *@This()) *Handler {
-        return &r.interface_state;
+    pub fn interface(self: *@This()) Handler {
+        return .{
+            .ptr = self,
+            .vtable = &.{ .handle = handle },
+        };
     }
 
-    pub fn handle(h: *Handler, req: Request, res: *Response) HandlerError!void {
-        const self: *@This() = @alignCast(@fieldParentPtr("interface_state", h));
+    fn handle(h: Handler, req: Request, res: *Response) HandlerError!void {
+        const self: *@This() = @ptrCast(@alignCast(h.ptr));
         try self.route(req, res);
     }
 };
@@ -240,21 +231,13 @@ test "prefix router" {
 }
 
 pub const CombinedRouter = struct {
-    routers: []const *Handler,
-    interface_state: Handler,
+    routers: []const Handler,
 
-    pub fn init(routers: []const *Handler) @This() {
-        return .{
-            .routers = routers,
-            .interface_state = .{
-                .vtable = &.{
-                    .handle = @This().handle,
-                },
-            },
-        };
+    pub fn init(routers: []const Handler) @This() {
+        return .{ .routers = routers };
     }
 
-    pub fn route(self: *@This(), req: Request, res: *Response) HandlerError!void {
+    pub fn route(self: @This(), req: Request, res: *Response) HandlerError!void {
         for (self.routers) |router| {
             router.handle(req, res) catch |err| {
                 switch (err) {
@@ -267,12 +250,15 @@ pub const CombinedRouter = struct {
         return error.Skipped;
     }
 
-    pub fn interface(r: *@This()) *Handler {
-        return &r.interface_state;
+    pub fn interface(self: *@This()) Handler {
+        return .{
+            .ptr = self,
+            .vtable = &.{ .handle = handle },
+        };
     }
 
-    pub fn handle(h: *Handler, req: Request, res: *Response) HandlerError!void {
-        const self: *@This() = @alignCast(@fieldParentPtr("interface_state", h));
+    fn handle(h: Handler, req: Request, res: *Response) HandlerError!void {
+        const self: *@This() = @ptrCast(@alignCast(h.ptr));
         try self.route(req, res);
     }
 };

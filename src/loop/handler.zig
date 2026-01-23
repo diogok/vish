@@ -1,5 +1,5 @@
 pub const VTable = struct {
-    handle: *const fn (h: *Handler, req: Request, res: *Response) Error!void,
+    handle: *const fn (h: Handler, req: Request, res: *Response) Error!void,
 };
 
 pub const Error = error{
@@ -17,10 +17,11 @@ pub const Error = error{
 };
 
 pub const Handler = struct {
+    ptr: *anyopaque,
     vtable: *const VTable,
 
     pub fn handle(
-        self: *@This(),
+        self: Handler,
         req: Request,
         res: *Response,
     ) Error!void {
@@ -29,29 +30,22 @@ pub const Handler = struct {
 
     pub fn wrap(HandlerType: type) type {
         return struct {
-            const Self = @This();
-
             handler: *HandlerType,
-            interface_state: Handler,
 
-            pub fn init(handler: *HandlerType) Self {
+            pub fn init(handler: *HandlerType) @This() {
+                return .{ .handler = handler };
+            }
+
+            pub fn interface(self: @This()) Handler {
                 return .{
-                    .handler = handler,
-                    .interface_state = .{
-                        .vtable = &.{
-                            .handle = Self.handle,
-                        },
-                    },
+                    .ptr = self.handler,
+                    .vtable = &.{ .handle = @This().handleFn },
                 };
             }
 
-            pub fn interface(r: *@This()) *Handler {
-                return &r.interface_state;
-            }
-
-            pub fn handle(h: *Handler, req: Request, res: *Response) Error!void {
-                const self: *Self = @alignCast(@fieldParentPtr("interface_state", h));
-                try self.handler.handle(req, res);
+            fn handleFn(h: Handler, req: Request, res: *Response) Error!void {
+                const concrete: *HandlerType = @ptrCast(@alignCast(h.ptr));
+                try concrete.handle(req, res);
             }
         };
     }
