@@ -1,8 +1,8 @@
 pub fn StructRouter(comptime HandlerType: type) type {
     return struct {
-        handler: *HandlerType,
+        handler: HandlerType,
 
-        pub fn init(handler: *HandlerType) @This() {
+        pub fn init(handler: HandlerType) @This() {
             return .{ .handler = handler };
         }
 
@@ -52,16 +52,15 @@ pub fn StructRouter(comptime HandlerType: type) type {
             return error.Skipped;
         }
 
-        pub fn interface(self: @This()) Handler {
+        pub fn interface(self: *@This()) Handler {
             return .{
-                .ptr = self.handler,
+                .ptr = self,
                 .vtable = &.{ .handle = handle },
             };
         }
 
         fn handle(h: Handler, req: Request, res: *Response) HandlerError!void {
-            const concrete: *HandlerType = @ptrCast(@alignCast(h.ptr));
-            const self = @This(){ .handler = concrete };
+            const self: *@This() = @ptrCast(@alignCast(h.ptr));
             try self.route(req, res);
         }
     };
@@ -69,29 +68,28 @@ pub fn StructRouter(comptime HandlerType: type) type {
 
 test "struct router" {
     const MyRouter = struct {
-        pub fn @"GET /"(_: *@This(), _: Request, res: *Response) !void {
+        pub fn @"GET /"(_: @This(), _: Request, res: *Response) !void {
             res.body = "hi";
         }
-        pub fn @"GET /foo"(_: *@This(), _: Request, res: *Response) !void {
+        pub fn @"GET /foo"(_: @This(), _: Request, res: *Response) !void {
             res.body = "bar";
         }
-        pub fn @"GET /foo/bar"(_: *@This(), _: Request, res: *Response) !void {
+        pub fn @"GET /foo/bar"(_: @This(), _: Request, res: *Response) !void {
             res.body = "baz";
         }
-        pub fn @"POST /echo"(_: *@This(), req: Request, res: *Response) !void {
+        pub fn @"POST /echo"(_: @This(), req: Request, res: *Response) !void {
             var buffer: [1024]u8 = undefined;
             var body_reader = req.bodyReader(&buffer);
             var reader = body_reader.interface();
             res.body = try reader.allocRemaining(testing.allocator, .unlimited);
             //defer testing.allocator.free(res.body);
         }
-        pub fn @"GET /echo/?"(_: *@This(), _: Request, res: *Response, params: []const []const u8) !void {
+        pub fn @"GET /echo/?"(_: @This(), _: Request, res: *Response, params: []const []const u8) !void {
             res.body = params[0];
         }
     };
 
-    var my_router = MyRouter{};
-    var router = StructRouter(MyRouter).init(&my_router);
+    var router = StructRouter(MyRouter).init(.{});
 
     var req: Request = .example;
     var res: Response = .fromRequest(req);
@@ -185,17 +183,16 @@ pub const PrefixRouter = struct {
 
 test "prefix router" {
     const MyRouter = struct {
-        pub fn @"GET /bar"(_: *@This(), _: Request, res: *Response) !void {
+        pub fn @"GET /bar"(_: @This(), _: Request, res: *Response) !void {
             res.body = "work";
         }
-        pub fn @"GET /baz"(_: *@This(), req: Request, res: *Response) !void {
+        pub fn @"GET /baz"(_: @This(), req: Request, res: *Response) !void {
             res.body = req.uri.path;
         }
-        pub fn deinit(_: *@This()) void {}
+        pub fn deinit(_: @This()) void {}
     };
 
-    var my_router = MyRouter{};
-    var router0 = StructRouter(MyRouter).init(&my_router);
+    var router0 = StructRouter(MyRouter).init(.{});
     var router = PrefixRouter.init("/foo", router0.interface());
 
     var req: Request = .example;
@@ -265,23 +262,21 @@ pub const CombinedRouter = struct {
 
 test "combined router" {
     const MyRouter0 = struct {
-        pub fn @"GET /"(_: *@This(), _: Request, res: *Response) !void {
+        pub fn @"GET /"(_: @This(), _: Request, res: *Response) !void {
             res.body = "hi";
         }
-        pub fn @"GET /foo"(_: *@This(), _: Request, res: *Response) !void {
+        pub fn @"GET /foo"(_: @This(), _: Request, res: *Response) !void {
             res.body = "bar";
         }
     };
     const MyRouter1 = struct {
-        pub fn @"GET /foo/bar"(_: *@This(), _: Request, res: *Response) !void {
+        pub fn @"GET /foo/bar"(_: @This(), _: Request, res: *Response) !void {
             res.body = "baz";
         }
     };
 
-    var my_router0 = MyRouter0{};
-    var my_router1 = MyRouter1{};
-    var router0 = StructRouter(MyRouter0).init(&my_router0);
-    var router1 = StructRouter(MyRouter1).init(&my_router1);
+    var router0 = StructRouter(MyRouter0).init(.{});
+    var router1 = StructRouter(MyRouter1).init(.{});
     var prefix_router0 = PrefixRouter.init("/sub", router0.interface());
     var prefix_router1 = PrefixRouter.init("/sub", router1.interface());
 

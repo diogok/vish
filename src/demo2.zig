@@ -15,10 +15,9 @@ pub fn main() !void {
     defer server.deinit();
     try server.listen();
 
-    var my_handler = MyHandler{
+    var struct_handler = http.utils.router.StructRouter(MyHandler).init(.{
         .allocator = allocator,
-    };
-    const struct_handler = http.utils.router.StructRouter(MyHandler).init(&my_handler);
+    });
     var combined_handlers = http.utils.router.CombinedRouter.init(&.{
         struct_handler.interface(),
     });
@@ -36,7 +35,7 @@ pub const MyHandler = struct {
     allocator: std.mem.Allocator,
 
     pub fn @"GET /"(
-        _: *@This(),
+        _: @This(),
         _: http.Request,
         res: *http.Response,
     ) http.HandleError!void {
@@ -46,7 +45,7 @@ pub const MyHandler = struct {
     }
 
     pub fn @"GET /err"(
-        _: *@This(),
+        _: @This(),
         _: http.Request,
         _: *http.Response,
     ) http.HandleError!void {
@@ -54,7 +53,7 @@ pub const MyHandler = struct {
     }
 
     pub fn @"GET /hello"(
-        self: *@This(),
+        self: @This(),
         req: http.Request,
         res: *http.Response,
     ) http.HandleError!void {
@@ -89,7 +88,7 @@ pub const MyHandler = struct {
     }
 
     pub fn @"POST /hello"(
-        self: *@This(),
+        self: @This(),
         req: http.Request,
         res: *http.Response,
     ) http.HandleError!void {
