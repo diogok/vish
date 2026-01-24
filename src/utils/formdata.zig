@@ -73,6 +73,46 @@ test "read form-data decode" {
     try testing.expectEqualStrings("bar zz", target.@"foo/bar");
 }
 
+/// Get the raw (URL-encoded) value for a key from a query string or form data.
+/// Returns null if the key is not found.
+pub fn get(data: []const u8, key: []const u8) ?[]const u8 {
+    var iter = std.mem.splitScalar(u8, data, '&');
+    while (iter.next()) |segment| {
+        if (segment.len == 0) continue;
+        if (std.mem.indexOfScalar(u8, segment, '=')) |eq_pos| {
+            if (std.mem.eql(u8, segment[0..eq_pos], key)) {
+                return segment[eq_pos + 1 ..];
+            }
+        }
+    }
+    return null;
+}
+
+/// Get the decoded value for a key from a query string or form data.
+/// Returns null if the key is not found.
+/// Caller owns the returned memory.
+pub fn getDecoded(allocator: std.mem.Allocator, data: []const u8, key: []const u8) !?[]u8 {
+    const raw = get(data, key) orelse return null;
+    return try uriencode.decodeAlloc(allocator, raw);
+}
+
+test "get" {
+    try testing.expectEqualStrings("bar", get("foo=bar&baz=qux", "foo").?);
+    try testing.expectEqualStrings("qux", get("foo=bar&baz=qux", "baz").?);
+    try testing.expectEqualStrings("hello%20world", get("path=hello%20world", "path").?);
+    try testing.expect(get("foo=bar", "missing") == null);
+    try testing.expectEqualStrings("", get("empty=&foo=bar", "empty").?);
+}
+
+test "getDecoded" {
+    const result = try getDecoded(testing.allocator, "path=hello%20world&foo=bar", "path");
+    defer testing.allocator.free(result.?);
+    try testing.expectEqualStrings("hello world", result.?);
+
+    try testing.expect(try getDecoded(testing.allocator, "foo=bar", "missing") == null);
+}
+
 const std = @import("std");
 const testing = std.testing;
-const decode = @import("uriencode.zig").decode;
+const uriencode = @import("uriencode.zig");
+const decode = uriencode.decode;
