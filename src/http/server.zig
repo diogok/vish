@@ -8,8 +8,8 @@ pub const ListenOptions = struct {
     read_timeout_in_millis: u32 = 1000,
     write_timeout_in_millis: u32 = 1000,
 
-    read_buffer_size: usize = 1 * 1024,
-    write_buffer_size: usize = 1 * 1024,
+    read_buffer_size: usize = 8 * 1024,
+    write_buffer_size: usize = 8 * 1024,
 };
 
 pub const Server = struct {
@@ -142,8 +142,10 @@ pub const Connection = struct {
     read_buffer: []u8,
     write_buffer: []u8,
 
-    net_reader: *std.net.Stream.Reader,
-    net_writer: *std.net.Stream.Writer,
+    net_reader: std.net.Stream.Reader,
+    net_writer: std.net.Stream.Writer,
+
+    arena: std.heap.ArenaAllocator,
 
     pub fn init(
         server: *Server,
@@ -152,33 +154,30 @@ pub const Connection = struct {
         const read_buffer = try server.allocator.alloc(u8, server.options.read_buffer_size);
         const write_buffer = try server.allocator.alloc(u8, server.options.write_buffer_size);
 
-        const net_reader = try server.allocator.create(std.net.Stream.Reader);
-        net_reader.* = connection.stream.reader(read_buffer);
-
-        const net_writer = try server.allocator.create(std.net.Stream.Writer);
-        net_writer.* = connection.stream.writer(write_buffer);
-
         return @This(){
             .server = server,
             .connection = connection,
             .read_buffer = read_buffer,
             .write_buffer = write_buffer,
-            .net_reader = net_reader,
-            .net_writer = net_writer,
+            .net_reader = connection.stream.reader(read_buffer),
+            .net_writer = connection.stream.writer(write_buffer),
+            .arena = std.heap.ArenaAllocator.init(server.allocator),
         };
     }
 
-    pub fn deinit(self: @This()) void {
+    pub fn deinit(self: *@This()) void {
+        self.arena.deinit();
         self.server.allocator.free(self.read_buffer);
         self.server.allocator.free(self.write_buffer);
-        self.server.allocator.destroy(self.net_reader);
-        self.server.allocator.destroy(self.net_writer);
         self.connection.stream.close();
     }
 
-    pub fn next(self: @This()) !?Request {
+    pub fn next(self: *@This()) !?Request {
+        // Reset arena for each new request (reuses memory from previous request)
+        _ = self.arena.reset(.retain_capacity);
+
         return Request.read(
-            self.server.allocator,
+            self.arena.allocator(),
             self.net_reader.interface(),
             &self.net_writer.interface,
         ) catch |err| {

@@ -90,12 +90,13 @@ pub const Loop = struct {
         connection: http.Connection,
         handler: Handler,
     ) void {
-        defer connection.deinit();
+        var conn = connection;
+        defer conn.deinit();
         defer log.info("Done with connection", .{});
 
         log.info("Connection started", .{});
         while (self.active) {
-            const request = connection.next() catch |err| {
+            const request = conn.next() catch |err| {
                 log.err("Error reading request: {any}", .{err});
                 return;
             };
@@ -118,7 +119,7 @@ pub const Loop = struct {
         handler: Handler,
         req: http.Request,
     ) enum { close, keep } {
-        defer req.deinit();
+        // Note: Request cleanup is handled by arena reset in Connection.next()
 
         log.debug("Request: {any}", .{req});
 

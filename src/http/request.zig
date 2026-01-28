@@ -93,10 +93,10 @@ pub const Version = enum {
                 return "HTTP/1.1";
             },
             .HTTP_0_9 => {
-                return "HTTP/1.0";
+                return "HTTP/0.9";
             },
             .HTTP_1_0 => {
-                return "HTTP/0.9";
+                return "HTTP/1.0";
             },
         }
     }
@@ -155,7 +155,7 @@ pub const Headers = struct { // how to make customizable?
     pub fn read(allocator: std.mem.Allocator, reader: *std.Io.Reader) !Headers {
         var target = Headers{};
         // TODO: config max line?
-        var line_buffer: [256]u8 = undefined;
+        var line_buffer: [4096]u8 = undefined;
 
         while (true) {
             const maybe_line = try reader.takeDelimiter('\n');
@@ -375,6 +375,38 @@ test "Parse http request with chunked body" {
     try testing.expectEqualStrings("key=value", body);
 }
 
+test "Parse chunked body with hex chunk sizes" {
+    // Chunk sizes in HTTP are hexadecimal per RFC 7230 §4.1
+    // 'a' = 10 bytes, '5' = 5 bytes
+    const request = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked \r\n\r\na\r\n0123456789\r\n5\r\nabcde\r\n0\r\n\r\n";
+
+    var reader = std.Io.Reader.fixed(request);
+    var writer = std.Io.Writer.Discarding.init(&[_]u8{});
+
+    const req = try Request.read(testing.allocator, &reader, &writer.writer);
+    defer req.deinit();
+
+    var body_reader = req.bodyReader(&[0]u8{});
+    var b_reader = body_reader.interface();
+    const body = try b_reader.allocRemaining(testing.allocator, .unlimited);
+    defer testing.allocator.free(body);
+    try testing.expectEqualStrings("0123456789abcde", body);
+}
+
+test "Parse long header value (>256 bytes)" {
+    // A header value longer than 256 bytes should be parsed correctly
+    const long_value = "a" ** 300;
+    const request = "GET / HTTP/1.1\r\nContent-Type: " ++ long_value ++ "\r\n\r\n";
+
+    var reader = std.Io.Reader.fixed(request);
+    var writer = std.Io.Writer.Discarding.init(&[_]u8{});
+
+    const req = try Request.read(testing.allocator, &reader, &writer.writer);
+    defer req.deinit();
+
+    try testing.expectEqualStrings(long_value, req.headers.content_type);
+}
+
 test "Parse transfer-encoding deflate" {
     const request = "POST / HTTP/1.1\r\nTransfer-Encoding: deflate\r\n\r\n";
 
@@ -385,6 +417,12 @@ test "Parse transfer-encoding deflate" {
     defer req.deinit();
 
     try testing.expectEqual(.deflate, req.headers.transfer_encoding.?);
+}
+
+test "Version.string() returns correct values" {
+    try testing.expectEqualStrings("HTTP/0.9", Version.HTTP_0_9.string());
+    try testing.expectEqualStrings("HTTP/1.0", Version.HTTP_1_0.string());
+    try testing.expectEqualStrings("HTTP/1.1", Version.HTTP_1_1.string());
 }
 
 test "Parse transfer-encoding defaults to null" {
@@ -448,7 +486,7 @@ pub const BodyReader = struct {
         if (line0 == null or line0.?.len == 1) {
             return error.EndOfStream;
         }
-        const len = std.fmt.parseInt(usize, line0.?[0 .. line0.?.len - 1], 10) catch 0;
+        const len = std.fmt.parseInt(usize, line0.?[0 .. line0.?.len - 1], 16) catch 0;
         if (len == 0) {
             self.reader.toss(2); // \r\n
             return error.EndOfStream;
