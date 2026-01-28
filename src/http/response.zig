@@ -33,16 +33,13 @@ pub const TransferEncoding = enum(u1) {
     deflate = 1,
 
     pub fn getValue(self: @This()) []const u8 {
-        return switch (self) {
-            .chunked => "chunked",
-            .deflate => "deflate",
-        };
+        return @tagName(self);
     }
 };
 
 pub const Headers = struct { // how to make customizable?
     transfer_encoding: ?TransferEncoding = null,
-    content_length: []const u8 = "", // make it usize
+    content_length: ?usize = null,
     content_type: []const u8 = "",
     connection: ?Connection = null,
     location: []const u8 = "",
@@ -105,8 +102,8 @@ pub const Response = struct {
         self: *@This(),
     ) !void {
         // set content-length if not set and we have a string body
-        if (self.headers.content_length.len == 0 and self.body.len > 0) {
-            self.headers.content_length = try std.fmt.bufPrint(&self.buffer, "{d}", .{self.body.len});
+        if (self.headers.content_length == null and self.body.len > 0) {
+            self.headers.content_length = self.body.len;
         }
         inline for (std.meta.fields(Headers)) |field| {
             const headerName = comptime capitalize(field.name);
@@ -121,6 +118,10 @@ pub const Response = struct {
             } else if (field.type == ?TransferEncoding) {
                 if (@field(self.headers, field.name)) |te| {
                     try self.sendHeader(self.writer, &headerName, te.getValue());
+                }
+            } else if (field.type == ?usize) {
+                if (@field(self.headers, field.name)) |val| {
+                    try self.writer.print("{s}: {d}\r\n", .{ &headerName, val });
                 }
             }
         }
@@ -151,7 +152,7 @@ pub const Response = struct {
         self: *@This(),
         len: usize,
     ) void {
-        self.headers.content_length = std.fmt.bufPrint(&self.buffer, "{d}", .{len}) catch "0";
+        self.headers.content_length = len;
     }
 
     pub fn writeChunk(

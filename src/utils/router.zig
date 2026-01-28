@@ -114,7 +114,7 @@ test "struct router" {
     var echo = std.Io.Reader.fixed("echo");
     req.method = .POST;
     req.uri.path = "/echo";
-    req.headers.content_length = "4";
+    req.headers.content_length = 4;
     req.reader = &echo;
     res = .fromRequest(req);
     try router.interface().handle(req, &res);

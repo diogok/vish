@@ -107,8 +107,15 @@ pub const Connection = enum(u1) {
     close = 1,
 
     pub fn parse(bytes: []const u8) Connection {
-        if (std.ascii.eqlIgnoreCase(bytes, "keep-alive")) {
-            return .keep_alive;
+        inline for (std.meta.fields(@This())) |field| {
+            const name = comptime blk: {
+                var buf: [field.name.len]u8 = undefined;
+                _ = std.mem.replace(u8, field.name, "_", "-", &buf);
+                break :blk buf;
+            };
+            if (std.ascii.eqlIgnoreCase(bytes, &name)) {
+                return @enumFromInt(field.value);
+            }
         }
         return .close;
     }
@@ -119,10 +126,10 @@ pub const TransferEncoding = enum(u1) {
     deflate = 1,
 
     pub fn parse(bytes: []const u8) ?TransferEncoding {
-        if (std.ascii.eqlIgnoreCase(bytes, "chunked")) {
-            return .chunked;
-        } else if (std.ascii.eqlIgnoreCase(bytes, "deflate")) {
-            return .deflate;
+        inline for (std.meta.fields(@This())) |field| {
+            if (std.ascii.eqlIgnoreCase(bytes, field.name)) {
+                return @enumFromInt(field.value);
+            }
         }
         return null;
     }
@@ -130,7 +137,7 @@ pub const TransferEncoding = enum(u1) {
 
 pub const Headers = struct { // how to make customizable?
     transfer_encoding: ?TransferEncoding = null,
-    content_length: []const u8 = "", // make it usize
+    content_length: usize = 0,
     content_type: []const u8 = "",
     connection: ?Connection = null,
     accept: []const u8 = "",
@@ -192,6 +199,8 @@ pub const Headers = struct { // how to make customizable?
                         @field(target, field.name) = Connection.parse(clean_value);
                     } else if (field.type == ?TransferEncoding) {
                         @field(target, field.name) = TransferEncoding.parse(clean_value);
+                    } else if (field.type == usize) {
+                        @field(target, field.name) = std.fmt.parseInt(usize, clean_value, 10) catch 0;
                     }
                 }
             }
@@ -299,7 +308,7 @@ test "Parse http request without body" {
     try testing.expectEqualStrings("/foo/bar", req.uri.path);
     try testing.expectEqualStrings("fuz=baz", req.uri.query);
     try testing.expectEqualStrings("application/form-data", req.headers.content_type);
-    try testing.expectEqualStrings("0", req.headers.content_length);
+    try testing.expectEqual(0, req.headers.content_length);
 
     var body_reader = req.bodyReader(&[0]u8{});
     var b_reader = body_reader.interface();
@@ -321,7 +330,7 @@ test "Parse http request without headers, body" {
     try testing.expectEqualStrings("/foo/bar", req.uri.path);
     try testing.expectEqualStrings("fuz=baz", req.uri.query);
     try testing.expectEqualStrings("", req.headers.content_type);
-    try testing.expectEqualStrings("", req.headers.content_length);
+    try testing.expectEqual(0, req.headers.content_length);
 
     var body_reader = req.bodyReader(&[0]u8{});
     var b_reader = body_reader.interface();
@@ -343,7 +352,7 @@ test "Parse http request without headers, body and qs" {
     try testing.expectEqualStrings("/foo/bar", req.uri.path);
     try testing.expectEqualStrings("", req.uri.query);
     try testing.expectEqualStrings("", req.headers.content_type);
-    try testing.expectEqualStrings("", req.headers.content_length);
+    try testing.expectEqual(0, req.headers.content_length);
 }
 
 test "Parse http request with chunked body" {
@@ -401,15 +410,9 @@ pub const BodyReader = struct {
     pos: usize = 0,
 
     pub fn init(headers: Headers, reader: *std.Io.Reader, buffer: []u8) @This() {
-        const content_len = std.fmt.parseInt(
-            usize,
-            headers.content_length,
-            10,
-        ) catch 0;
-
         const limited_reader = std.Io.Reader.Limited.init(
             reader,
-            .limited(content_len),
+            .limited(headers.content_length),
             buffer,
         );
 

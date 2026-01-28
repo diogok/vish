@@ -14,7 +14,7 @@ pub const Common = struct {
 
         const date = get_current_date();
 
-        const fmt = "{s} - - [{s}] \"{s} {s} {s}\" {d} {s}\n";
+        const fmt = "{s} - - [{s}] \"{s} {s} {s}\" {d} {?d}\n";
         const args = .{
             "", // should be client address
             date,
