@@ -144,9 +144,9 @@ pub const Loop = struct {
             log.err("Writer flush error: {any}", .{err});
         };
 
-        if (std.ascii.eqlIgnoreCase(req.headers.connection, "close") or
-            std.ascii.eqlIgnoreCase(res.headers.connection, "close"))
-        {
+        const req_conn = req.headers.connection orelse .close;
+        const res_conn = res.headers.connection orelse .close;
+        if (req_conn == .close or res_conn == .close) {
             return .close;
         } else {
             return .keep;

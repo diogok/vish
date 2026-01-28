@@ -102,18 +102,32 @@ pub const Version = enum {
     }
 };
 
+pub const Connection =  enum(u1) {
+    keep_alive=0,
+    close=1,
+
+    pub fn parse(bytes: []const u8) Connection {
+        if (std.ascii.eqlIgnoreCase(bytes, "keep-alive")) {
+            return .keep_alive;
+        }
+        return .close;
+    }
+};
+
 pub const Headers = struct { // how to make customizable?
     transfer_encoding: []const u8 = "", // make it enum
     content_length: []const u8 = "", // make it usize
     content_type: []const u8 = "",
-    connection: []const u8 = "", // make it enum
+    connection: ?Connection = null,
     accept: []const u8 = "",
 
     // maybe add a map for non stantard headers?
 
     pub fn free(self: @This(), allocator: std.mem.Allocator) void {
         inline for (std.meta.fields(@This())) |field| {
-            allocator.free(@field(self, field.name));
+            if (field.type == []const u8) {
+                allocator.free(@field(self, field.name));
+            }
         }
     }
 
@@ -158,7 +172,11 @@ pub const Headers = struct { // how to make customizable?
             inline for (std.meta.fields(Headers)) |field| {
                 if (std.mem.eql(u8, field.name, key)) {
                     const clean_value = std.mem.trim(u8, value, " ");
-                    @field(target, field.name) = try allocator.dupe(u8, clean_value);
+                    if (field.type == []const u8) {
+                        @field(target, field.name) = try allocator.dupe(u8, clean_value);
+                    } else if (field.type == ?Connection) {
+                        @field(target, field.name) = Connection.parse(clean_value);
+                    }
                 }
             }
         }

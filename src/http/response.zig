@@ -16,11 +16,23 @@ pub const Status = enum(u16) {
     }
 };
 
+pub const Connection = enum(u1) {
+    keep_alive=0,
+    close=1,
+
+    pub fn getValue(self: @This()) []const u8{
+        return switch (self) {
+            .keep_alive => "keep-alive",
+            .close => "close",
+        };
+    }
+};
+
 pub const Headers = struct { // how to make customizable?
     transfer_encoding: []const u8 = "", // make it enum
     content_length: []const u8 = "", // make it usize
     content_type: []const u8 = "",
-    connection: []const u8 = "", // make it enum
+    connection: ?Connection = null,
     location: []const u8 = "",
 };
 
@@ -40,10 +52,11 @@ pub const Response = struct {
     writer: *std.Io.Writer,
 
     pub fn fromRequest(src: Request) @This() {
+        const conn:?Connection = if(src.headers.connection) |conn|  @enumFromInt(@intFromEnum(conn)) else null;
         return .{
             .version = src.version,
             .headers = .{
-                .connection = src.headers.connection,
+                .connection = conn,
             },
             .writer = src.writer,
         };
@@ -84,9 +97,15 @@ pub const Response = struct {
             self.headers.content_length = try std.fmt.bufPrint(&self.buffer, "{d}", .{self.body.len});
         }
         inline for (std.meta.fields(Headers)) |field| {
-            if (@field(self.headers, field.name).len > 0) {
-                const headerName = comptime capitalize(field.name);
-                try self.sendHeader(self.writer, &headerName, @field(self.headers, field.name));
+            const headerName = comptime capitalize(field.name);
+            if (field.type == []const u8) {
+                if (@field(self.headers, field.name).len > 0) {
+                    try self.sendHeader(self.writer, &headerName, @field(self.headers, field.name));
+                }
+            } else if (field.type == ?Connection) {
+                if (@field(self.headers, field.name)) |conn| {
+                    try self.sendHeader(self.writer, &headerName, conn.getValue());
+                }
             }
         }
         self.sent_headers = true;
