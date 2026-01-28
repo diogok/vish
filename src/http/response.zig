@@ -17,10 +17,10 @@ pub const Status = enum(u16) {
 };
 
 pub const Connection = enum(u1) {
-    keep_alive=0,
-    close=1,
+    keep_alive = 0,
+    close = 1,
 
-    pub fn getValue(self: @This()) []const u8{
+    pub fn getValue(self: @This()) []const u8 {
         return switch (self) {
             .keep_alive => "keep-alive",
             .close => "close",
@@ -52,7 +52,7 @@ pub const Response = struct {
     writer: *std.Io.Writer,
 
     pub fn fromRequest(src: Request) @This() {
-        const conn:?Connection = if(src.headers.connection) |conn|  @enumFromInt(@intFromEnum(conn)) else null;
+        const conn: ?Connection = if (src.headers.connection) |conn| @enumFromInt(@intFromEnum(conn)) else null;
         return .{
             .version = src.version,
             .headers = .{

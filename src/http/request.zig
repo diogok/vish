@@ -102,9 +102,9 @@ pub const Version = enum {
     }
 };
 
-pub const Connection =  enum(u1) {
-    keep_alive=0,
-    close=1,
+pub const Connection = enum(u1) {
+    keep_alive = 0,
+    close = 1,
 
     pub fn parse(bytes: []const u8) Connection {
         if (std.ascii.eqlIgnoreCase(bytes, "keep-alive")) {

@@ -36,7 +36,7 @@ pub fn decode(reader: *std.Io.Reader, writer: *std.Io.Writer) !void {
     }
 }
 
-pub const DecodeError = error{OutOfMemory, InvalidEncoding};
+pub const DecodeError = error{ OutOfMemory, InvalidEncoding };
 
 /// Decode a URL-encoded slice, returning an allocated slice.
 /// Caller owns the returned memory.
