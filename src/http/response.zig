@@ -28,8 +28,20 @@ pub const Connection = enum(u1) {
     }
 };
 
+pub const TransferEncoding = enum(u1) {
+    chunked = 0,
+    deflate = 1,
+
+    pub fn getValue(self: @This()) []const u8 {
+        return switch (self) {
+            .chunked => "chunked",
+            .deflate => "deflate",
+        };
+    }
+};
+
 pub const Headers = struct { // how to make customizable?
-    transfer_encoding: []const u8 = "", // make it enum
+    transfer_encoding: ?TransferEncoding = null,
     content_length: []const u8 = "", // make it usize
     content_type: []const u8 = "",
     connection: ?Connection = null,
@@ -106,6 +118,10 @@ pub const Response = struct {
                 if (@field(self.headers, field.name)) |conn| {
                     try self.sendHeader(self.writer, &headerName, conn.getValue());
                 }
+            } else if (field.type == ?TransferEncoding) {
+                if (@field(self.headers, field.name)) |te| {
+                    try self.sendHeader(self.writer, &headerName, te.getValue());
+                }
             }
         }
         self.sent_headers = true;
@@ -145,8 +161,8 @@ pub const Response = struct {
         if (!self.sent_status) {
             try self.sendStatus();
         }
-        if (self.headers.transfer_encoding.len == 0) {
-            self.headers.transfer_encoding = "chunked";
+        if (self.headers.transfer_encoding == null) {
+            self.headers.transfer_encoding = .chunked;
             if (!self.sent_headers) {
                 try self.sendHeaders();
                 try self.sendNewline();
@@ -164,7 +180,7 @@ pub const Response = struct {
         if (!self.sent_newline) {
             try self.sendNewline();
         }
-        if (std.ascii.eqlIgnoreCase("chunked", self.headers.transfer_encoding)) {
+        if (self.headers.transfer_encoding == .chunked) {
             _ = try self.writer.write("0\r\n\r\n");
         }
     }

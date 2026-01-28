@@ -114,8 +114,22 @@ pub const Connection = enum(u1) {
     }
 };
 
+pub const TransferEncoding = enum(u1) {
+    chunked = 0,
+    deflate = 1,
+
+    pub fn parse(bytes: []const u8) ?TransferEncoding {
+        if (std.ascii.eqlIgnoreCase(bytes, "chunked")) {
+            return .chunked;
+        } else if (std.ascii.eqlIgnoreCase(bytes, "deflate")) {
+            return .deflate;
+        }
+        return null;
+    }
+};
+
 pub const Headers = struct { // how to make customizable?
-    transfer_encoding: []const u8 = "", // make it enum
+    transfer_encoding: ?TransferEncoding = null,
     content_length: []const u8 = "", // make it usize
     content_type: []const u8 = "",
     connection: ?Connection = null,
@@ -176,6 +190,8 @@ pub const Headers = struct { // how to make customizable?
                         @field(target, field.name) = try allocator.dupe(u8, clean_value);
                     } else if (field.type == ?Connection) {
                         @field(target, field.name) = Connection.parse(clean_value);
+                    } else if (field.type == ?TransferEncoding) {
+                        @field(target, field.name) = TransferEncoding.parse(clean_value);
                     }
                 }
             }
@@ -261,7 +277,7 @@ test "Parse basic http request with body" {
     try testing.expectEqualStrings("/foo/bar", req.uri.path);
     try testing.expectEqualStrings("fuz=baz", req.uri.query);
     try testing.expectEqualStrings("application/form-data", req.headers.content_type);
-    try testing.expectEqualStrings("9", req.headers.content_length);
+    try testing.expectEqual(9, req.headers.content_length);
 
     var body_reader = req.bodyReader(&[0]u8{});
     var b_reader = body_reader.interface();
@@ -341,12 +357,37 @@ test "Parse http request with chunked body" {
 
     try testing.expectEqual(req.method, .POST);
     try testing.expectEqualStrings("/", req.uri.path);
+    try testing.expectEqual(.chunked, req.headers.transfer_encoding.?);
 
     var body_reader = req.bodyReader(&[0]u8{});
     var b_reader = body_reader.interface();
     const body = try b_reader.allocRemaining(testing.allocator, .unlimited);
     defer testing.allocator.free(body);
     try testing.expectEqualStrings("key=value", body);
+}
+
+test "Parse transfer-encoding deflate" {
+    const request = "POST / HTTP/1.1\r\nTransfer-Encoding: deflate\r\n\r\n";
+
+    var reader = std.Io.Reader.fixed(request);
+    var writer = std.Io.Writer.Discarding.init(&[_]u8{});
+
+    const req = try Request.read(testing.allocator, &reader, &writer.writer);
+    defer req.deinit();
+
+    try testing.expectEqual(.deflate, req.headers.transfer_encoding.?);
+}
+
+test "Parse transfer-encoding defaults to null" {
+    const request = "GET / HTTP/1.1\r\n\r\n";
+
+    var reader = std.Io.Reader.fixed(request);
+    var writer = std.Io.Writer.Discarding.init(&[_]u8{});
+
+    const req = try Request.read(testing.allocator, &reader, &writer.writer);
+    defer req.deinit();
+
+    try testing.expectEqual(null, req.headers.transfer_encoding);
 }
 
 pub const BodyReader = struct {
@@ -372,7 +413,7 @@ pub const BodyReader = struct {
             buffer,
         );
 
-        const chunked = std.ascii.eqlIgnoreCase("chunked", headers.transfer_encoding);
+        const chunked = headers.transfer_encoding == .chunked;
 
         return @This(){
             .reader = reader,
