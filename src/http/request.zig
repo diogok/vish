@@ -77,11 +77,12 @@ pub const Version = enum {
     }
 
     pub fn parse(bytes: []const u8) !Version {
-        if (std.ascii.eqlIgnoreCase(bytes, "HTTP/1.1")) {
+        // HTTP versions are always uppercase per spec - use exact comparison
+        if (std.mem.eql(u8, bytes, "HTTP/1.1")) {
             return .HTTP_1_1;
-        } else if (std.ascii.eqlIgnoreCase(bytes, "HTTP/1.0")) {
+        } else if (std.mem.eql(u8, bytes, "HTTP/1.0")) {
             return .HTTP_1_0;
-        } else if (std.ascii.eqlIgnoreCase(bytes, "HTTP/0.9")) {
+        } else if (std.mem.eql(u8, bytes, "HTTP/0.9")) {
             return .HTTP_0_9;
         } else {
             log.err("Invalid HTTP version: {s}", .{bytes});
@@ -158,8 +159,6 @@ pub const Headers = struct {
 
     pub fn read(allocator: std.mem.Allocator, reader: *std.Io.Reader) !Headers {
         var target = Headers{};
-        // TODO: config max header line length
-        var line_buffer: [4096]u8 = undefined;
 
         while (true) {
             const maybe_line = try reader.takeDelimiter('\n');
@@ -167,13 +166,10 @@ pub const Headers = struct {
                 @branchHint(.unlikely);
                 continue;
             }
-
-            // somehow I can't just use maybe_line
-            std.mem.copyForwards(u8, &line_buffer, maybe_line.?);
-            var line = line_buffer[0..maybe_line.?.len];
+            const line = maybe_line.?;
 
             if (line.len == 1) {
-                // last header line
+                // last header line (just \r)
                 break;
             }
 
@@ -184,19 +180,20 @@ pub const Headers = struct {
             }
             const separator_pos = maybe_separator.?;
 
-            const key: []u8 = line[0..separator_pos];
-            const value: []u8 = line[separator_pos + 1 .. line.len - 1];
-            for (key, 0..) |b, i| {
-                if (b == '-') {
-                    key[i] = '_';
-                } else {
-                    key[i] = std.ascii.toLower(b);
-                }
-            }
+            const key = line[0..separator_pos];
+            const value = line[separator_pos + 1 .. line.len - 1];
 
-            // comptime check each field of header
+            // comptime check each field of header using case-insensitive compare
+            // with length check to short-circuit early
             inline for (std.meta.fields(Headers)) |field| {
-                if (std.mem.eql(u8, field.name, key)) {
+                // Convert field name from snake_case to kebab-case at comptime
+                const header_name = comptime blk: {
+                    var buf: [field.name.len]u8 = undefined;
+                    _ = std.mem.replace(u8, field.name, "_", "-", &buf);
+                    break :blk buf;
+                };
+                // Length check first for fast rejection
+                if (key.len == header_name.len and std.ascii.eqlIgnoreCase(key, &header_name)) {
                     const clean_value = std.mem.trim(u8, value, " ");
                     if (field.type == []const u8) {
                         @field(target, field.name) = try allocator.dupe(u8, clean_value);

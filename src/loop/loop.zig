@@ -36,7 +36,8 @@ pub const Loop = struct {
         handler: Handler,
     ) !@This() {
         var pool = try allocator.create(std.Thread.Pool);
-        try pool.init(.{ .allocator = allocator });
+        const cpu_count = std.Thread.getCpuCount() catch 4;
+        try pool.init(.{ .allocator = allocator, .n_jobs = @intCast(cpu_count * 4) });
 
         const wg = try allocator.create(std.Thread.WaitGroup);
         wg.* = std.Thread.WaitGroup{};
