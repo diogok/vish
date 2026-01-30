@@ -1,3 +1,5 @@
+//! HTTP response handling.
+
 pub const Status = enum(u16) {
     OK = 200,
     Moved_Permanentely = 301,
@@ -37,14 +39,21 @@ pub const TransferEncoding = enum(u1) {
     }
 };
 
-pub const Headers = struct { // how to make customizable?
+pub const Headers = struct {
     transfer_encoding: ?TransferEncoding = null,
     content_length: ?usize = null,
     content_type: []const u8 = "",
     connection: ?Connection = null,
     location: []const u8 = "",
+
+    // TODO: add optional hashmap for other headers
 };
 
+/// HTTP response builder with state tracking for incremental sending.
+///
+/// The response can be sent in multiple ways:
+/// 1. Simple: Set body and call send() - sends everything at once
+/// 2. Chunked: Call writeChunk() multiple times, then end()
 pub const Response = struct {
     version: request.Version = .HTTP_1_1,
 
@@ -52,14 +61,19 @@ pub const Response = struct {
     headers: Headers = .{},
     body: []const u8 = "",
 
+    /// True after the status line (e.g., "HTTP/1.1 200 OK\r\n") has been sent
     sent_status: bool = false,
+    /// True after all headers have been sent (but before the blank line)
     sent_headers: bool = false,
+    /// True after the blank line separating headers from body has been sent
     sent_newline: bool = false,
 
     buffer: [9]u8 = undefined,
 
     writer: *std.Io.Writer,
 
+    /// Create a response pre-configured from the request.
+    /// Copies the HTTP version and Connection header from the request.
     pub fn fromRequest(src: Request) @This() {
         const conn: ?Connection = if (src.headers.connection) |conn| @enumFromInt(@intFromEnum(conn)) else null;
         return .{
@@ -243,6 +257,51 @@ fn capitalize(comptime name: []const u8) [name.len]u8 {
 
 test "capitalize" {
     try testing.expectEqualStrings("Content-Length", &capitalize("content_length"));
+}
+
+test "multiple chunks in chunked response" {
+    var buffer: [4 * 1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+
+    var res = Response{
+        .status = .OK,
+        .writer = &writer,
+    };
+    try res.writeChunk("first");
+    try res.writeChunk("second");
+    try res.writeChunk("third");
+    try res.end();
+
+    const content = buffer[0..writer.end];
+    try testing.expectEqualStrings("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nfirst\r\n6\r\nsecond\r\n5\r\nthird\r\n0\r\n\r\n", content);
+}
+
+test "setContentLength updates headers" {
+    var buffer: [4 * 1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+
+    var res = Response{
+        .status = .OK,
+        .writer = &writer,
+    };
+    res.setContentLength(42);
+
+    try testing.expectEqual(@as(?usize, 42), res.headers.content_length);
+}
+
+test "empty body response" {
+    var buffer: [4 * 1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+
+    var res = Response{
+        .status = .Not_Modified,
+        .writer = &writer,
+    };
+    try res.send();
+
+    const content = buffer[0..writer.end];
+    // 304 responses typically have no body
+    try testing.expectEqualStrings("HTTP/1.1 304 Not Modified\r\n", content);
 }
 
 const std = @import("std");

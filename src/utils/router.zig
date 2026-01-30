@@ -1,3 +1,16 @@
+//! HTTP request routing module.
+//!
+//! Provides flexible routing mechanisms for dispatching HTTP requests to appropriate handlers based on method and path patterns.
+
+
+/// Provider a Handler for a Router where each route pattern is a struct method.
+/// Example:
+/// ```
+/// const MyRouter = struct {
+///   pub fn "GET /"(self: @This(), request: Request, response: *Response) !void {}
+///   pub fn "POST /hello/?"(self: @This(), request: Request, response: *Response) !void {}
+/// };
+/// ```
 pub fn StructRouter(comptime HandlerType: type) type {
     return struct {
         handler: HandlerType,
@@ -137,6 +150,7 @@ test "struct router" {
     try testing.expectEqualStrings("hello", res.body);
 }
 
+/// Routes to a handler if the URI perfix matches.
 pub const PrefixRouter = struct {
     prefix: []const u8,
     handler: Handler,
@@ -227,6 +241,7 @@ test "prefix router" {
     try testing.expectError(error.Skipped, err);
 }
 
+/// Handler that attempts a series of routers until one matches.
 pub const CombinedRouter = struct {
     routers: []const Handler,
 
@@ -325,6 +340,8 @@ test "combined router" {
     try testing.expectEqualStrings("baz", res.body);
 }
 
+/// Count the number of wildcard parameters ("?") in a route pattern.
+/// Used to determine the size of the params array at compile time.
 fn params_len(src_route: []const u8) usize {
     const route = std.mem.trimRight(u8, src_route, "/");
     var size: usize = 0;
@@ -336,17 +353,30 @@ fn params_len(src_route: []const u8) usize {
     return size;
 }
 
+/// Match a request path against a route pattern with wildcard support.
+///
+/// Route patterns can contain "?" as wildcards that match any single path segment.
+/// The matched segments are captured and returned in the params array.
+///
+/// Examples
+/// - Route "/users/?/posts" matches path "/users/123/posts" -> params = ["123"]
+/// - Route "/?" matches path "/anything" -> params = ["anything"]
+/// - Route "/foo/bar" matches path "/foo/bar" exactly (no params)
+///
+/// Returns null if the path doesn't match the route pattern.
 fn check_match(comptime src_route: []const u8, src_path: []const u8) ?[params_len(src_route)][]const u8 {
+    // Normalize paths by trimming trailing slashes
     const route = comptime std.mem.trimRight(u8, src_route, "/");
     const path = std.mem.trimRight(u8, src_path, "/");
 
     var params: [params_len(route)][]const u8 = undefined;
 
+    // Empty route matches empty path
     if (route.len == 0 and path.len == 0) {
         return params;
     }
 
-    // number of sections on target route
+    // Count segments in route pattern (compile-time)
     const route_len: usize = comptime blk: {
         var size: usize = 0;
         for (route) |c| {
@@ -357,7 +387,7 @@ fn check_match(comptime src_route: []const u8, src_path: []const u8) ?[params_le
         break :blk size;
     };
 
-    // number of sections on request path
+    // Count segments in request path (runtime)
     const path_len: usize = blk: {
         var size: usize = 0;
         for (path) |c| {
@@ -368,24 +398,27 @@ fn check_match(comptime src_route: []const u8, src_path: []const u8) ?[params_le
         break :blk size;
     };
 
+    // Paths with different number of segments cannot match
     if (path_len != route_len) {
         return null;
     }
 
+    // Routes with no segments match (both are empty or "/")
     if (route_len == 0) {
         return params;
     }
 
+    // Routes with no wildcards: early return if segment counts match
     if (params.len == 0) {
         return params;
     }
 
-    // split the target route into parts
+    // Split route into segments (compile-time)
     const route_parts: [route_len][]const u8 = blk: {
         var parts: [route_len][]const u8 = undefined;
         var index: usize = 0;
         var split = std.mem.splitScalar(u8, route, '/');
-        _ = split.first();
+        _ = split.first(); // skip empty string before first "/"
         while (split.next()) |part| {
             parts[index] = part;
             index += 1;
@@ -393,12 +426,12 @@ fn check_match(comptime src_route: []const u8, src_path: []const u8) ?[params_le
         break :blk parts;
     };
 
-    // split the request path into parts
+    // Split request path into segments (runtime)
     const req_parts: [route_len][]const u8 = blk: {
         var parts: [route_len][]const u8 = undefined;
         var index: usize = 0;
         var split = std.mem.splitScalar(u8, path, '/');
-        _ = split.first();
+        _ = split.first(); // skip empty string before first "/"
         while (split.next()) |part| {
             parts[index] = part;
             index += 1;

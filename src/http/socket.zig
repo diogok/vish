@@ -1,4 +1,7 @@
-//! Utilities to configure the socket
+//! Socket configuration utilities for TCP server operations.
+//!
+//! Provides cross-platform utilities for configuring TCP sockets,
+//! like timeout, keep-alive, and TCP No Delay.
 
 /// Set send and receive timeout on the socket.
 pub fn setTimeout(
@@ -25,7 +28,10 @@ pub fn setTimeout(
     );
 }
 
-/// Make a timevalue, to be used on timeout functions.
+/// Convert milliseconds to a POSIX timeval structure.
+///
+/// This is used for setting socket timeout options (SO_RCVTIMEO, SO_SNDTIMEO).
+/// The timeval structure splits time into seconds and microseconds.
 pub fn makeTimevalue(millis: u32) std.posix.timeval {
     const micros: i32 = @as(i32, @intCast(millis)) * 1000;
 
@@ -36,7 +42,14 @@ pub fn makeTimevalue(millis: u32) std.posix.timeval {
     return timeval;
 }
 
-/// Wait until a connection is ready to be accepted
+/// Wait until a connection is ready to be accepted on the given socket.
+///
+/// Uses platform-specific polling mechanisms:
+/// - Windows: select() with fd_set
+/// - Other platforms: poll() with pollfd
+///
+/// Returns `error.Timeout` if no connection is ready within the timeout period.
+/// This allows the server to periodically check for shutdown signals.
 pub fn wait(fd: std.posix.socket_t, timeout_in_ms: u32) !void {
     switch (builtin.os.tag) {
         .windows => {
@@ -67,7 +80,13 @@ pub fn wait(fd: std.posix.socket_t, timeout_in_ms: u32) !void {
     return;
 }
 
-/// Set common server flags: keepalive and nodelay, according to options
+/// Set common TCP server socket options.
+///
+/// ## Options
+/// - `tcp_keep_alive`: Enable TCP keep-alive probes to detect dead connections
+/// - `tcp_no_delay`: Disable Nagle's algorithm for lower latency (sends small packets immediately)
+///
+/// Note: Currently only implemented for Linux. Other platforms are no-ops.
 pub fn setServerFlags(fd: std.posix.socket_t, options: struct { tcp_keep_alive: bool, tcp_no_delay: bool }) !void {
     switch (builtin.os.tag) {
         .linux => {
@@ -90,6 +109,33 @@ pub fn setServerFlags(fd: std.posix.socket_t, options: struct { tcp_keep_alive: 
         },
         else => {},
     }
+}
+
+test "makeTimevalue converts milliseconds to seconds and microseconds" {
+    // Test exact seconds
+    const tv1 = makeTimevalue(1000);
+    try testing.expectEqual(@as(isize, 1), tv1.sec);
+    try testing.expectEqual(@as(isize, 0), tv1.usec);
+
+    // Test with microseconds remainder
+    const tv2 = makeTimevalue(1500);
+    try testing.expectEqual(@as(isize, 1), tv2.sec);
+    try testing.expectEqual(@as(isize, 500000), tv2.usec);
+
+    // Test zero
+    const tv3 = makeTimevalue(0);
+    try testing.expectEqual(@as(isize, 0), tv3.sec);
+    try testing.expectEqual(@as(isize, 0), tv3.usec);
+
+    // Test milliseconds only (less than 1 second)
+    const tv4 = makeTimevalue(250);
+    try testing.expectEqual(@as(isize, 0), tv4.sec);
+    try testing.expectEqual(@as(isize, 250000), tv4.usec);
+
+    // Test multiple seconds
+    const tv5 = makeTimevalue(5000);
+    try testing.expectEqual(@as(isize, 5), tv5.sec);
+    try testing.expectEqual(@as(isize, 0), tv5.usec);
 }
 
 const std = @import("std");

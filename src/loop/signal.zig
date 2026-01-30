@@ -1,6 +1,9 @@
+//! Signal handling utils
+
 const Signal = std.atomic.Value(u32);
 const interruptSignal = Signal.init(0);
 
+/// Wait on default interrupt (INT or HUP) signals
 pub fn wait() void {
     const sigact = &std.posix.Sigaction{
         .handler = .{ .handler = receive },

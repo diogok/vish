@@ -1,3 +1,6 @@
+//! Form data and query string parsing.
+
+/// Parses URL-encoded form data and query strings, like used in HTTP POST bodies (application/x-www-form-urlencoded) and URL query parameters.
 pub fn read_formdata(
     allocator: std.mem.Allocator,
     reader: *std.Io.Reader,

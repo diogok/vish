@@ -1,3 +1,5 @@
+//! Handler is an "interface" (using a vtable) for handling HTTP Requests.
+
 pub const VTable = struct {
     handle: *const fn (h: Handler, req: Request, res: *Response) Error!void,
 };
@@ -28,6 +30,7 @@ pub const Handler = struct {
         return self.vtable.handle(self, req, res);
     }
 
+    /// Utility to wrap any struct with a compatible Handle function
     pub fn wrap(HandlerType: type) type {
         return struct {
             handler: *HandlerType,

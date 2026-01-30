@@ -1,3 +1,24 @@
+//! Event loop for handling concurrent HTTP connections.
+//!
+//! Provides a multi-threaded event loop that accepts connections
+//! and dispatches them to handler functions.
+//!
+//! It uses a thread pool to process multiple connections concurrently,
+//! and handle shutdown and cleanup as needed.
+//!
+//! ## Main flow
+//! - Main accept loop runs in its own thread, waiting for new connections
+//! - Each connection is dispatched to a thread pool worker
+//! - Workers process requests in a keep-alive loop until the connection closes
+//! - Graceful shutdown stops accepting new connections and waits for workers to finish
+//!
+//! ## Lifecycle
+//! - Accept thread receives connection and spawns worker task
+//! - Worker reads requests in a loop (supporting HTTP keep-alive)
+//! - Each request is passed to the handler, which populates the response
+//! - Response is flushed; connection continues or closes based on Connection header
+//! - Connection arena is reset between requests for memory efficiency
+
 pub const Loop = struct {
     allocator: std.mem.Allocator,
 
@@ -56,6 +77,7 @@ pub const Loop = struct {
         self.thread_pool.waitAndWork(self.wait_group);
     }
 
+    /// While loop is active, accept a connection (when available), and start a thread to handle it
     fn accept(
         self: *@This(),
         server: *http.Server,
@@ -85,6 +107,16 @@ pub const Loop = struct {
         }
     }
 
+    /// Handle a single TCP connection, processing multiple HTTP requests (keep-alive).
+    ///
+    /// This function runs in a thread pool worker and processes requests in a loop
+    /// until either:
+    /// - The connection is closed (Connection: close header)
+    /// - A read error occurs (timeout, client disconnect)
+    /// - The server is shutting down (self.active == false)
+    ///
+    /// Memory for each request is managed by the Connection's allocator,
+    /// which is reset between requests.
     fn onConnection(
         self: *@This(),
         connection: http.Connection,
@@ -95,6 +127,7 @@ pub const Loop = struct {
         defer log.info("Done with connection", .{});
 
         log.info("Connection started", .{});
+        // Keep-alive loop: process multiple requests on the same connection
         while (self.active) {
             const request = conn.next() catch |err| {
                 log.err("Error reading request: {any}", .{err});
@@ -104,16 +137,21 @@ pub const Loop = struct {
                 const conn_header = self.onRequest(handler, req);
                 switch (conn_header) {
                     .close => {
-                        return;
+                        return; // Client or server requested connection close
                     },
-                    .keep => {},
+                    .keep => {}, // Continue to next request
                 }
             } else {
-                return;
+                return; // No more data (client closed connection or timeout)
             }
         }
     }
 
+    /// Process a single HTTP request and determine if the connection should continue.
+    ///
+    /// Returns .close if either the request or response has Connection: close,
+    /// indicating the connection should be terminated after this response.
+    /// Returns .keep to continue processing requests on this connection.
     fn onRequest(
         _: *@This(),
         handler: Handler,

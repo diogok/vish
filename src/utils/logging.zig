@@ -1,3 +1,4 @@
+/// A handler for logging request in Common Log Format.
 pub const Common = struct {
     handler: Handler,
 

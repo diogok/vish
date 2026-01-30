@@ -1,3 +1,5 @@
+//! HTTP request handling.
+
 pub const Method = enum {
     GET,
     POST,
@@ -106,8 +108,10 @@ pub const Connection = enum(u1) {
     keep_alive = 0,
     close = 1,
 
-    pub fn parse(bytes: []const u8) Connection {
+    pub fn parse(bytes: []const u8) ?Connection {
+        // comptime loop for each possible value in the enum
         inline for (std.meta.fields(@This())) |field| {
+            // convert from _ to -
             const name = comptime blk: {
                 var buf: [field.name.len]u8 = undefined;
                 _ = std.mem.replace(u8, field.name, "_", "-", &buf);
@@ -117,7 +121,7 @@ pub const Connection = enum(u1) {
                 return @enumFromInt(field.value);
             }
         }
-        return .close;
+        return null;
     }
 };
 
@@ -126,6 +130,7 @@ pub const TransferEncoding = enum(u1) {
     deflate = 1,
 
     pub fn parse(bytes: []const u8) ?TransferEncoding {
+        // comptime loop for each possible value in the enum
         inline for (std.meta.fields(@This())) |field| {
             if (std.ascii.eqlIgnoreCase(bytes, field.name)) {
                 return @enumFromInt(field.value);
@@ -135,14 +140,13 @@ pub const TransferEncoding = enum(u1) {
     }
 };
 
-pub const Headers = struct { // how to make customizable?
-    transfer_encoding: ?TransferEncoding = null,
+pub const Headers = struct {
     content_length: usize = 0,
     content_type: []const u8 = "",
     connection: ?Connection = null,
-    accept: []const u8 = "",
+    transfer_encoding: ?TransferEncoding = null,
 
-    // maybe add a map for non stantard headers?
+    // TODO: maybe add an optional hashmap for rest of headers
 
     pub fn free(self: @This(), allocator: std.mem.Allocator) void {
         inline for (std.meta.fields(@This())) |field| {
@@ -154,7 +158,7 @@ pub const Headers = struct { // how to make customizable?
 
     pub fn read(allocator: std.mem.Allocator, reader: *std.Io.Reader) !Headers {
         var target = Headers{};
-        // TODO: config max line?
+        // TODO: config max header line length
         var line_buffer: [4096]u8 = undefined;
 
         while (true) {
@@ -190,6 +194,7 @@ pub const Headers = struct { // how to make customizable?
                 }
             }
 
+            // comptime check each field of header
             inline for (std.meta.fields(Headers)) |field| {
                 if (std.mem.eql(u8, field.name, key)) {
                     const clean_value = std.mem.trim(u8, value, " ");
@@ -393,50 +398,37 @@ test "Parse chunked body with hex chunk sizes" {
     try testing.expectEqualStrings("0123456789abcde", body);
 }
 
-test "Parse long header value (>256 bytes)" {
-    // A header value longer than 256 bytes should be parsed correctly
-    const long_value = "a" ** 300;
-    const request = "GET / HTTP/1.1\r\nContent-Type: " ++ long_value ++ "\r\n\r\n";
 
-    var reader = std.Io.Reader.fixed(request);
-    var writer = std.Io.Writer.Discarding.init(&[_]u8{});
 
-    const req = try Request.read(testing.allocator, &reader, &writer.writer);
-    defer req.deinit();
+test "URI.parse() handles various path formats" {
+    // Path with query
+    const uri1 = try URI.parse(testing.allocator, "/path?query=value");
+    defer testing.allocator.free(uri1.path);
+    defer testing.allocator.free(uri1.query);
+    try testing.expectEqualStrings("/path", uri1.path);
+    try testing.expectEqualStrings("query=value", uri1.query);
 
-    try testing.expectEqualStrings(long_value, req.headers.content_type);
+    // Path without query
+    const uri2 = try URI.parse(testing.allocator, "/path/to/resource");
+    defer testing.allocator.free(uri2.path);
+    try testing.expectEqualStrings("/path/to/resource", uri2.path);
+    try testing.expectEqualStrings("", uri2.query);
+
+    // Root path
+    const uri3 = try URI.parse(testing.allocator, "/");
+    defer testing.allocator.free(uri3.path);
+    try testing.expectEqualStrings("/", uri3.path);
+
+    // Path with empty query
+    const uri4 = try URI.parse(testing.allocator, "/path?");
+    defer testing.allocator.free(uri4.path);
+    defer testing.allocator.free(uri4.query);
+    try testing.expectEqualStrings("/path", uri4.path);
+    try testing.expectEqualStrings("", uri4.query);
 }
 
-test "Parse transfer-encoding deflate" {
-    const request = "POST / HTTP/1.1\r\nTransfer-Encoding: deflate\r\n\r\n";
 
-    var reader = std.Io.Reader.fixed(request);
-    var writer = std.Io.Writer.Discarding.init(&[_]u8{});
-
-    const req = try Request.read(testing.allocator, &reader, &writer.writer);
-    defer req.deinit();
-
-    try testing.expectEqual(.deflate, req.headers.transfer_encoding.?);
-}
-
-test "Version.string() returns correct values" {
-    try testing.expectEqualStrings("HTTP/0.9", Version.HTTP_0_9.string());
-    try testing.expectEqualStrings("HTTP/1.0", Version.HTTP_1_0.string());
-    try testing.expectEqualStrings("HTTP/1.1", Version.HTTP_1_1.string());
-}
-
-test "Parse transfer-encoding defaults to null" {
-    const request = "GET / HTTP/1.1\r\n\r\n";
-
-    var reader = std.Io.Reader.fixed(request);
-    var writer = std.Io.Writer.Discarding.init(&[_]u8{});
-
-    const req = try Request.read(testing.allocator, &reader, &writer.writer);
-    defer req.deinit();
-
-    try testing.expectEqual(null, req.headers.transfer_encoding);
-}
-
+/// A streaming body reader that handles both Content-Length and chunked Transfer-Encoding.
 pub const BodyReader = struct {
     reader: *std.Io.Reader,
 

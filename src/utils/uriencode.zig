@@ -1,3 +1,12 @@
+//! URL encoding and decoding.
+//!
+//! Provides functions for percent-encoding and decoding strings
+//! according to RFC 3986.
+//!
+//! It's used for encoding special characters in URLs
+//! and decoding form data/query parameters.
+//!
+
 pub fn encode(reader: *std.Io.Reader, writer: *std.Io.Writer) !void {
     while (true) {
         const char = reader.takeByte() catch |err| {

@@ -1,3 +1,17 @@
+//! HTTP server and connection management module.
+//!
+//! This module provides the core server infrastructure for accepting TCP connections
+//! and managing their lifecycle.
+//!
+//! It handles socket configuration, timeouts, and
+//! buffer allocation for efficient request/response processing.
+//!
+//! The server uses a non-blocking accept with configurable timeout, allowing the
+//! event loop to periodically check for shutdown signals.
+//!
+//! Each connection gets its own arena allocator that is reset between requests.
+//! ```
+
 pub const ListenOptions = struct {
     kernel_backlog: u31 = 1024,
     reuse_address: bool = true,
