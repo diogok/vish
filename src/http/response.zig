@@ -201,9 +201,8 @@ pub const Response = struct {
             self.headers.transfer_encoding = .chunked;
             if (!self.sent_headers) {
                 try self.sendHeaders();
-                try self.sendNewline();
-            } else {
-                try self.sendHeader(self.writer, "Transfer-Encoding", "chunked");
+            }
+            if (!self.sent_newline) {
                 try self.sendNewline();
             }
         }
@@ -276,13 +275,12 @@ test "chunked response writing" {
         .headers = .{ .content_type = "text/plain" },
         .writer = &writer,
     };
-    try res.send();
     try res.writeChunk("hello");
     try res.end();
 
     const content = buffer[0..writer.end];
 
-    try testing.expectEqualStrings("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n", content);
+    try testing.expectEqualStrings("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: text/plain\r\n\r\n5\r\nhello\r\n0\r\n\r\n", content);
 }
 
 fn capitalize(comptime name: []const u8) [name.len]u8 {

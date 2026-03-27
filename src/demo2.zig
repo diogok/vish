@@ -18,8 +18,10 @@ pub fn main() !void {
     var struct_handler = http.utils.router.StructRouter(MyHandler).init(.{
         .allocator = allocator,
     });
+    var static_handler = http.utils.router.StaticRouter(assets).init();
     var combined_handlers = http.utils.router.CombinedRouter.init(&.{
         struct_handler.interface(),
+        static_handler.interface(),
     });
 
     var handler = http.utils.logging.Common.init(combined_handlers.interface());
@@ -126,6 +128,7 @@ pub const MyHandler = struct {
 
 const std = @import("std");
 const http = @import("http");
+const assets = @import("assets");
 const log = std.log.scoped(.demo);
 
 pub const std_options: std.Options = .{

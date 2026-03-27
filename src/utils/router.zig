@@ -499,9 +499,106 @@ test "matching paths" {
     try testing.expectEqualStrings(m9.?[0], "bar");
 }
 
+/// Serves static assets using a comptime Assets module (e.g. one created by `addStaticAssets`).
+/// The Assets type must have a `get(allocator, path) ?[]const u8` function.
+///
+/// Only responds to GET requests. Returns `error.Skipped` for non-GET methods,
+/// empty paths, path traversal attempts, or missing files.
+///
+/// Example:
+/// ```
+/// const assets = @import("assets");
+/// var static = StaticRouter(assets).init();
+/// ```
+pub fn StaticRouter(comptime Assets: type) type {
+    return struct {
+        pub fn init() @This() {
+            return .{};
+        }
+
+        pub fn route(_: @This(), req: Request, res: *Response) HandlerError!void {
+            if (req.method != .GET) return error.Skipped;
+
+            const path = std.mem.trimLeft(u8, req.uri.path, "/");
+            if (path.len == 0) return error.Skipped;
+            if (std.fs.path.isAbsolute(path)) return error.Skipped;
+
+            // Reject path traversal: ".." as a segment (start, middle, or end)
+            var it = std.mem.splitScalar(u8, path, '/');
+            while (it.next()) |segment| {
+                if (std.mem.eql(u8, segment, "..")) return error.Skipped;
+            }
+
+            const content = Assets.get(req.allocator, path) orelse return error.Skipped;
+            res.headers.content_type = mime.guess(path);
+            res.body = content;
+            try res.send();
+        }
+
+        pub fn interface(self: *@This()) Handler {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .handle = handle },
+            };
+        }
+
+        fn handle(h: Handler, req: Request, res: *Response) HandlerError!void {
+            const self: *@This() = @ptrCast(@alignCast(h.ptr));
+            try self.route(req, res);
+        }
+    };
+}
+
+test "static router" {
+    const MockAssets = struct {
+        pub fn get(_: std.mem.Allocator, path: []const u8) ?[]const u8 {
+            if (std.mem.eql(u8, path, "index.html")) return "<html></html>";
+            if (std.mem.eql(u8, path, "style.css")) return "body {}";
+            return null;
+        }
+    };
+
+    var buffer: [4 * 1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+
+    var router = StaticRouter(MockAssets).init();
+
+    var req: Request = .example;
+    req.uri.path = "/index.html";
+    req.writer = &writer;
+    var res: Response = .fromRequest(req);
+    try router.interface().handle(req, &res);
+    try testing.expectEqualStrings("<html></html>", res.body);
+    try testing.expectEqualStrings("text/html", res.headers.content_type);
+
+    req.uri.path = "/style.css";
+    res = .fromRequest(req);
+    try router.interface().handle(req, &res);
+    try testing.expectEqualStrings("body {}", res.body);
+    try testing.expectEqualStrings("text/css", res.headers.content_type);
+
+    req.uri.path = "/missing.html";
+    res = .fromRequest(req);
+    try testing.expectError(error.Skipped, router.interface().handle(req, &res));
+
+    req.uri.path = "/../etc/passwd";
+    res = .fromRequest(req);
+    try testing.expectError(error.Skipped, router.interface().handle(req, &res));
+
+    req.uri.path = "/";
+    res = .fromRequest(req);
+    try testing.expectError(error.Skipped, router.interface().handle(req, &res));
+
+    req.method = .POST;
+    req.uri.path = "/index.html";
+    res = .fromRequest(req);
+    try testing.expectError(error.Skipped, router.interface().handle(req, &res));
+}
+
 const std = @import("std");
 const testing = std.testing;
 
+const mime = @import("mime.zig");
 const Request = @import("../http/request.zig").Request;
 const Response = @import("../http/response.zig").Response;
 const Handler = @import("../loop/handler.zig").Handler;
