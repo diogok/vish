@@ -44,11 +44,13 @@ pub fn StructRouter(comptime HandlerType: type) type {
                 if (hasMatching) {
                     const maybe_matches = check_match(fn_path, path);
                     if (maybe_matches) |matches| {
-                        const func = @field(HandlerType, decl.name);
-                        // TODO: can I make the args a struct?
-                        const args = .{ self.handler, req, res, matches[0..] };
-                        try @call(.auto, func, args);
-                        return;
+                        if (std.mem.eql(u8, fn_method, @tagName(req.method))) {
+                            const func = @field(HandlerType, decl.name);
+                            // TODO: can I make the args a struct?
+                            const args = .{ self.handler, req, res, matches[0..] };
+                            try @call(.auto, func, args);
+                            return;
+                        }
                     }
                 } else {
                     if (std.mem.eql(u8, fn_path, path)) {
@@ -148,6 +150,13 @@ test "struct router" {
     res = .fromRequest(req);
     try router.interface().handle(req, &res);
     try testing.expectEqualStrings("hello", res.body);
+
+    // Wildcard routes must check HTTP method — POST /echo/hello should not match GET /echo/?
+    req.method = .POST;
+    req.uri.path = "/echo/hello";
+    res = .fromRequest(req);
+    const err2 = router.interface().handle(req, &res);
+    try testing.expectError(error.Skipped, err2);
 }
 
 /// Routes to a handler if the URI perfix matches.

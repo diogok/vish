@@ -11,6 +11,7 @@ const signal = @import("loop/signal.zig");
 
 pub const Request = request.Request;
 pub const Response = response.Response;
+pub const Status = response.Status;
 
 pub const Server = server.Server;
 pub const Connection = server.Connection;

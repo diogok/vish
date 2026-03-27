@@ -8,8 +8,17 @@ pub const Status = enum(u16) {
     Not_Modified = 304,
     Temporary_Redirect = 307,
     Permanent_Redirect = 308,
+    Created = 201,
+    Accepted = 202,
+    No_Content = 204,
     Bad_Request = 400,
+    Unauthorized = 401,
+    Forbidden = 403,
     Not_Found = 404,
+    Method_Not_Allowed = 405,
+    Conflict = 409,
+    Unprocessable_Entity = 422,
+    Too_Many_Requests = 429,
     Internal_Server_Error = 500,
     // TODO: rest of standard codes
 
@@ -39,14 +48,21 @@ pub const TransferEncoding = enum(u1) {
     }
 };
 
+pub const ExtraHeader = struct {
+    name: []const u8 = "",
+    value: []const u8 = "",
+};
+
 pub const Headers = struct {
     transfer_encoding: ?TransferEncoding = null,
     content_length: ?usize = null,
     content_type: []const u8 = "",
+    cache_control: []const u8 = "",
     connection: ?Connection = null,
     location: []const u8 = "",
+    set_cookie: []const u8 = "",
 
-    // TODO: add optional hashmap for other headers
+    extra: []const ExtraHeader = &.{},
 };
 
 /// HTTP response builder with state tracking for incremental sending.
@@ -88,8 +104,8 @@ pub const Response = struct {
     pub fn send(self: *@This()) !void {
         try self.sendStatus();
         try self.sendHeaders();
+        try self.sendNewline();
         if (self.body.len != 0) {
-            try self.sendNewline();
             try self.sendBody();
         }
     }
@@ -137,6 +153,11 @@ pub const Response = struct {
                 if (@field(self.headers, field.name)) |val| {
                     try self.writer.print("{s}: {d}\r\n", .{ &headerName, val });
                 }
+            }
+        }
+        for (self.headers.extra) |header| {
+            if (header.name.len > 0) {
+                try self.writer.print("{s}: {s}\r\n", .{ header.name, header.value });
             }
         }
         self.sent_headers = true;
@@ -198,6 +219,34 @@ pub const Response = struct {
         if (self.headers.transfer_encoding == .chunked) {
             _ = try self.writer.write("0\r\n\r\n");
         }
+    }
+
+    /// Write a Server-Sent Event. Sends status and headers on first call,
+    /// setting Content-Type to text/event-stream and Cache-Control to no-cache
+    /// if not already set.
+    ///
+    /// Format: "event: <type>\ndata: <data>\n\n" or "data: <data>\n\n"
+    pub fn writeEvent(self: *@This(), event_type: ?[]const u8, data: []const u8) !void {
+        if (!self.sent_status) {
+            if (self.headers.content_type.len == 0) {
+                self.headers.content_type = "text/event-stream";
+            }
+            if (self.headers.cache_control.len == 0) {
+                self.headers.cache_control = "no-cache";
+            }
+            try self.sendStatus();
+            try self.sendHeaders();
+            try self.sendNewline();
+        }
+        if (event_type) |et| {
+            try self.writer.print("event: {s}\n", .{et});
+        }
+        try self.writer.print("data: {s}\n\n", .{data});
+    }
+
+    /// Flush the underlying writer to ensure data is sent to the client.
+    pub fn flush(self: *@This()) !void {
+        try self.writer.flush();
     }
 };
 
@@ -276,6 +325,49 @@ test "multiple chunks in chunked response" {
     try testing.expectEqualStrings("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nfirst\r\n6\r\nsecond\r\n5\r\nthird\r\n0\r\n\r\n", content);
 }
 
+test "SSE event writing" {
+    var buffer: [4 * 1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+
+    var res = Response{
+        .status = .OK,
+        .writer = &writer,
+    };
+    try res.writeEvent("message", "{\"hello\":\"world\"}");
+
+    const content = buffer[0..writer.end];
+    try testing.expectEqualStrings("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\nevent: message\ndata: {\"hello\":\"world\"}\n\n", content);
+}
+
+test "SSE event without event type" {
+    var buffer: [4 * 1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+
+    var res = Response{
+        .status = .OK,
+        .writer = &writer,
+    };
+    try res.writeEvent(null, "{\"data\":1}");
+
+    const content = buffer[0..writer.end];
+    try testing.expectEqualStrings("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\ndata: {\"data\":1}\n\n", content);
+}
+
+test "SSE multiple events" {
+    var buffer: [4 * 1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+
+    var res = Response{
+        .status = .OK,
+        .writer = &writer,
+    };
+    try res.writeEvent("message", "first");
+    try res.writeEvent("message", "second");
+
+    const content = buffer[0..writer.end];
+    try testing.expectEqualStrings("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\nevent: message\ndata: first\n\nevent: message\ndata: second\n\n", content);
+}
+
 test "setContentLength updates headers" {
     var buffer: [4 * 1024]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
@@ -300,8 +392,8 @@ test "empty body response" {
     try res.send();
 
     const content = buffer[0..writer.end];
-    // 304 responses typically have no body
-    try testing.expectEqualStrings("HTTP/1.1 304 Not Modified\r\n", content);
+    // 304 responses typically have no body, but blank line is always required
+    try testing.expectEqualStrings("HTTP/1.1 304 Not Modified\r\n\r\n", content);
 }
 
 const std = @import("std");

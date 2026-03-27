@@ -144,6 +144,8 @@ pub const TransferEncoding = enum(u1) {
 pub const Headers = struct {
     content_length: usize = 0,
     content_type: []const u8 = "",
+    authorization: []const u8 = "",
+    cookie: []const u8 = "",
     connection: ?Connection = null,
     transfer_encoding: ?TransferEncoding = null,
 

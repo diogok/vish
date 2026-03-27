@@ -33,7 +33,8 @@ pub fn setTimeout(
 /// This is used for setting socket timeout options (SO_RCVTIMEO, SO_SNDTIMEO).
 /// The timeval structure splits time into seconds and microseconds.
 pub fn makeTimevalue(millis: u32) std.posix.timeval {
-    const micros: i32 = @as(i32, @intCast(millis)) * 1000;
+    const millis_i64: i64 = @intCast(millis);
+    const micros: i64 = millis_i64 * 1000;
 
     var timeval: std.posix.timeval = undefined;
     timeval.sec = @intCast(@divTrunc(micros, 1000000));
