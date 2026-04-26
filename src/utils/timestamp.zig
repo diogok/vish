@@ -7,8 +7,9 @@ pub const Timestamp = struct {
     minute: u6,
     second: u6,
 
-    pub fn now() @This() {
-        return Timestamp.init(std.time.timestamp());
+    pub fn now(io: std.Io) @This() {
+        const ts = std.Io.Clock.now(.real, io);
+        return Timestamp.init(ts.toSeconds());
     }
 
     pub fn init(epoch: i64) @This() {
@@ -96,10 +97,10 @@ test "timestamp" {
     try testing.expectEqualStrings("00", &ts.getSecond());
 }
 
-pub fn get_current_date() [date_len]u8 {
+pub fn get_current_date(io: std.Io) [date_len]u8 {
     var date: [date_len]u8 = undefined;
 
-    const timestamp = Timestamp.now();
+    const timestamp = Timestamp.now(io);
     const fmt = "{s}/{s}/{s}:{s}:{s}:{s} +0000";
     const args = .{
         timestamp.getDay(),

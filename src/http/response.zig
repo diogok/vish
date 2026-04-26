@@ -17,9 +17,14 @@ pub const Status = enum(u16) {
     Not_Found = 404,
     Method_Not_Allowed = 405,
     Conflict = 409,
+    Gone = 410,
+    Precondition_Failed = 412,
+    Payload_Too_Large = 413,
     Unprocessable_Entity = 422,
+    Precondition_Required = 428,
     Too_Many_Requests = 429,
     Internal_Server_Error = 500,
+    Service_Unavailable = 503,
     // TODO: rest of standard codes
 
     pub fn int(self: @This()) u16 {
@@ -46,6 +51,17 @@ pub const TransferEncoding = enum(u1) {
     pub fn getValue(self: @This()) []const u8 {
         return @tagName(self);
     }
+};
+
+/// A Server-Sent Event with optional id, event type, retry hint, and data.
+///
+/// Per the HTML Living Standard SSE spec, `data` may contain `\n` to be split
+/// across multiple `data:` field lines in the emitted event.
+pub const SSEMessage = struct {
+    id: ?[]const u8 = null,
+    event: ?[]const u8 = null,
+    data: []const u8 = "",
+    retry_ms: ?u32 = null,
 };
 
 pub const ExtraHeader = struct {
@@ -243,6 +259,64 @@ pub const Response = struct {
         try self.writer.print("data: {s}\n\n", .{data});
     }
 
+    /// Ensure SSE status + headers are sent (once). Sets Content-Type to
+    /// text/event-stream and Cache-Control to no-cache if unset.
+    fn ensureSSEHeaders(self: *@This()) !void {
+        if (self.sent_status) return;
+        if (self.headers.content_type.len == 0) {
+            self.headers.content_type = "text/event-stream";
+        }
+        if (self.headers.cache_control.len == 0) {
+            self.headers.cache_control = "no-cache";
+        }
+        try self.sendStatus();
+        try self.sendHeaders();
+        try self.sendNewline();
+    }
+
+    /// Write a Server-Sent Event with optional id, event type, and retry hint.
+    /// Multi-line `data` is split on `\n` into multiple `data:` lines per SSE spec.
+    /// Auto-sets `Content-Type: text/event-stream` and `Cache-Control: no-cache`
+    /// on the first call (like `writeEvent`).
+    pub fn writeSSE(self: *@This(), ev: SSEMessage) !void {
+        try self.ensureSSEHeaders();
+
+        if (ev.id) |id| {
+            try self.writer.print("id: {s}\n", .{id});
+        }
+        if (ev.event) |event| {
+            try self.writer.print("event: {s}\n", .{event});
+        }
+        if (ev.retry_ms) |retry| {
+            try self.writer.print("retry: {d}\n", .{retry});
+        }
+
+        if (ev.data.len == 0) {
+            _ = try self.writer.write("data:\n");
+        } else {
+            var it = std.mem.splitScalar(u8, ev.data, '\n');
+            while (it.next()) |line| {
+                try self.writer.print("data: {s}\n", .{line});
+            }
+        }
+
+        _ = try self.writer.write("\n");
+    }
+
+    /// Emit an SSE comment line (`: <text>\n\n`). Used for heartbeats and debug.
+    /// Auto-sets SSE headers on first call. If `text` contains `\n`, each line
+    /// after the first is prefixed with a fresh `: `.
+    pub fn writeSSEComment(self: *@This(), text: []const u8) !void {
+        try self.ensureSSEHeaders();
+
+        var it = std.mem.splitScalar(u8, text, '\n');
+        while (it.next()) |line| {
+            try self.writer.print(": {s}\n", .{line});
+        }
+
+        _ = try self.writer.write("\n");
+    }
+
     /// Flush the underlying writer to ensure data is sent to the client.
     pub fn flush(self: *@This()) !void {
         try self.writer.flush();
@@ -364,6 +438,166 @@ test "SSE multiple events" {
 
     const content = buffer[0..writer.end];
     try testing.expectEqualStrings("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\nevent: message\ndata: first\n\nevent: message\ndata: second\n\n", content);
+}
+
+test "writeSSE with only data emits SSE headers and data line" {
+    var buffer: [4 * 1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+
+    var res = Response{
+        .status = .OK,
+        .writer = &writer,
+    };
+    try res.writeSSE(.{ .data = "hello" });
+
+    const content = buffer[0..writer.end];
+    try testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\ndata: hello\n\n",
+        content,
+    );
+}
+
+test "writeSSE with id, event, and data emits fields in spec order" {
+    var buffer: [4 * 1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+
+    var res = Response{
+        .status = .OK,
+        .writer = &writer,
+    };
+    try res.writeSSE(.{ .id = "42", .event = "token", .data = "hi" });
+
+    const content = buffer[0..writer.end];
+    try testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\nid: 42\nevent: token\ndata: hi\n\n",
+        content,
+    );
+}
+
+test "writeSSE splits multi-line data into multiple data lines" {
+    var buffer: [4 * 1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+
+    var res = Response{
+        .status = .OK,
+        .writer = &writer,
+    };
+    try res.writeSSE(.{ .data = "line1\nline2" });
+
+    const content = buffer[0..writer.end];
+    try testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\ndata: line1\ndata: line2\n\n",
+        content,
+    );
+}
+
+test "writeSSE with empty data emits bare data field" {
+    var buffer: [4 * 1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+
+    var res = Response{
+        .status = .OK,
+        .writer = &writer,
+    };
+    try res.writeSSE(.{});
+
+    const content = buffer[0..writer.end];
+    try testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\ndata:\n\n",
+        content,
+    );
+}
+
+test "writeSSE with retry_ms emits retry field" {
+    var buffer: [4 * 1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+
+    var res = Response{
+        .status = .OK,
+        .writer = &writer,
+    };
+    try res.writeSSE(.{ .retry_ms = 5000, .data = "soon" });
+
+    const content = buffer[0..writer.end];
+    try testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\nretry: 5000\ndata: soon\n\n",
+        content,
+    );
+}
+
+test "writeSSEComment emits comment line" {
+    var buffer: [4 * 1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+
+    var res = Response{
+        .status = .OK,
+        .writer = &writer,
+    };
+    try res.writeSSEComment("heartbeat");
+
+    const content = buffer[0..writer.end];
+    try testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\n: heartbeat\n\n",
+        content,
+    );
+}
+
+test "writeSSEComment with multi-line text prefixes each line" {
+    var buffer: [4 * 1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+
+    var res = Response{
+        .status = .OK,
+        .writer = &writer,
+    };
+    try res.writeSSEComment("first\nsecond\nthird");
+
+    const content = buffer[0..writer.end];
+    try testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\n: first\n: second\n: third\n\n",
+        content,
+    );
+}
+
+test "multiple writeSSE and writeSSEComment calls send headers once" {
+    var buffer: [4 * 1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+
+    var res = Response{
+        .status = .OK,
+        .writer = &writer,
+    };
+    try res.writeSSE(.{ .id = "1", .data = "a" });
+    try res.writeSSEComment("ping");
+    try res.writeSSE(.{ .id = "2", .data = "b" });
+
+    const content = buffer[0..writer.end];
+    try testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\n" ++
+            "id: 1\ndata: a\n\n" ++
+            ": ping\n\n" ++
+            "id: 2\ndata: b\n\n",
+        content,
+    );
+}
+
+test "new status codes render correct status line" {
+    const cases = [_]struct { status: Status, expected: []const u8 }{
+        .{ .status = .Gone, .expected = "HTTP/1.1 410 Gone\r\n\r\n" },
+        .{ .status = .Precondition_Failed, .expected = "HTTP/1.1 412 Precondition Failed\r\n\r\n" },
+        .{ .status = .Payload_Too_Large, .expected = "HTTP/1.1 413 Payload Too Large\r\n\r\n" },
+        .{ .status = .Precondition_Required, .expected = "HTTP/1.1 428 Precondition Required\r\n\r\n" },
+        .{ .status = .Service_Unavailable, .expected = "HTTP/1.1 503 Service Unavailable\r\n\r\n" },
+    };
+
+    for (cases) |case| {
+        var buffer: [256]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buffer);
+        var res = Response{ .status = case.status, .writer = &writer };
+        try res.send();
+        const content = buffer[0..writer.end];
+        try testing.expectEqualStrings(case.expected, content);
+    }
 }
 
 test "setContentLength updates headers" {

@@ -2,7 +2,6 @@
 //!
 //! Provides flexible routing mechanisms for dispatching HTTP requests to appropriate handlers based on method and path patterns.
 
-
 /// Provider a Handler for a Router where each route pattern is a struct method.
 /// Example:
 /// ```
@@ -352,7 +351,7 @@ test "combined router" {
 /// Count the number of wildcard parameters ("?") in a route pattern.
 /// Used to determine the size of the params array at compile time.
 fn params_len(src_route: []const u8) usize {
-    const route = std.mem.trimRight(u8, src_route, "/");
+    const route = std.mem.trimEnd(u8, src_route, "/");
     var size: usize = 0;
     for (route) |c| {
         if (c == '?') {
@@ -375,8 +374,8 @@ fn params_len(src_route: []const u8) usize {
 /// Returns null if the path doesn't match the route pattern.
 fn check_match(comptime src_route: []const u8, src_path: []const u8) ?[params_len(src_route)][]const u8 {
     // Normalize paths by trimming trailing slashes
-    const route = comptime std.mem.trimRight(u8, src_route, "/");
-    const path = std.mem.trimRight(u8, src_path, "/");
+    const route = comptime std.mem.trimEnd(u8, src_route, "/");
+    const path = std.mem.trimEnd(u8, src_path, "/");
 
     var params: [params_len(route)][]const u8 = undefined;
 
@@ -499,27 +498,31 @@ test "matching paths" {
     try testing.expectEqualStrings(m9.?[0], "bar");
 }
 
-/// Serves static assets using a comptime Assets module (e.g. one created by `addStaticAssets`).
-/// The Assets type must have a `get(allocator, path) ?[]const u8` function.
+/// Serves static assets using a comptime `Assets` module (e.g. one
+/// created by `addStaticAssets`). The Assets type must expose a
+/// `get(io, allocator, path) ?Asset` function returning a value with
+/// a `content: []const u8` field and a `deinit()` method.
 ///
-/// Only responds to GET requests. Returns `error.Skipped` for non-GET methods,
-/// empty paths, path traversal attempts, or missing files.
+/// Only responds to GET requests. Returns `error.Skipped` for non-GET
+/// methods, empty paths, path traversal attempts, or missing files.
 ///
 /// Example:
 /// ```
 /// const assets = @import("assets");
-/// var static = StaticRouter(assets).init();
+/// var static = StaticRouter(assets).init(io);
 /// ```
 pub fn StaticRouter(comptime Assets: type) type {
     return struct {
-        pub fn init() @This() {
-            return .{};
+        io: std.Io,
+
+        pub fn init(io: std.Io) @This() {
+            return .{ .io = io };
         }
 
-        pub fn route(_: @This(), req: Request, res: *Response) HandlerError!void {
+        pub fn route(self: @This(), req: Request, res: *Response) HandlerError!void {
             if (req.method != .GET) return error.Skipped;
 
-            const path = std.mem.trimLeft(u8, req.uri.path, "/");
+            const path = std.mem.trimStart(u8, req.uri.path, "/");
             if (path.len == 0) return error.Skipped;
             if (std.fs.path.isAbsolute(path)) return error.Skipped;
 
@@ -529,9 +532,10 @@ pub fn StaticRouter(comptime Assets: type) type {
                 if (std.mem.eql(u8, segment, "..")) return error.Skipped;
             }
 
-            const content = Assets.get(req.allocator, path) orelse return error.Skipped;
+            const asset = Assets.get(self.io, req.allocator, path) orelse return error.Skipped;
+            defer asset.deinit();
             res.headers.content_type = mime.guess(path);
-            res.body = content;
+            res.body = asset.content;
             try res.send();
         }
 
@@ -551,9 +555,13 @@ pub fn StaticRouter(comptime Assets: type) type {
 
 test "static router" {
     const MockAssets = struct {
-        pub fn get(_: std.mem.Allocator, path: []const u8) ?[]const u8 {
-            if (std.mem.eql(u8, path, "index.html")) return "<html></html>";
-            if (std.mem.eql(u8, path, "style.css")) return "body {}";
+        pub const Asset = struct {
+            content: []const u8,
+            pub fn deinit(_: Asset) void {}
+        };
+        pub fn get(_: std.Io, _: std.mem.Allocator, path: []const u8) ?Asset {
+            if (std.mem.eql(u8, path, "index.html")) return .{ .content = "<html></html>" };
+            if (std.mem.eql(u8, path, "style.css")) return .{ .content = "body {}" };
             return null;
         }
     };
@@ -561,7 +569,7 @@ test "static router" {
     var buffer: [4 * 1024]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
 
-    var router = StaticRouter(MockAssets).init();
+    var router = StaticRouter(MockAssets).init(testing.io);
 
     var req: Request = .example;
     req.uri.path = "/index.html";

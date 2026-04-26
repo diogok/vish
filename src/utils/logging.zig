@@ -1,9 +1,10 @@
 /// A handler for logging request in Common Log Format.
 pub const Common = struct {
+    io: std.Io,
     handler: Handler,
 
-    pub fn init(handler: Handler) @This() {
-        return .{ .handler = handler };
+    pub fn init(io: std.Io, handler: Handler) @This() {
+        return .{ .io = io, .handler = handler };
     }
 
     pub fn log(
@@ -13,7 +14,7 @@ pub const Common = struct {
     ) HandlerError!void {
         try self.handler.handle(req, res);
 
-        const date = get_current_date();
+        const date = get_current_date(self.io);
 
         const fmt = "{s} - - [{s}] \"{s} {s} {s}\" {d} {?d}\n";
         const args = .{
@@ -27,7 +28,7 @@ pub const Common = struct {
         };
 
         var stdout_buffer: [1024]u8 = undefined;
-        var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+        var stdout_writer = std.Io.File.stdout().writer(self.io, &stdout_buffer);
         const stdout = &stdout_writer.interface;
 
         stdout.print(fmt, args) catch {};
@@ -69,7 +70,7 @@ test "common logs" {
     const wrapper_handler = Handler.wrap(MyHandler).init(&my_handler);
     const handler = wrapper_handler.interface();
 
-    var logger = Common.init(handler);
+    var logger = Common.init(testing.io, handler);
 
     const req: Request = .example;
     var res = Response.fromRequest(req);

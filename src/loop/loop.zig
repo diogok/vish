@@ -1,51 +1,41 @@
 //! Event loop for handling concurrent HTTP connections.
 //!
-//! Provides a multi-threaded event loop that accepts connections
-//! and dispatches them to handler functions.
-//!
-//! It uses a thread pool to process multiple connections concurrently,
-//! and handle shutdown and cleanup as needed.
+//! Provides a multi-threaded event loop that accepts connections and
+//! dispatches them to handler functions, one task per connection.
 //!
 //! ## Main flow
-//! - Main accept loop runs in its own thread, waiting for new connections
-//! - Each connection is dispatched to a thread pool worker
-//! - Workers process requests in a keep-alive loop until the connection closes
-//! - Graceful shutdown stops accepting new connections and waits for workers to finish
+//! - The accept loop runs in its own task, waiting for new connections.
+//! - Each accepted connection is handed off to a worker task, which
+//!   under the default `Io` becomes its own OS thread.
+//! - Workers process requests in a keep-alive loop until the connection
+//!   closes.
+//! - `stop()` stops accepting new connections. `deinit()` releases the
+//!   loop and cancels any workers still blocked in I/O.
 //!
 //! ## Lifecycle
-//! - Accept thread receives connection and spawns worker task
-//! - Worker reads requests in a loop (supporting HTTP keep-alive)
-//! - Each request is passed to the handler, which populates the response
-//! - Response is flushed; connection continues or closes based on Connection header
-//! - Connection arena is reset between requests for memory efficiency
+//! - Accept task receives a connection and spawns a worker.
+//! - Worker reads requests in a loop (supporting HTTP keep-alive).
+//! - Each request is passed to the handler, which populates the response.
+//! - Response is flushed; connection continues or closes based on the
+//!   `Connection` header.
+//! - Connection arena is reset between requests for memory efficiency.
 
 pub const Loop = struct {
-    allocator: std.mem.Allocator,
+    io: std.Io,
 
-    thread_pool: *std.Thread.Pool,
-    wait_group: *std.Thread.WaitGroup,
+    accept_group: std.Io.Group,
+    worker_group: std.Io.Group,
 
     active: bool,
 
     server: *http.Server,
     handler: Handler,
 
-    pub fn init(
-        allocator: std.mem.Allocator,
-        server: *http.Server,
-        handler: Handler,
-    ) !@This() {
-        var pool = try allocator.create(std.Thread.Pool);
-        const cpu_count = std.Thread.getCpuCount() catch 4;
-        try pool.init(.{ .allocator = allocator, .n_jobs = @intCast(cpu_count * 4) });
-
-        const wg = try allocator.create(std.Thread.WaitGroup);
-        wg.* = std.Thread.WaitGroup{};
-
-        return @This(){
-            .allocator = allocator,
-            .thread_pool = pool,
-            .wait_group = wg,
+    pub fn init(io: std.Io, server: *http.Server, handler: Handler) !@This() {
+        return .{
+            .io = io,
+            .accept_group = .init,
+            .worker_group = .init,
             .active = false,
             .server = server,
             .handler = handler,
@@ -55,35 +45,38 @@ pub const Loop = struct {
     pub fn deinit(self: *@This()) void {
         log.info("Deinit loop", .{});
         self.stop();
-        self.wait();
-        self.thread_pool.deinit();
-        self.allocator.destroy(self.thread_pool);
-        self.allocator.destroy(self.wait_group);
+        self.accept_group.cancel(self.io);
+        self.worker_group.cancel(self.io);
     }
 
     pub fn stop(self: *@This()) void {
         log.info("Stop loop", .{});
         self.active = false;
+        self.server.stop();
     }
 
-    pub fn start(
-        self: *@This(),
-    ) !void {
+    pub fn start(self: *@This()) !void {
         self.active = true;
-        self.thread_pool.spawnWg(self.wait_group, @This().accept, .{ self, self.server, self.handler });
+        self.accept_group.async(self.io, acceptLoop, .{ self, self.server, self.handler });
         log.info("Started", .{});
     }
 
+    /// Block until the accept task and all workers finish on their own.
+    /// For a hard stop, use `deinit`, which also cancels in-flight tasks.
     pub fn wait(self: *@This()) void {
-        self.thread_pool.waitAndWork(self.wait_group);
+        self.accept_group.await(self.io) catch |err| switch (err) {
+            error.Canceled => {},
+        };
+        self.worker_group.await(self.io) catch |err| switch (err) {
+            error.Canceled => {},
+        };
     }
 
-    /// While loop is active, accept a connection (when available), and start a thread to handle it
-    fn accept(
+    fn acceptLoop(
         self: *@This(),
         server: *http.Server,
         handler: Handler,
-    ) void {
+    ) std.Io.Cancelable!void {
         log.debug("Accepting connections", .{});
         defer log.debug("Done accepting connections", .{});
 
@@ -95,71 +88,61 @@ pub const Loop = struct {
             };
             if (connection) |conn| {
                 log.debug("Got a connection...", .{});
-                self.thread_pool.spawnWg(
-                    self.wait_group,
-                    @This().onConnection,
-                    .{
-                        self,
-                        conn,
-                        handler,
-                    },
-                );
+                self.worker_group.concurrent(self.io, onConnection, .{ self, conn, handler }) catch |err| switch (err) {
+                    // Out of concurrency: run the connection on the
+                    // accept thread. This applies backpressure to the
+                    // accept loop until this connection finishes.
+                    error.ConcurrencyUnavailable => onConnection(self, conn, handler) catch {},
+                };
+            } else if (!self.active) {
+                return;
             }
         }
     }
 
     /// Handle a single TCP connection, processing multiple HTTP requests (keep-alive).
     ///
-    /// This function runs in a thread pool worker and processes requests in a loop
-    /// until either:
-    /// - The connection is closed (Connection: close header)
-    /// - A read error occurs (timeout, client disconnect)
-    /// - The server is shutting down (self.active == false)
+    /// Runs in its own task and processes requests in a loop until either:
+    /// - The connection is closed (`Connection: close` header)
+    /// - A read error occurs or the client disconnects
+    /// - The server is shutting down (`self.active == false`)
     ///
-    /// Memory for each request is managed by the Connection's allocator,
+    /// Memory for each request is managed by the Connection's arena,
     /// which is reset between requests.
     fn onConnection(
         self: *@This(),
         connection: http.Connection,
         handler: Handler,
-    ) void {
+    ) std.Io.Cancelable!void {
         var conn = connection;
         defer conn.deinit();
         defer log.info("Done with connection", .{});
 
         log.info("Connection started", .{});
-        // Keep-alive loop: process multiple requests on the same connection
         while (self.active) {
             const request = conn.next() catch |err| {
                 log.err("Error reading request: {any}", .{err});
                 return;
             };
-            if (request) |req| {
-                const conn_header = self.onRequest(handler, req);
-                switch (conn_header) {
-                    .close => {
-                        return; // Client or server requested connection close
-                    },
-                    .keep => {}, // Continue to next request
-                }
-            } else {
-                return; // No more data (client closed connection or timeout)
+            const req = request orelse return;
+            switch (self.onRequest(handler, req)) {
+                .close => return,
+                .keep => {},
             }
         }
     }
 
     /// Process a single HTTP request and determine if the connection should continue.
     ///
-    /// Returns .close if either the request or response has Connection: close,
-    /// indicating the connection should be terminated after this response.
-    /// Returns .keep to continue processing requests on this connection.
+    /// Returns `.close` if either the request or response has
+    /// `Connection: close`, meaning the connection should be terminated
+    /// after this response. Returns `.keep` to continue processing
+    /// requests on this connection.
     fn onRequest(
         _: *@This(),
         handler: Handler,
         req: http.Request,
     ) enum { close, keep } {
-        // Note: Request cleanup is handled by arena reset in Connection.next()
-
         log.debug("Request: {any}", .{req});
 
         var res = http.Response.fromRequest(req);

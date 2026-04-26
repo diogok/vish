@@ -1,29 +1,32 @@
-//! Signal handling utils
+//! Signal handling utils.
+//!
+//! Block the calling task until SIGINT or SIGHUP is received. Typical
+//! use is at the bottom of `main` after starting the server loop, so
+//! Ctrl-C triggers a clean shutdown.
 
-const Signal = std.atomic.Value(u32);
-const interruptSignal = Signal.init(0);
+var interrupt_event: std.Io.Event = .unset;
+var interrupt_io: ?std.Io = null;
 
-/// Wait on default interrupt (INT or HUP) signals
-pub fn wait() void {
+/// Wait on default interrupt (INT or HUP) signals.
+pub fn wait(io: std.Io) void {
+    interrupt_io = io;
+
     const sigact = &std.posix.Sigaction{
         .handler = .{ .handler = receive },
         .mask = std.posix.sigemptyset(),
         .flags = 0,
     };
-    std.posix.sigaction(std.c.SIG.INT, sigact, null);
-    std.posix.sigaction(std.c.SIG.HUP, sigact, null);
+    std.posix.sigaction(.INT, sigact, null);
+    std.posix.sigaction(.HUP, sigact, null);
 
     log.info("Waiting for stop signal.", .{});
-    std.Thread.Futex.wait(&interruptSignal, 0);
+    interrupt_event.waitUncancelable(io);
 }
 
-fn receive(sig: c_int) callconv(.c) void {
-    log.info("Signal received: {d}", .{sig});
-    switch (sig) {
-        std.c.SIG.INT, std.c.SIG.HUP => {
-            std.Thread.Futex.wake(&interruptSignal, 1);
-        },
-        else => {},
+fn receive(sig: std.posix.SIG) callconv(.c) void {
+    log.info("Signal received: {t}", .{sig});
+    if (interrupt_io) |io| {
+        interrupt_event.set(io);
     }
 }
 

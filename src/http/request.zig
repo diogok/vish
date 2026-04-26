@@ -148,6 +148,13 @@ pub const Headers = struct {
     cookie: []const u8 = "",
     connection: ?Connection = null,
     transfer_encoding: ?TransferEncoding = null,
+    last_event_id: []const u8 = "",
+    if_match: []const u8 = "",
+    if_none_match: []const u8 = "",
+    accept: []const u8 = "",
+    host: []const u8 = "",
+    user_agent: []const u8 = "",
+    idempotency_key: []const u8 = "",
 
     // TODO: maybe add an optional hashmap for rest of headers
 
@@ -379,6 +386,33 @@ test "Parse http request with chunked body" {
     try testing.expectEqualStrings("key=value", body);
 }
 
+test "Parse http request with extended headers" {
+    const request =
+        "GET /stream HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "User-Agent: test-agent/1.0\r\n" ++
+        "Accept: text/event-stream\r\n" ++
+        "Last-Event-ID: 42\r\n" ++
+        "If-Match: \"etag-one\"\r\n" ++
+        "If-None-Match: \"etag-two\"\r\n" ++
+        "Idempotency-Key: abc-123\r\n" ++
+        "\r\n";
+
+    var reader = std.Io.Reader.fixed(request);
+    var writer = std.Io.Writer.Discarding.init(&[_]u8{});
+
+    const req = try Request.read(testing.allocator, &reader, &writer.writer);
+    defer req.deinit();
+
+    try testing.expectEqualStrings("example.com", req.headers.host);
+    try testing.expectEqualStrings("test-agent/1.0", req.headers.user_agent);
+    try testing.expectEqualStrings("text/event-stream", req.headers.accept);
+    try testing.expectEqualStrings("42", req.headers.last_event_id);
+    try testing.expectEqualStrings("\"etag-one\"", req.headers.if_match);
+    try testing.expectEqualStrings("\"etag-two\"", req.headers.if_none_match);
+    try testing.expectEqualStrings("abc-123", req.headers.idempotency_key);
+}
+
 test "Parse chunked body with hex chunk sizes" {
     // Chunk sizes in HTTP are hexadecimal per RFC 7230 §4.1
     // 'a' = 10 bytes, '5' = 5 bytes
@@ -396,8 +430,6 @@ test "Parse chunked body with hex chunk sizes" {
     defer testing.allocator.free(body);
     try testing.expectEqualStrings("0123456789abcde", body);
 }
-
-
 
 test "URI.parse() handles various path formats" {
     // Path with query
@@ -425,7 +457,6 @@ test "URI.parse() handles various path formats" {
     try testing.expectEqualStrings("/path", uri4.path);
     try testing.expectEqualStrings("", uri4.query);
 }
-
 
 /// A streaming body reader that handles both Content-Length and chunked Transfer-Encoding.
 pub const BodyReader = struct {

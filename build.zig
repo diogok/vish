@@ -72,12 +72,31 @@ pub fn build(b: *std.Build) void {
     }
 }
 
+/// Build a module that exposes the contents of `dir` as a static asset
+/// table. Pair with `http.utils.router.StaticRouter` to serve the files
+/// over HTTP.
+///
+/// In Debug builds the lookup reads from disk on every call (so edits
+/// to the asset directory are picked up without a rebuild). In release
+/// builds the bytes are `@embedFile`'d into the binary.
+///
+/// The returned module exports:
+///
+/// ```
+/// pub const Asset = struct {
+///     content: []const u8,
+///     pub fn deinit(self: Asset) void;
+/// };
+/// pub fn get(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ?Asset;
+/// ```
 pub fn addStaticAssets(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     dir: []const u8,
 ) *std.Build.Module {
+    const io = b.graph.io;
+
     const options = b.addOptions();
     options.addOption([]const u8, "asset_dir", b.pathFromRoot(dir));
 
@@ -86,38 +105,40 @@ pub fn addStaticAssets(
 
     // Collect file paths from the asset directory
     var file_list: std.ArrayListUnmanaged([]const u8) = .empty;
-    var abs_dir = std.fs.cwd().openDir(b.pathFromRoot(dir), .{ .iterate = true }) catch
+    var abs_dir = std.Io.Dir.cwd().openDir(io, b.pathFromRoot(dir), .{ .iterate = true }) catch
         @panic("failed to open asset directory");
-    defer abs_dir.close();
-    collectFiles(b.allocator, abs_dir, "", &file_list);
+    defer abs_dir.close(io);
+    collectFiles(io, b.allocator, abs_dir, "", &file_list);
 
-    // Generate asset module source with load() and get() functions
-    var src: std.ArrayListUnmanaged(u8) = .empty;
-    const w = src.writer(b.allocator);
+    // Generate the asset module: an `Asset` struct and a `get(io, allocator, path) ?Asset`
+    // lookup. In Debug it reads from disk on each call (the asset directory is the source
+    // tree, so edits show up without a rebuild); in release it returns @embedFile'd bytes.
+    var src_alloc = std.Io.Writer.Allocating.init(b.allocator);
+    defer src_alloc.deinit();
+    const w = &src_alloc.writer;
     w.writeAll(
         \\const std = @import("std");
         \\const builtin = @import("builtin");
         \\const options = @import("build_options");
         \\
-        \\pub fn load(comptime path: []const u8) []const u8 {
-        \\    if (comptime builtin.mode == .Debug) {
-        \\        const abs = options.asset_dir ++ "/" ++ path;
-        \\        return std.fs.cwd().readFileAlloc(std.heap.page_allocator, abs, 10 * 1024 * 1024) catch |err| {
-        \\            std.log.err("load asset '{s}': {}", .{ abs, err });
-        \\            @panic("failed to load asset");
-        \\        };
-        \\    } else {
-        \\        return @embedFile(path);
-        \\    }
-        \\}
+        \\pub const Asset = struct {
+        \\    content: []const u8,
+        \\    owned_allocator: ?std.mem.Allocator,
         \\
-        \\pub fn get(allocator: std.mem.Allocator, path: []const u8) ?[]const u8 {
+        \\    pub fn deinit(self: Asset) void {
+        \\        if (self.owned_allocator) |a| a.free(self.content);
+        \\    }
+        \\};
+        \\
+        \\pub fn get(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ?Asset {
         \\    if (comptime builtin.mode == .Debug) {
-        \\        var asset_dir = std.fs.cwd().openDir(options.asset_dir, .{}) catch return null;
-        \\        defer asset_dir.close();
-        \\        return asset_dir.readFileAlloc(allocator, path, 10 * 1024 * 1024) catch null;
+        \\        var asset_dir = std.Io.Dir.cwd().openDir(io, options.asset_dir, .{}) catch return null;
+        \\        defer asset_dir.close(io);
+        \\        const bytes = asset_dir.readFileAlloc(io, path, allocator, .unlimited) catch return null;
+        \\        return .{ .content = bytes, .owned_allocator = allocator };
         \\    } else {
-        \\        return files.get(path);
+        \\        const bytes = files.get(path) orelse return null;
+        \\        return .{ .content = bytes, .owned_allocator = null };
         \\    }
         \\}
         \\
@@ -134,7 +155,7 @@ pub fn addStaticAssets(
         \\
     ) catch unreachable;
 
-    const source = wf.add("_assets.zig", src.items);
+    const source = wf.add("_assets.zig", src_alloc.written());
 
     return b.createModule(.{
         .root_source_file = source,
@@ -146,9 +167,15 @@ pub fn addStaticAssets(
     });
 }
 
-fn collectFiles(allocator: std.mem.Allocator, base_dir: std.fs.Dir, prefix: []const u8, list: *std.ArrayListUnmanaged([]const u8)) void {
+fn collectFiles(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    base_dir: std.Io.Dir,
+    prefix: []const u8,
+    list: *std.ArrayList([]const u8),
+) void {
     var iter = base_dir.iterate();
-    while (iter.next() catch null) |entry| {
+    while (iter.next(io) catch null) |entry| {
         const name = if (prefix.len > 0)
             std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, entry.name }) catch continue
         else
@@ -157,9 +184,9 @@ fn collectFiles(allocator: std.mem.Allocator, base_dir: std.fs.Dir, prefix: []co
         switch (entry.kind) {
             .file => list.append(allocator, name) catch {},
             .directory => {
-                var sub = base_dir.openDir(entry.name, .{ .iterate = true }) catch continue;
-                defer sub.close();
-                collectFiles(allocator, sub, name, list);
+                var sub = base_dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
+                defer sub.close(io);
+                collectFiles(io, allocator, sub, name, list);
             },
             else => {},
         }
