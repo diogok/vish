@@ -55,9 +55,14 @@ pub const Loop = struct {
         self.server.stop();
     }
 
+    /// Spawn the accept task and return. Fails with `ConcurrencyUnavailable`
+    /// if the `Io` implementation can't dedicate a unit of concurrency to
+    /// the accept loop — without one, `start` would deadlock instead of
+    /// returning, since `acceptLoop` doesn't terminate until shutdown.
     pub fn start(self: *@This()) !void {
         self.active = true;
-        self.accept_group.async(self.io, acceptLoop, .{ self, self.server, self.handler });
+        errdefer self.active = false;
+        try self.accept_group.concurrent(self.io, acceptLoop, .{ self, self.server, self.handler });
         log.info("Started", .{});
     }
 
@@ -177,6 +182,197 @@ pub const Loop = struct {
     }
 };
 
+const HelloHandler = struct {
+    pub fn handle(_: @This(), _: http.Request, res: *http.Response) HandlerError!void {
+        res.body = "hello";
+        try res.send();
+    }
+};
+
+const TestServer = struct {
+    server: http.Server,
+    loop: Loop,
+    handler_state: HelloHandler,
+    handler_wrap: Handler.wrap(HelloHandler),
+
+    fn start(self: *TestServer, io: std.Io, allocator: std.mem.Allocator) !void {
+        self.handler_state = .{};
+        self.handler_wrap = Handler.wrap(HelloHandler).init(&self.handler_state);
+
+        const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+        self.server = http.Server.init(io, allocator, address, .{});
+        try self.server.listen();
+        errdefer self.server.deinit();
+
+        self.loop = try Loop.init(io, &self.server, self.handler_wrap.interface());
+        try self.loop.start();
+    }
+
+    fn stop(self: *TestServer) void {
+        self.loop.deinit();
+        self.server.deinit();
+    }
+
+    fn boundAddress(self: *TestServer) std.Io.net.IpAddress {
+        return self.server.getAddress().?;
+    }
+};
+
+fn sendRequest(io: std.Io, allocator: std.mem.Allocator, addr: std.Io.net.IpAddress, request: []const u8) ![]u8 {
+    var stream = try std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream });
+    defer stream.close(io);
+
+    var wbuf: [1024]u8 = undefined;
+    var w = stream.writer(io, &wbuf);
+    try w.interface.writeAll(request);
+    try w.interface.flush();
+
+    var rbuf: [4096]u8 = undefined;
+    var r = stream.reader(io, &rbuf);
+    return r.interface.allocRemaining(allocator, .unlimited);
+}
+
+test "loop serves a single request" {
+    const io = testing.io;
+    const allocator = testing.allocator;
+
+    var ts: TestServer = undefined;
+    try ts.start(io, allocator);
+    defer ts.stop();
+
+    const response = try sendRequest(
+        io,
+        allocator,
+        ts.boundAddress(),
+        "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    );
+    defer allocator.free(response);
+
+    try testing.expect(std.mem.indexOf(u8, response, "200 OK") != null);
+    try testing.expect(std.mem.indexOf(u8, response, "hello") != null);
+}
+
+test "loop handles keep-alive (multiple requests on one connection)" {
+    const io = testing.io;
+    const allocator = testing.allocator;
+
+    var ts: TestServer = undefined;
+    try ts.start(io, allocator);
+    defer ts.stop();
+
+    var stream = try std.Io.net.IpAddress.connect(&ts.boundAddress(), io, .{ .mode = .stream });
+    defer stream.close(io);
+
+    var wbuf: [1024]u8 = undefined;
+    var w = stream.writer(io, &wbuf);
+    inline for (0..3) |_| {
+        try w.interface.writeAll("GET / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n");
+    }
+    try w.interface.writeAll("GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    try w.interface.flush();
+
+    var rbuf: [4096]u8 = undefined;
+    var r = stream.reader(io, &rbuf);
+    const response = try r.interface.allocRemaining(allocator, .unlimited);
+    defer allocator.free(response);
+
+    var count: usize = 0;
+    var idx: usize = 0;
+    while (std.mem.indexOfPos(u8, response, idx, "200 OK")) |found| {
+        count += 1;
+        idx = found + "200 OK".len;
+    }
+    try testing.expectEqual(@as(usize, 4), count);
+}
+
+test "loop handles concurrent connections" {
+    const io = testing.io;
+    const allocator = testing.allocator;
+
+    var ts: TestServer = undefined;
+    try ts.start(io, allocator);
+    defer ts.stop();
+
+    const N = 8;
+    var oks: [N]bool = @splat(false);
+    var clients: std.Io.Group = .init;
+    const addr = ts.boundAddress();
+
+    for (0..N) |i| {
+        clients.async(io, hitOnce, .{ io, allocator, addr, &oks[i] });
+    }
+    clients.await(io) catch |err| switch (err) {
+        error.Canceled => {},
+    };
+
+    for (oks) |ok| try testing.expect(ok);
+}
+
+fn hitOnce(io: std.Io, allocator: std.mem.Allocator, addr: std.Io.net.IpAddress, ok: *bool) std.Io.Cancelable!void {
+    const response = sendRequest(
+        io,
+        allocator,
+        addr,
+        "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    ) catch return;
+    defer allocator.free(response);
+    if (std.mem.indexOf(u8, response, "200 OK") != null and
+        std.mem.indexOf(u8, response, "hello") != null)
+    {
+        ok.* = true;
+    }
+}
+
+test "loop returns 404 when handler skips" {
+    const io = testing.io;
+    const allocator = testing.allocator;
+
+    const SkipAll = struct {
+        pub fn handle(_: @This(), _: http.Request, _: *http.Response) HandlerError!void {
+            return error.Skipped;
+        }
+    };
+
+    var state = SkipAll{};
+    const wrapped = Handler.wrap(SkipAll).init(&state);
+
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = http.Server.init(io, allocator, address, .{});
+    defer server.deinit();
+    try server.listen();
+
+    var loop = try Loop.init(io, &server, wrapped.interface());
+    defer loop.deinit();
+    try loop.start();
+
+    const response = try sendRequest(
+        io,
+        allocator,
+        server.getAddress().?,
+        "GET /missing HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    );
+    defer allocator.free(response);
+
+    try testing.expect(std.mem.indexOf(u8, response, "404 Not Found") != null);
+}
+
+test "loop shuts down cleanly with idle worker" {
+    // An idle keep-alive client holds a worker blocked in netRead.
+    // `loop.deinit` must cancel the worker_group and unblock the worker
+    // so this test returns; if cancellation is broken the test hangs.
+    const io = testing.io;
+    const allocator = testing.allocator;
+
+    var ts: TestServer = undefined;
+    try ts.start(io, allocator);
+    defer ts.stop();
+
+    var stream = try std.Io.net.IpAddress.connect(&ts.boundAddress(), io, .{ .mode = .stream });
+    defer stream.close(io);
+    // Connection opened, no bytes sent. Worker is now blocked in netRead.
+    // ts.stop() (deferred) must reap it via Group.cancel.
+}
+
 const log = std.log.scoped(.http);
 
 const std = @import("std");
@@ -185,3 +381,4 @@ const testing = std.testing;
 const http = @import("../http/server.zig");
 
 const Handler = @import("handler.zig").Handler;
+const HandlerError = @import("handler.zig").Error;
