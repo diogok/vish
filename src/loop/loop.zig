@@ -8,13 +8,16 @@
 //! - Each accepted connection is handed off to a worker task, which
 //!   under the default `Io` becomes its own OS thread.
 //! - Workers process requests in a keep-alive loop until the connection
-//!   closes.
+//!   closes or the idle deadline elapses between requests.
 //! - `stop()` stops accepting new connections. `deinit()` releases the
 //!   loop and cancels any workers still blocked in I/O.
 //!
 //! ## Lifecycle
 //! - Accept task receives a connection and spawns a worker.
-//! - Worker reads requests in a loop (supporting HTTP keep-alive).
+//! - For each request the worker first waits for the first byte under
+//!   an idle deadline (`ListenOptions.idle_timeout_in_millis`); once
+//!   data is in flight the deadline is cancelled and parsing runs
+//!   without one.
 //! - Each request is passed to the handler, which populates the response.
 //! - Response is flushed; connection continues or closes based on the
 //!   `Connection` header.
@@ -110,6 +113,7 @@ pub const Loop = struct {
     /// Runs in its own task and processes requests in a loop until either:
     /// - The connection is closed (`Connection: close` header)
     /// - A read error occurs or the client disconnects
+    /// - The idle deadline elapses between requests
     /// - The server is shutting down (`self.active == false`)
     ///
     /// Memory for each request is managed by the Connection's arena,
@@ -125,6 +129,14 @@ pub const Loop = struct {
 
         log.info("Connection started", .{});
         while (self.active) {
+            // Race the wait-for-next-request against an idle deadline.
+            // The deadline only guards the wait — once the first byte of
+            // the next request arrives, the deadline is cancelled and
+            // the rest of the parse runs without one. This matches the
+            // shape `io.concurrentTimeout` will eventually provide; for
+            // now we approximate with an explicit babysitter task.
+            if (!self.waitForNextRequest(&conn)) return;
+
             const request = conn.next() catch |err| {
                 log.err("Error reading request: {any}", .{err});
                 return;
@@ -135,6 +147,47 @@ pub const Loop = struct {
                 .keep => {},
             }
         }
+    }
+
+    /// Block until the first byte of the next request arrives, or the
+    /// idle deadline elapses, or the connection closes. Returns `true`
+    /// if data is now buffered and ready to parse, `false` if the
+    /// connection should be closed (timed out, EOF, or read error).
+    fn waitForNextRequest(self: *@This(), conn: *http.Connection) bool {
+        const idle_ms = conn.server.options.idle_timeout_in_millis;
+        const reader = &conn.net_reader.interface;
+
+        if (idle_ms == 0) {
+            // No deadline — block on first byte indefinitely.
+            reader.fill(1) catch return false;
+            return true;
+        }
+
+        // Spawn a babysitter that shuts the stream down after idle_ms.
+        // `concurrent` (not `async`) — under saturation `async` would
+        // run the babysitter inline on this thread, which would block
+        // before we ever reached `fill(1)`.
+        var babysitter: std.Io.Group = .init;
+        var armed = false;
+        const stream = conn.stream;
+        if (babysitter.concurrent(self.io, idleBabysitter, .{ self.io, stream, idle_ms })) {
+            armed = true;
+        } else |err| switch (err) {
+            error.ConcurrencyUnavailable => {
+                log.warn("idle deadline unavailable for this cycle", .{});
+            },
+        }
+
+        const have_data = if (reader.fill(1)) |_| true else |_| false;
+        if (armed) babysitter.cancel(self.io);
+        return have_data;
+    }
+
+    /// Sleep for `idle_ms`; if not cancelled in time, shut down `stream`
+    /// to unblock the worker's pending read with EOF.
+    fn idleBabysitter(io: std.Io, stream: std.Io.net.Stream, idle_ms: u32) std.Io.Cancelable!void {
+        std.Io.sleep(io, .fromMilliseconds(@intCast(idle_ms)), .awake) catch return;
+        stream.shutdown(io, .both) catch {};
     }
 
     /// Process a single HTTP request and determine if the connection should continue.
@@ -196,11 +249,15 @@ const TestServer = struct {
     handler_wrap: Handler.wrap(HelloHandler),
 
     fn start(self: *TestServer, io: std.Io, allocator: std.mem.Allocator) !void {
+        return self.startWithOptions(io, allocator, .{});
+    }
+
+    fn startWithOptions(self: *TestServer, io: std.Io, allocator: std.mem.Allocator, options: http.ListenOptions) !void {
         self.handler_state = .{};
         self.handler_wrap = Handler.wrap(HelloHandler).init(&self.handler_state);
 
         const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
-        self.server = http.Server.init(io, allocator, address, .{});
+        self.server = http.Server.init(io, allocator, address, options);
         try self.server.listen();
         errdefer self.server.deinit();
 
@@ -364,13 +421,71 @@ test "loop shuts down cleanly with idle worker" {
     const allocator = testing.allocator;
 
     var ts: TestServer = undefined;
-    try ts.start(io, allocator);
+    try ts.startWithOptions(io, allocator, .{ .idle_timeout_in_millis = 0 });
     defer ts.stop();
 
     var stream = try std.Io.net.IpAddress.connect(&ts.boundAddress(), io, .{ .mode = .stream });
     defer stream.close(io);
-    // Connection opened, no bytes sent. Worker is now blocked in netRead.
-    // ts.stop() (deferred) must reap it via Group.cancel.
+    // Connection opened, no bytes sent, idle deadline disabled. Worker
+    // is now blocked in netRead. `ts.stop()` (deferred) must reap it
+    // via Group.cancel.
+}
+
+test "loop reaps idle keep-alive connections" {
+    const io = testing.io;
+    const allocator = testing.allocator;
+
+    var ts: TestServer = undefined;
+    try ts.startWithOptions(io, allocator, .{ .idle_timeout_in_millis = 100 });
+    defer ts.stop();
+
+    var stream = try std.Io.net.IpAddress.connect(&ts.boundAddress(), io, .{ .mode = .stream });
+    defer stream.close(io);
+
+    // Open the connection, send nothing. The server's idle deadline
+    // (100 ms) should fire, the worker shuts the socket, and the
+    // client read returns EOF.
+    var rbuf: [128]u8 = undefined;
+    var r = stream.reader(io, &rbuf);
+    const got = try r.interface.allocRemaining(allocator, .unlimited);
+    defer allocator.free(got);
+    try testing.expectEqual(0, got.len);
+}
+
+test "loop does not reap an in-flight request" {
+    // The deadline only times the wait-for-first-byte phase; once data
+    // is arriving the deadline is cancelled and the parser runs without
+    // one. Send a request whose body trickles in over a window longer
+    // than the idle timeout — the request should still complete.
+    const io = testing.io;
+    const allocator = testing.allocator;
+
+    var ts: TestServer = undefined;
+    try ts.startWithOptions(io, allocator, .{ .idle_timeout_in_millis = 100 });
+    defer ts.stop();
+
+    var stream = try std.Io.net.IpAddress.connect(&ts.boundAddress(), io, .{ .mode = .stream });
+    defer stream.close(io);
+
+    var wbuf: [256]u8 = undefined;
+    var w = stream.writer(io, &wbuf);
+
+    // Send the request line immediately, then sleep past the idle
+    // deadline before completing the headers. The parser is already
+    // engaged with the request, so the deadline should be cancelled.
+    try w.interface.writeAll("GET / HTTP/1.1\r\n");
+    try w.interface.flush();
+    std.Io.sleep(io, .fromMilliseconds(250), .awake) catch {};
+    try w.interface.writeAll("Host: x\r\nConnection: close\r\n\r\n");
+    try w.interface.flush();
+
+    var rbuf: [4096]u8 = undefined;
+    var r = stream.reader(io, &rbuf);
+    const response = try r.interface.allocRemaining(allocator, .unlimited);
+    defer allocator.free(response);
+
+    try testing.expect(std.mem.indexOf(u8, response, "200 OK") != null);
+    try testing.expect(std.mem.indexOf(u8, response, "hello") != null);
 }
 
 const log = std.log.scoped(.http);

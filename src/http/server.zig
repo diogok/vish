@@ -10,15 +10,19 @@
 //! requests. Calling `stop` unblocks the accept loop; `deinit` releases
 //! resources.
 //!
-//! There is no per-connection idle/read timeout. An idle keep-alive
-//! client holds its worker until it disconnects; place behind a load
-//! balancer for public exposure.
+//! Idle keep-alive connections are reaped after `idle_timeout_in_millis`
+//! ms with no new request — see `ListenOptions`.
 
 pub const ListenOptions = struct {
     kernel_backlog: u31 = 1024,
     reuse_address: bool = true,
     tcp_keep_alive: bool = true,
     tcp_no_delay: bool = false,
+
+    /// Maximum time to wait between requests on a keep-alive connection
+    /// before reaping it. Only the gap between requests is timed; an
+    /// already-arriving request is not interrupted. Set to 0 to disable.
+    idle_timeout_in_millis: u32 = 1000,
 
     read_buffer_size: usize = 8 * 1024,
     write_buffer_size: usize = 8 * 1024,
