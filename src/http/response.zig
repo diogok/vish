@@ -44,12 +44,31 @@ pub const Connection = enum(u1) {
     }
 };
 
-pub const TransferEncoding = enum(u1) {
-    chunked = 0,
+pub const TransferEncoding = enum {
+    chunked,
+
+    pub fn getValue(self: @This()) []const u8 {
+        return @tagName(self);
+    }
+};
+
+/// HTTP `Content-Encoding` for the response body. `gzip` maps to RFC
+/// 1952 (gzip container); `deflate` maps to RFC 1950 (zlib-wrapped raw
+/// deflate). Set on `Headers.content_encoding` to opt the response into
+/// buffered compression in `Response.send()`.
+pub const ContentEncoding = enum(u1) {
+    gzip = 0,
     deflate = 1,
 
     pub fn getValue(self: @This()) []const u8 {
         return @tagName(self);
+    }
+
+    pub fn container(self: @This()) std.compress.flate.Container {
+        return switch (self) {
+            .gzip => .gzip,
+            .deflate => .zlib,
+        };
     }
 };
 
@@ -71,6 +90,7 @@ pub const ExtraHeader = struct {
 
 pub const Headers = struct {
     transfer_encoding: ?TransferEncoding = null,
+    content_encoding: ?ContentEncoding = null,
     content_length: ?usize = null,
     content_type: []const u8 = "",
     cache_control: []const u8 = "",
@@ -104,6 +124,11 @@ pub const Response = struct {
 
     writer: *std.Io.Writer,
 
+    /// Per-request allocator (typically the connection arena). Required
+    /// only when `headers.content_encoding` is set — `send()` uses it
+    /// to allocate the compressed body buffer.
+    allocator: ?std.mem.Allocator = null,
+
     /// Create a response pre-configured from the request.
     /// Copies the HTTP version and Connection header from the request.
     pub fn fromRequest(src: Request) @This() {
@@ -114,16 +139,45 @@ pub const Response = struct {
                 .connection = conn,
             },
             .writer = src.writer,
+            .allocator = src.allocator,
         };
     }
 
     pub fn send(self: *@This()) !void {
+        if (self.headers.content_encoding) |enc| {
+            if (self.body.len > 0) try self.compressBody(enc);
+        }
         try self.sendStatus();
         try self.sendHeaders();
         try self.sendNewline();
         if (self.body.len != 0) {
             try self.sendBody();
         }
+    }
+
+    /// Compress `self.body` in place. `self.body` is replaced with an
+    /// arena-allocated compressed buffer; `Content-Length` is set to
+    /// the compressed size. Requires `self.allocator` to be set
+    /// (always true when constructed via `fromRequest`).
+    fn compressBody(self: *@This(), enc: ContentEncoding) !void {
+        const allocator = self.allocator.?;
+        const work_buf = try allocator.alloc(u8, std.compress.flate.max_window_len);
+        // Sink must satisfy Compress.init's `output.buffer.len > 8` assert.
+        var sink = try std.Io.Writer.Allocating.initCapacity(allocator, 4 * 1024);
+        // Note: do not sink.deinit() — we hand its buffer off via toOwnedSlice.
+        var compressor = try std.compress.flate.Compress.init(
+            &sink.writer,
+            work_buf,
+            enc.container(),
+            .default,
+        );
+        try compressor.writer.writeAll(self.body);
+        try compressor.finish();
+        const compressed = try sink.toOwnedSlice();
+        self.body = compressed;
+        self.headers.content_length = compressed.len;
+        // `work_buf` is arena-owned; no explicit free needed in production.
+        // In tests with a non-arena allocator the caller must reset/free.
     }
 
     fn sendStatus(
@@ -164,6 +218,10 @@ pub const Response = struct {
             } else if (field.type == ?TransferEncoding) {
                 if (@field(self.headers, field.name)) |te| {
                     try self.sendHeader(self.writer, &headerName, te.getValue());
+                }
+            } else if (field.type == ?ContentEncoding) {
+                if (@field(self.headers, field.name)) |ce| {
+                    try self.sendHeader(self.writer, &headerName, ce.getValue());
                 }
             } else if (field.type == ?usize) {
                 if (@field(self.headers, field.name)) |val| {
@@ -210,6 +268,9 @@ pub const Response = struct {
         self: *@This(),
         chunk: []const u8,
     ) !void {
+        // Streaming compression (compressor → chunked encoder) is not
+        // implemented. Use the buffered path: set `body` and call `send()`.
+        std.debug.assert(self.headers.content_encoding == null);
         if (!self.sent_status) {
             try self.sendStatus();
         }
@@ -222,7 +283,7 @@ pub const Response = struct {
                 try self.sendNewline();
             }
         }
-        try self.writer.print("{d}\r\n", .{chunk.len});
+        try self.writer.print("{x}\r\n", .{chunk.len});
         _ = try self.writer.write(chunk);
         _ = try self.writer.write("\r\n");
     }
@@ -242,6 +303,8 @@ pub const Response = struct {
     ///
     /// Format: "event: <type>\ndata: <data>\n\n" or "data: <data>\n\n"
     pub fn writeEvent(self: *@This(), event_type: ?[]const u8, data: []const u8) !void {
+        // SSE + compression breaks per-event flush semantics — refuse.
+        std.debug.assert(self.headers.content_encoding == null);
         if (!self.sent_status) {
             if (self.headers.content_type.len == 0) {
                 self.headers.content_type = "text/event-stream";
@@ -262,6 +325,8 @@ pub const Response = struct {
     /// Ensure SSE status + headers are sent (once). Sets Content-Type to
     /// text/event-stream and Cache-Control to no-cache if unset.
     fn ensureSSEHeaders(self: *@This()) !void {
+        // SSE + compression breaks per-event flush semantics — refuse.
+        std.debug.assert(self.headers.content_encoding == null);
         if (self.sent_status) return;
         if (self.headers.content_type.len == 0) {
             self.headers.content_type = "text/event-stream";
@@ -355,6 +420,29 @@ test "chunked response writing" {
     const content = buffer[0..writer.end];
 
     try testing.expectEqualStrings("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: text/plain\r\n\r\n5\r\nhello\r\n0\r\n\r\n", content);
+}
+
+test "chunked response sizes are hex per RFC 7230" {
+    var buffer: [4 * 1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+
+    var res = Response{
+        .status = .OK,
+        .writer = &writer,
+    };
+    // 16 bytes: decimal "16" vs hex "10". 26 bytes: decimal "26" vs hex "1a".
+    try res.writeChunk("0123456789abcdef"); // 16 bytes -> "10"
+    try res.writeChunk("0123456789abcdefghijklmnop"); // 26 bytes -> "1a"
+    try res.end();
+
+    const content = buffer[0..writer.end];
+    try testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+            "10\r\n0123456789abcdef\r\n" ++
+            "1a\r\n0123456789abcdefghijklmnop\r\n" ++
+            "0\r\n\r\n",
+        content,
+    );
 }
 
 fn capitalize(comptime name: []const u8) [name.len]u8 {
@@ -626,6 +714,87 @@ test "empty body response" {
     const content = buffer[0..writer.end];
     // 304 responses typically have no body, but blank line is always required
     try testing.expectEqualStrings("HTTP/1.1 304 Not Modified\r\n\r\n", content);
+}
+
+fn assertCompressedResponseRoundTrips(
+    enc: ContentEncoding,
+    plaintext: []const u8,
+    expected_header: []const u8,
+) !void {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var out_buf: [16 * 1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&out_buf);
+
+    var res = Response{
+        .status = .OK,
+        .headers = .{ .content_type = "text/plain", .content_encoding = enc },
+        .body = plaintext,
+        .writer = &writer,
+        .allocator = arena.allocator(),
+    };
+    try res.send();
+
+    const wire = out_buf[0..writer.end];
+
+    // Header section assertions
+    try testing.expect(std.mem.indexOf(u8, wire, expected_header) != null);
+    try testing.expect(std.mem.indexOf(u8, wire, "Content-Type: text/plain\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, wire, "Content-Length: ") != null);
+
+    // Locate body (after the blank line)
+    const sep = "\r\n\r\n";
+    const sep_idx = std.mem.indexOf(u8, wire, sep).?;
+    const compressed_body = wire[sep_idx + sep.len ..];
+    try testing.expect(compressed_body.len > 0);
+    try testing.expect(compressed_body.len < plaintext.len + 64); // sanity: at most plaintext + some header overhead
+
+    // Round-trip: decompress and compare to plaintext
+    const dbuf = try testing.allocator.alloc(u8, std.compress.flate.max_window_len);
+    defer testing.allocator.free(dbuf);
+    var src = std.Io.Reader.fixed(compressed_body);
+    var decompress = std.compress.flate.Decompress.init(&src, enc.container(), dbuf);
+    const recovered = try decompress.reader.allocRemaining(testing.allocator, .unlimited);
+    defer testing.allocator.free(recovered);
+    try testing.expectEqualStrings(plaintext, recovered);
+}
+
+test "Response body compresses with Content-Encoding: gzip" {
+    const plaintext =
+        "{\"message\":\"hello, world\",\"items\":[1,2,3,4,5,6,7,8,9,10]}" ++
+        " repeated for compressibility " ** 16;
+    try assertCompressedResponseRoundTrips(.gzip, plaintext, "Content-Encoding: gzip\r\n");
+}
+
+test "Response body compresses with Content-Encoding: deflate" {
+    const plaintext =
+        "<html><body><h1>compress me</h1></body></html>" ++
+        " repeated " ** 32;
+    try assertCompressedResponseRoundTrips(.deflate, plaintext, "Content-Encoding: deflate\r\n");
+}
+
+test "Response with content_encoding but empty body skips compression" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var out_buf: [4 * 1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&out_buf);
+
+    var res = Response{
+        .status = .No_Content,
+        .headers = .{ .content_encoding = .gzip },
+        .writer = &writer,
+        .allocator = arena.allocator(),
+    };
+    try res.send();
+
+    const wire = out_buf[0..writer.end];
+    // Header is still emitted (the field is set), but no compression ran.
+    try testing.expect(std.mem.indexOf(u8, wire, "Content-Encoding: gzip\r\n") != null);
+    // No body, no Content-Length set.
+    try testing.expect(std.mem.indexOf(u8, wire, "Content-Length: ") == null);
+    try testing.expect(std.mem.endsWith(u8, wire, "\r\n\r\n"));
 }
 
 const std = @import("std");

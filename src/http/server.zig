@@ -26,6 +26,13 @@ pub const ListenOptions = struct {
 
     read_buffer_size: usize = 8 * 1024,
     write_buffer_size: usize = 8 * 1024,
+
+    /// When true, request headers not matched by the pre-parsed `Headers`
+    /// fields are stored in `Headers.extras` and queryable via
+    /// `Headers.get(name)`. Default false: arbitrary headers are
+    /// discarded, saving a lowercase-key allocation and a hashmap put per
+    /// non-pre-parsed header per request.
+    parse_extra_headers: bool = false,
 };
 
 pub const Server = struct {
@@ -170,6 +177,7 @@ pub const Connection = struct {
             self.arena.allocator(),
             &self.net_reader.interface,
             &self.net_writer.interface,
+            .{ .parse_extra_headers = self.server.options.parse_extra_headers },
         ) catch |err| {
             if (err == error.NoData) return null;
             if (self.net_reader.err) |net_err| {

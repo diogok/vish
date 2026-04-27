@@ -93,7 +93,7 @@ test "struct router" {
         }
         pub fn @"POST /echo"(_: @This(), req: Request, res: *Response) !void {
             var buffer: [1024]u8 = undefined;
-            var body_reader = req.bodyReader(&buffer);
+            var body_reader = try req.bodyReader(&buffer);
             var reader = body_reader.interface();
             res.body = try reader.allocRemaining(testing.allocator, .unlimited);
             //defer testing.allocator.free(res.body);

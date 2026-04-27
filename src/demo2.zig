@@ -94,7 +94,7 @@ pub const MyHandler = struct {
         };
         var params = Params{};
         var buf: [1024]u8 = undefined;
-        var body_reader = req.bodyReader(&buf);
+        var body_reader = try req.bodyReader(&buf);
 
         http.utils.formdata.read_formdata(
             self.allocator,
