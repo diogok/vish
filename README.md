@@ -15,14 +15,14 @@ A vtable-based interface that allows any struct with a `handle(Request, *Respons
 
 ### Accept/read/write Loop
 
-A multi-threaded loop that manages HTTP connections:
+A concurrent loop built on Zig's `std.Io` rework:
 
-- Runs an accept loop in a dedicated thread, waiting for incoming connections
-- Dispatches each connection to a thread pool
-- Supports graceful shutdown: stops accepting new connections and waits for workers to finish
+- An accept task runs in its own unit of concurrency, waiting for incoming connections
+- Each connection is dispatched to a worker task (one OS thread per connection under the default `Io`)
+- Backpressure: when concurrency is saturated, the connection runs inline on the accept task
+- Idle keep-alive connections are reaped after a configurable timeout
+- Supports graceful shutdown: stops accepting new connections and cancels in-flight workers
 - Memory is managed per-connection using an arena allocator that resets between requests
-
-I am waiting for the Zig IO rework to try alternative evented async loop.
 
 ### Routing
 
@@ -45,6 +45,25 @@ pub fn @"GET /users/?"(self: @This(), req: Request, res: *Response, params: []co
 PrefixRouter: Routes requests to a handler if the URI prefix matches. The prefix is stripped from the path before passing to the inner handler, enabling modular sub-applications.
 
 CombinedRouter: Chains multiple handlers together, attempting each in order until one matches.
+
+### Streaming responses
+
+- Chunked transfer encoding via `writeChunk` / `end`
+- Server-Sent Events via `writeSSE` / `writeEvent` / `writeSSEComment`
+
+### Compression
+
+Transparent `gzip` and `deflate` for both directions:
+
+- Request bodies with `Content-Encoding: gzip|deflate` are decompressed on read; handlers always see plaintext
+- Set `res.headers.content_encoding = .gzip` (or `.deflate`) on a response and `send()` will compress the body and update `Content-Length`
+
+### Static assets
+
+`addStaticAssets` in `build.zig` generates an asset module that pairs with `StaticRouter`:
+
+- Debug builds read from disk on each request (live edits, no rebuild)
+- Release builds `@embedFile` everything into the binary
 
 ### Middleware
 
@@ -83,23 +102,24 @@ exe.root_module.addImport("http", http.module("http"));
 const std = @import("std");
 const http = @import("http");
 
-pub fn main() !void {
-    const allocator = std.heap.smp_allocator;
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const allocator = init.gpa;
 
-    const address = try std.net.Address.resolveIp("127.0.0.1", 8080);
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", 8080);
 
-    var server = http.Server.init(allocator, address, .{});
+    var server = http.Server.init(io, allocator, address, .{});
     defer server.deinit();
     try server.listen();
 
     var my_handler = MyHandler{};
     const handler = http.Handler.wrap(MyHandler).init(&my_handler);
 
-    var loop = try http.Loop.init(allocator, &server, handler.interface());
+    var loop = try http.Loop.init(io, &server, handler.interface());
     defer loop.deinit();
     try loop.start();
 
-    http.waitInterrupt();
+    http.waitInterrupt(io);
 }
 
 const MyHandler = struct {
@@ -115,7 +135,9 @@ const MyHandler = struct {
 };
 ```
 
-See [src/demo.zig] and [src/demo2.zig].
+See [src/demo.zig](src/demo.zig) and [src/demo2.zig](src/demo2.zig) for
+runnable examples, and [docs/](docs/) for architecture, conventions, and
+a full usage walkthrough.
 
 ## License
 
