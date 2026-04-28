@@ -4,7 +4,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const http = b.addModule("http", .{
+    const vish = b.addModule("vish", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -32,7 +32,7 @@ pub fn build(b: *std.Build) void {
                 .strip = optimize == .ReleaseSmall,
             }),
         });
-        exe.root_module.addImport("http", http);
+        exe.root_module.addImport("vish", vish);
         b.installArtifact(exe);
 
         const run_cmd = b.addRunArtifact(exe);
@@ -57,7 +57,7 @@ pub fn build(b: *std.Build) void {
                 .strip = optimize == .ReleaseSmall,
             }),
         });
-        exe.root_module.addImport("http", http);
+        exe.root_module.addImport("vish", vish);
         exe.root_module.addImport("assets", assets);
         b.installArtifact(exe);
 
@@ -73,7 +73,7 @@ pub fn build(b: *std.Build) void {
 }
 
 /// Build a module that exposes the contents of `dir` as a static asset
-/// table. Pair with `http.utils.router.StaticRouter` to serve the files
+/// table. Pair with `vish.utils.router.StaticRouter` to serve the files
 /// over HTTP.
 ///
 /// In Debug builds the lookup reads from disk on every call (so edits

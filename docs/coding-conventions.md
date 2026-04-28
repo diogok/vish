@@ -13,9 +13,9 @@ The library is built on Zig's I/O rework. There is no global runtime —
 filesystem, signals, or sleeps.
 
 ```zig
-var server = http.Server.init(io, allocator, address, .{});
-var loop = try http.Loop.init(io, &server, handler.interface());
-http.waitInterrupt(io);
+var server = vish.Server.init(io, allocator, address, .{});
+var loop = try vish.Loop.init(io, &server, handler.interface());
+vish.waitInterrupt(io);
 ```
 
 Handlers do **not** receive `io` as a parameter — they get it indirectly
@@ -50,14 +50,14 @@ generates the vtable; the concrete type just implements `handle`:
 
 ```zig
 const Hello = struct {
-    pub fn handle(_: @This(), _: http.Request, res: *http.Response) http.HandleError!void {
+    pub fn handle(_: @This(), _: vish.Request, res: *vish.Response) vish.HandleError!void {
         res.body = "hi";
         try res.send();
     }
 };
 
 var state = Hello{};
-const handler = http.Handler.wrap(Hello).init(&state).interface();
+const handler = vish.Handler.wrap(Hello).init(&state).interface();
 ```
 
 **2. Inline `interface()` method — for stateful handlers / routers.** Every
@@ -145,16 +145,16 @@ pattern.
 ## Logging
 
 ```zig
-const log = std.log.scoped(.http);
+const log = std.log.scoped(.vish);
 ```
 
-All library modules log under the `.http` scope. Demos use their own
+All library modules log under the `.vish` scope. Demos use their own
 scope (`.demo`). Set per-scope levels via `std_options`:
 
 ```zig
 pub const std_options: std.Options = .{
     .log_scope_levels = &[_]std.log.ScopeLevel{
-        .{ .scope = .http, .level = .warn },
+        .{ .scope = .vish, .level = .warn },
     },
 };
 ```

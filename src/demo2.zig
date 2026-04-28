@@ -6,26 +6,26 @@ pub fn main(init: std.process.Init) !void {
     const port: u16 = 8080;
     const address = try std.Io.net.IpAddress.parse(ip, port);
 
-    var server = http.Server.init(io, allocator, address, .{});
+    var server = vish.Server.init(io, allocator, address, .{});
     defer server.deinit();
     try server.listen();
 
-    var struct_handler = http.utils.router.StructRouter(MyHandler).init(.{
+    var struct_handler = vish.utils.router.StructRouter(MyHandler).init(.{
         .allocator = allocator,
     });
-    var static_handler = http.utils.router.StaticRouter(assets).init(io);
-    var combined_handlers = http.utils.router.CombinedRouter.init(&.{
+    var static_handler = vish.utils.router.StaticRouter(assets).init(io);
+    var combined_handlers = vish.utils.router.CombinedRouter.init(&.{
         struct_handler.interface(),
         static_handler.interface(),
     });
 
-    var handler = http.utils.logging.Common.init(io, combined_handlers.interface());
+    var handler = vish.utils.logging.Common.init(io, combined_handlers.interface());
 
-    var loop = try http.Loop.init(io, &server, handler.interface());
+    var loop = try vish.Loop.init(io, &server, handler.interface());
     defer loop.deinit();
     try loop.start();
 
-    http.waitInterrupt(io);
+    vish.waitInterrupt(io);
 }
 
 pub const MyHandler = struct {
@@ -33,9 +33,9 @@ pub const MyHandler = struct {
 
     pub fn @"GET /"(
         _: @This(),
-        _: http.Request,
-        res: *http.Response,
-    ) http.HandleError!void {
+        _: vish.Request,
+        res: *vish.Response,
+    ) vish.HandleError!void {
         res.body = "hello";
 
         try res.send();
@@ -43,24 +43,24 @@ pub const MyHandler = struct {
 
     pub fn @"GET /err"(
         _: @This(),
-        _: http.Request,
-        _: *http.Response,
-    ) http.HandleError!void {
+        _: vish.Request,
+        _: *vish.Response,
+    ) vish.HandleError!void {
         return error.Internal;
     }
 
     pub fn @"GET /hello"(
         self: @This(),
-        req: http.Request,
-        res: *http.Response,
-    ) http.HandleError!void {
+        req: vish.Request,
+        res: *vish.Response,
+    ) vish.HandleError!void {
         const Params = struct {
             name: ?[]const u8 = null,
         };
         var params = Params{};
         var query_reader = std.Io.Reader.fixed(req.uri.query);
 
-        http.utils.formdata.read_formdata(
+        vish.utils.formdata.read_formdata(
             self.allocator,
             &query_reader,
             &params,
@@ -86,9 +86,9 @@ pub const MyHandler = struct {
 
     pub fn @"POST /hello"(
         self: @This(),
-        req: http.Request,
-        res: *http.Response,
-    ) http.HandleError!void {
+        req: vish.Request,
+        res: *vish.Response,
+    ) vish.HandleError!void {
         const Params = struct {
             name: ?[]const u8 = null,
         };
@@ -96,7 +96,7 @@ pub const MyHandler = struct {
         var buf: [1024]u8 = undefined;
         var body_reader = try req.bodyReader(&buf);
 
-        http.utils.formdata.read_formdata(
+        vish.utils.formdata.read_formdata(
             self.allocator,
             body_reader.interface(),
             &params,
@@ -122,12 +122,12 @@ pub const MyHandler = struct {
 };
 
 const std = @import("std");
-const http = @import("http");
+const vish = @import("vish");
 const assets = @import("assets");
 const log = std.log.scoped(.demo);
 
 pub const std_options: std.Options = .{
     .log_scope_levels = &[_]std.log.ScopeLevel{
-        .{ .scope = .http, .level = .warn },
+        .{ .scope = .vish, .level = .warn },
     },
 };

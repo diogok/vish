@@ -194,7 +194,7 @@ pub const Connection = struct {
     }
 };
 
-const log = std.log.scoped(.http);
+const log = std.log.scoped(.vish);
 
 const std = @import("std");
 const testing = std.testing;

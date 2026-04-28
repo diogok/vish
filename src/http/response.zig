@@ -803,4 +803,4 @@ const testing = std.testing;
 const request = @import("request.zig");
 const Request = request.Request;
 
-const log = std.log.scoped(.http);
+const log = std.log.scoped(.vish);

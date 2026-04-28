@@ -8,17 +8,17 @@ and `src/demo2.zig` (routing + assets + logging).
 ## Install
 
 ```sh
-zig fetch --save git+https://github.com/diogok/http
+zig fetch --save git+https://github.com/diogok/vish
 ```
 
 `build.zig`:
 
 ```zig
-const http = b.dependency("http", .{
+const vish = b.dependency("vish", .{
     .target = target,
     .optimize = optimize,
 });
-exe.root_module.addImport("http", http.module("http"));
+exe.root_module.addImport("vish", vish.module("vish"));
 ```
 
 Static-asset bundling is opt-in. If you want it, also pull
@@ -34,29 +34,29 @@ pub fn main(init: std.process.Init) !void {
 
     const address = try std.Io.net.IpAddress.parse("127.0.0.1", 8080);
 
-    var server = http.Server.init(io, allocator, address, .{});
+    var server = vish.Server.init(io, allocator, address, .{});
     defer server.deinit();
     try server.listen();
 
     var hello = Hello{};
-    const handler = http.Handler.wrap(Hello).init(&hello);
+    const handler = vish.Handler.wrap(Hello).init(&hello);
 
-    var loop = try http.Loop.init(io, &server, handler.interface());
+    var loop = try vish.Loop.init(io, &server, handler.interface());
     defer loop.deinit();
     try loop.start();
 
-    http.waitInterrupt(io);
+    vish.waitInterrupt(io);
 }
 
 const Hello = struct {
-    pub fn handle(_: @This(), _: http.Request, res: *http.Response) http.HandleError!void {
+    pub fn handle(_: @This(), _: vish.Request, res: *vish.Response) vish.HandleError!void {
         res.body = "Hello, World!";
         try res.send();
     }
 };
 
 const std = @import("std");
-const http = @import("http");
+const vish = @import("vish");
 ```
 
 Run with `zig build run`.
@@ -68,19 +68,19 @@ matches on method + path; non-matches return `error.Skipped`.
 
 ```zig
 const Routes = struct {
-    pub fn @"GET /"(_: @This(), _: http.Request, res: *http.Response) http.HandleError!void {
+    pub fn @"GET /"(_: @This(), _: vish.Request, res: *vish.Response) vish.HandleError!void {
         res.body = "home";
         try res.send();
     }
 
-    pub fn @"POST /users"(_: @This(), _: http.Request, res: *http.Response) http.HandleError!void {
+    pub fn @"POST /users"(_: @This(), _: vish.Request, res: *vish.Response) vish.HandleError!void {
         res.status = .Created;
         try res.send();
     }
 };
 
-var routes = http.utils.router.StructRouter(Routes).init(.{});
-var loop = try http.Loop.init(io, &server, routes.interface());
+var routes = vish.utils.router.StructRouter(Routes).init(.{});
+var loop = try vish.Loop.init(io, &server, routes.interface());
 ```
 
 ### Path params
@@ -110,7 +110,7 @@ pub fn @"GET /users/?/posts/?"(_: @This(), _: Request, res: *Response, params: [
 
 ```zig
 var api_routes = StructRouter(ApiRoutes).init(.{});
-var api = http.utils.router.PrefixRouter.init("/api", api_routes.interface());
+var api = vish.utils.router.PrefixRouter.init("/api", api_routes.interface());
 ```
 
 Now `GET /api/users` is dispatched to `ApiRoutes.@"GET /users"`.
@@ -121,7 +121,7 @@ Now `GET /api/users` is dispatched to `ApiRoutes.@"GET /users"`.
 var struct_routes = StructRouter(MyHandler).init(.{ .allocator = allocator });
 var static_routes = StaticRouter(assets).init(io);
 
-var combined = http.utils.router.CombinedRouter.init(&.{
+var combined = vish.utils.router.CombinedRouter.init(&.{
     struct_routes.interface(),
     static_routes.interface(),
 });
@@ -144,7 +144,7 @@ Code:
 ```zig
 const assets = @import("assets");
 
-var static = http.utils.router.StaticRouter(assets).init(io);
+var static = vish.utils.router.StaticRouter(assets).init(io);
 // add static.interface() to a CombinedRouter
 ```
 
@@ -160,9 +160,9 @@ inner handler returns:
 
 ```zig
 var combined = CombinedRouter.init(&.{ ... });
-var logger = http.utils.logging.Common.init(io, combined.interface());
+var logger = vish.utils.logging.Common.init(io, combined.interface());
 
-var loop = try http.Loop.init(io, &server, logger.interface());
+var loop = try vish.Loop.init(io, &server, logger.interface());
 ```
 
 Custom middleware is just a handler that holds a wrapped `Handler`,
@@ -202,7 +202,7 @@ pub fn @"GET /hello"(self: @This(), req: Request, res: *Response) !void {
     var params = Params{};
 
     var query = std.Io.Reader.fixed(req.uri.query);
-    http.utils.formdata.read_formdata(self.allocator, &query, &params) catch {};
+    vish.utils.formdata.read_formdata(self.allocator, &query, &params) catch {};
 
     var out = std.Io.Writer.Allocating.init(self.allocator);
     defer out.deinit();
@@ -222,7 +222,7 @@ pub fn @"POST /hello"(self: @This(), req: Request, res: *Response) !void {
 
     var buf: [1024]u8 = undefined;
     var body_reader = try req.bodyReader(&buf);
-    http.utils.formdata.read_formdata(self.allocator, body_reader.interface(), &params) catch {};
+    vish.utils.formdata.read_formdata(self.allocator, body_reader.interface(), &params) catch {};
 
     // ...
 }
@@ -302,7 +302,7 @@ By default unrecognized request headers are discarded for performance.
 Opt in:
 
 ```zig
-var server = http.Server.init(io, allocator, address, .{ .parse_extra_headers = true });
+var server = vish.Server.init(io, allocator, address, .{ .parse_extra_headers = true });
 ```
 
 then in handlers:
@@ -317,7 +317,7 @@ Pre-parsed fields (`Host`, `Content-Type`, `Content-Length`, ...) are
 ## Listening options
 
 ```zig
-http.Server.init(io, allocator, address, .{
+vish.Server.init(io, allocator, address, .{
     .kernel_backlog = 1024,
     .reuse_address = true,
     .tcp_keep_alive = true,
@@ -335,7 +335,7 @@ cancelled and a slow request is allowed to complete.
 
 ## Shutdown
 
-`http.waitInterrupt(io)` blocks on SIGINT/SIGHUP. The deferred
+`vish.waitInterrupt(io)` blocks on SIGINT/SIGHUP. The deferred
 `loop.deinit()` and `server.deinit()` then run in reverse declaration
 order to:
 

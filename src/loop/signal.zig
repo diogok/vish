@@ -31,4 +31,4 @@ fn receive(sig: std.posix.SIG) callconv(.c) void {
 }
 
 const std = @import("std");
-const log = std.log.scoped(.http);
+const log = std.log.scoped(.vish);

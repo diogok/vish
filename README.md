@@ -1,6 +1,6 @@
-# http
+# VISH
 
-A simple HTTP server library for Zig.
+**V**table **I**O **S**erver for **H**TTP — a simple HTTP server library for Zig.
 
 ## Features
 
@@ -83,24 +83,24 @@ Custom middleware can be implemented by creating a handler that wraps another ha
 ## Installation
 
 ```sh
-zig fetch --save git+https://github.com/your-username/http
+zig fetch --save git+https://github.com/diogok/vish
 ```
 
 Then in your `build.zig`:
 
 ```zig
-const http = b.dependency("http", .{
+const vish = b.dependency("vish", .{
     .target = target,
     .optimize = optimize,
 });
-exe.root_module.addImport("http", http.module("http"));
+exe.root_module.addImport("vish", vish.module("vish"));
 ```
 
 ## Usage
 
 ```zig
 const std = @import("std");
-const http = @import("http");
+const vish = @import("vish");
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -108,26 +108,26 @@ pub fn main(init: std.process.Init) !void {
 
     const address = try std.Io.net.IpAddress.parse("127.0.0.1", 8080);
 
-    var server = http.Server.init(io, allocator, address, .{});
+    var server = vish.Server.init(io, allocator, address, .{});
     defer server.deinit();
     try server.listen();
 
     var my_handler = MyHandler{};
-    const handler = http.Handler.wrap(MyHandler).init(&my_handler);
+    const handler = vish.Handler.wrap(MyHandler).init(&my_handler);
 
-    var loop = try http.Loop.init(io, &server, handler.interface());
+    var loop = try vish.Loop.init(io, &server, handler.interface());
     defer loop.deinit();
     try loop.start();
 
-    http.waitInterrupt(io);
+    vish.waitInterrupt(io);
 }
 
 const MyHandler = struct {
     pub fn handle(
         _: @This(),
-        req: http.Request,
-        res: *http.Response,
-    ) http.HandleError!void {
+        req: vish.Request,
+        res: *vish.Response,
+    ) vish.HandleError!void {
         _ = req;
         res.body = "Hello, World!";
         try res.send();

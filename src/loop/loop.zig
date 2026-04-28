@@ -488,7 +488,7 @@ test "loop does not reap an in-flight request" {
     try testing.expect(std.mem.indexOf(u8, response, "hello") != null);
 }
 
-const log = std.log.scoped(.http);
+const log = std.log.scoped(.vish);
 
 const std = @import("std");
 const testing = std.testing;
