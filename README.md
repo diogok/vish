@@ -1,6 +1,6 @@
 # VISH
 
-**V**table **I**O **S**erver for **H**TTP — a simple HTTP server library for Zig.
+**V**table **I**O **S**erver for **H**TTP: an HTTP server library for Zig.
 
 ## Features
 
@@ -135,9 +135,15 @@ const MyHandler = struct {
 };
 ```
 
-See [src/demo.zig](src/demo.zig) and [src/demo2.zig](src/demo2.zig) for
-runnable examples, and [docs/](docs/) for architecture, conventions, and
-a full usage walkthrough.
+See [src/demo.zig](src/demo.zig) and [src/demo2.zig](src/demo2.zig) for runnable examples, and [docs/](docs/) for architecture, conventions, and a full usage walkthrough.
+
+## AI Usage
+
+- This library was mostly hand written. 
+- Some functions, fixes and zig version migratation were AI assisted.
+- Comments and docs were AI written and human edited.
+- All was human reviewed.
+- The design, interfaces and archtecture is my own.
 
 ## License
 
