@@ -1,9 +1,8 @@
 # Usage
 
-Walk-through from "hello world" up to routing, static assets, middleware,
-form data, streaming, and SSE. Every snippet here matches the current
-`std.Io`-based API; runnable versions live in `src/demo.zig` (minimal)
-and `src/demo2.zig` (routing + assets + logging).
+Walk-through from "hello world" up to routing, static assets, middleware, form data, streaming, and SSE.
+
+Every snippet here matches the current `std.Io`-based API; runnable versions live in `src/demo.zig` (minimal) and `src/demo2.zig` (routing + assets + logging).
 
 ## Install
 
@@ -21,9 +20,7 @@ const vish = b.dependency("vish", .{
 exe.root_module.addImport("vish", vish.module("vish"));
 ```
 
-Static-asset bundling is opt-in. If you want it, also pull
-`addStaticAssets` from this package's `build.zig` (or copy the function —
-it's pure `std.Build` code).
+Static-asset bundling is opt-in. If you want it, also pull `addStaticAssets` from this package's `build.zig` (or copy the function — it's pure `std.Build` code).
 
 ## Minimal server
 
@@ -63,8 +60,7 @@ Run with `zig build run`.
 
 ## Routing — StructRouter
 
-Define routes as struct methods named `"<METHOD> <PATH>"`. The router
-matches on method + path; non-matches return `error.Skipped`.
+Define routes as struct methods named `"<METHOD> <PATH>"`. The router matches on method + path; non-matches return `error.Skipped`.
 
 ```zig
 const Routes = struct {
@@ -85,8 +81,7 @@ var loop = try vish.Loop.init(io, &server, routes.interface());
 
 ### Path params
 
-Use `?` as a single-segment wildcard. Matched segments are passed as a
-4th parameter `params: []const []const u8`:
+Use `?` as a single-segment wildcard. Matched segments are passed as a 4th parameter `params: []const []const u8`:
 
 ```zig
 pub fn @"GET /users/?"(_: @This(), _: Request, res: *Response, params: []const []const u8) !void {
@@ -127,8 +122,7 @@ var combined = vish.utils.router.CombinedRouter.init(&.{
 });
 ```
 
-`CombinedRouter` tries each handler in order; `error.Skipped` falls
-through to the next. The first non-Skipped result wins.
+`CombinedRouter` tries each handler in order; `error.Skipped` falls through to the next. The first non-Skipped result wins.
 
 ## Static assets
 
@@ -148,15 +142,11 @@ var static = vish.utils.router.StaticRouter(assets).init(io);
 // add static.interface() to a CombinedRouter
 ```
 
-Debug builds read from disk on each request (live edits, no rebuild).
-Release builds `@embedFile` everything into the binary. `StaticRouter`
-only handles `GET`, rejects path-traversal, and returns `Skipped` on
-miss so a `CombinedRouter` can fall through.
+Debug builds read from disk on each request (live edits, no rebuild). Release builds `@embedFile` everything into the binary. `StaticRouter` only handles `GET`, rejects path-traversal, and returns `Skipped` on miss so a `CombinedRouter` can fall through.
 
 ## Middleware — request logging
 
-`Common` wraps another handler and logs each request in CLF after the
-inner handler returns:
+`Common` wraps another handler and logs each request in CLF after the inner handler returns:
 
 ```zig
 var combined = CombinedRouter.init(&.{ ... });
@@ -165,15 +155,11 @@ var logger = vish.utils.logging.Common.init(io, combined.interface());
 var loop = try vish.Loop.init(io, &server, logger.interface());
 ```
 
-Custom middleware is just a handler that holds a wrapped `Handler`,
-calls it, and adds behavior — see `src/utils/logging.zig` for the
-template.
+Custom middleware is just a handler that holds a wrapped `Handler`, calls it, and adds behavior — see `src/utils/logging.zig` for the template.
 
 ## Reading a body
 
-`Request.bodyReader(buffer)` returns a `BodyReader` that handles both
-`Content-Length` and `Transfer-Encoding: chunked`, and (transparently)
-`Content-Encoding: gzip|deflate`. Always read through `.interface()`:
+`Request.bodyReader(buffer)` returns a `BodyReader` that handles both `Content-Length` and `Transfer-Encoding: chunked`, and (transparently) `Content-Encoding: gzip|deflate`. Always read through `.interface()`:
 
 ```zig
 pub fn @"POST /upload"(_: @This(), req: Request, res: *Response) !void {
@@ -190,9 +176,7 @@ pub fn @"POST /upload"(_: @This(), req: Request, res: *Response) !void {
 
 ## Form data and query strings
 
-`read_formdata` parses `application/x-www-form-urlencoded` data into a
-struct of `?[]const u8` (or `[]const u8`) fields. Field names match
-form keys; URL-decoded values are arena-allocated.
+`read_formdata` parses `application/x-www-form-urlencoded` data into a struct of `?[]const u8` (or `[]const u8`) fields. Field names match form keys; URL-decoded values are arena-allocated.
 
 ### Query string
 
@@ -228,9 +212,7 @@ pub fn @"POST /hello"(self: @This(), req: Request, res: *Response) !void {
 }
 ```
 
-`StructRouter` instances need an allocator if their handlers use one;
-construct with `.init(.{ .allocator = allocator })` and access via
-`self.allocator`.
+`StructRouter` instances need an allocator if their handlers use one; construct with `.init(.{ .allocator = allocator })` and access via `self.allocator`.
 
 ## Responses
 
@@ -253,8 +235,7 @@ try res.writeChunk("second");
 try res.end();
 ```
 
-`writeChunk` sends `Transfer-Encoding: chunked` headers on the first
-call; chunk sizes are emitted in hex per RFC 7230.
+`writeChunk` sends `Transfer-Encoding: chunked` headers on the first call; chunk sizes are emitted in hex per RFC 7230.
 
 ### Server-Sent Events
 
@@ -265,9 +246,7 @@ try res.writeSSE(.{ .data = "multi\nline" });   // splits on \n into multiple da
 try res.flush();
 ```
 
-The first SSE call sets `Content-Type: text/event-stream` and
-`Cache-Control: no-cache` if not already set. SSE is incompatible with
-`Content-Encoding` (asserts in debug).
+The first SSE call sets `Content-Type: text/event-stream` and `Cache-Control: no-cache` if not already set. SSE is incompatible with `Content-Encoding` (asserts in debug).
 
 ### Compression
 
@@ -277,10 +256,7 @@ res.body = big_payload;
 try res.send();
 ```
 
-`send()` compresses into the per-request arena, sets `Content-Length`
-to the compressed size, and writes status/headers/body. Streaming
-compression is **not** supported — don't combine `content_encoding`
-with `writeChunk`/`writeSSE`.
+`send()` compresses into the per-request arena, sets `Content-Length` to the compressed size, and writes status/headers/body. Streaming compression is **not** supported — don't combine `content_encoding` with `writeChunk`/`writeSSE`.
 
 ### Extra headers
 
@@ -292,14 +268,11 @@ res.headers.extra = &.{
 try res.send();
 ```
 
-For frequently-used headers, prefer adding a typed field to
-`response.Headers` instead — the comptime serializer picks it up
-automatically.
+For frequently-used headers, prefer adding a typed field to `response.Headers` instead — the comptime serializer picks it up automatically.
 
 ## Reading arbitrary request headers
 
-By default unrecognized request headers are discarded for performance.
-Opt in:
+By default unrecognized request headers are discarded for performance. Opt in:
 
 ```zig
 var server = vish.Server.init(io, allocator, address, .{ .parse_extra_headers = true });
@@ -311,8 +284,7 @@ then in handlers:
 if (req.headers.get("x-request-id")) |rid| { ... }   // case-insensitive
 ```
 
-Pre-parsed fields (`Host`, `Content-Type`, `Content-Length`, ...) are
-**not** mirrored into `extras` — read them via the typed field.
+Pre-parsed fields (`Host`, `Content-Type`, `Content-Length`, ...) are **not** mirrored into `extras` — read them via the typed field.
 
 ## Listening options
 
@@ -329,24 +301,17 @@ vish.Server.init(io, allocator, address, .{
 });
 ```
 
-`idle_timeout_in_millis` only times the wait-for-next-request gap on a
-keep-alive connection; once data starts arriving the deadline is
-cancelled and a slow request is allowed to complete.
+`idle_timeout_in_millis` only times the wait-for-next-request gap on a keep-alive connection; once data starts arriving the deadline is cancelled and a slow request is allowed to complete.
 
 ## Shutdown
 
-`vish.waitInterrupt(io)` blocks on SIGINT/SIGHUP. The deferred
-`loop.deinit()` and `server.deinit()` then run in reverse declaration
-order to:
+`vish.waitInterrupt(io)` blocks on SIGINT/SIGHUP. The deferred `loop.deinit()` and `server.deinit()` then run in reverse declaration order to:
 
-1. Set `loop.active = false` and shut down the listener — accept
-   returns null.
-2. Cancel the accept group and worker group — any task blocked in I/O
-   is unblocked.
+1. Set `loop.active = false` and shut down the listener — accept returns null.
+2. Cancel the accept group and worker group — any task blocked in I/O is unblocked.
 3. Close the listening socket and free buffers.
 
-For a soft stop, call `loop.stop()` and `loop.wait()` instead — workers
-are allowed to finish in-flight requests on their own.
+For a soft stop, call `loop.stop()` and `loop.wait()` instead — workers are allowed to finish in-flight requests on their own.
 
 ## Running tests
 
@@ -354,6 +319,4 @@ are allowed to finish in-flight requests on their own.
 zig build test
 ```
 
-Tests cover request parsing, response writing, all routers, the loop
-itself (real sockets on `127.0.0.1:0`), form data, MIME detection,
-URI encoding, and timestamps.
+Tests cover request parsing, response writing, all routers, the loop itself (real sockets on `127.0.0.1:0`), form data, MIME detection, URI encoding, and timestamps.
