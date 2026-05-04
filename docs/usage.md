@@ -176,7 +176,7 @@ pub fn @"POST /upload"(_: @This(), req: Request, res: *Response) !void {
 
 ## Form data and query strings
 
-`read_formdata` parses `application/x-www-form-urlencoded` data into a struct of `?[]const u8` (or `[]const u8`) fields. Field names match form keys; URL-decoded values are arena-allocated.
+`readFormdata` parses `application/x-www-form-urlencoded` data into a struct of `?[]const u8` (or `[]const u8`) fields. Field names match form keys; URL-decoded values are arena-allocated.
 
 ### Query string
 
@@ -186,7 +186,7 @@ pub fn @"GET /hello"(self: @This(), req: Request, res: *Response) !void {
     var params = Params{};
 
     var query = std.Io.Reader.fixed(req.uri.query);
-    vish.utils.formdata.read_formdata(self.allocator, &query, &params) catch {};
+    vish.utils.formdata.readFormdata(self.allocator, &query, &params) catch {};
 
     var out = std.Io.Writer.Allocating.init(self.allocator);
     defer out.deinit();
@@ -206,7 +206,7 @@ pub fn @"POST /hello"(self: @This(), req: Request, res: *Response) !void {
 
     var buf: [1024]u8 = undefined;
     var body_reader = try req.bodyReader(&buf);
-    vish.utils.formdata.read_formdata(self.allocator, body_reader.interface(), &params) catch {};
+    vish.utils.formdata.readFormdata(self.allocator, body_reader.interface(), &params) catch {};
 
     // ...
 }

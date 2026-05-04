@@ -1,7 +1,10 @@
-//! Form data and query string parsing.
+//! `application/x-www-form-urlencoded` parser. Reads `key=value&...`
+//! pairs into matching fields of a struct (`?[]const u8` or
+//! `[]const u8`); URL-decoded values are arena-allocated.
 
-/// Parses URL-encoded form data and query strings, like used in HTTP POST bodies (application/x-www-form-urlencoded) and URL query parameters.
-pub fn read_formdata(
+/// Read URL-encoded pairs from `reader` into matching fields of `target`.
+/// Unknown keys are skipped. Decoded values are allocated from `allocator`.
+pub fn readFormdata(
     allocator: std.mem.Allocator,
     reader: *std.Io.Reader,
     target: anytype,
@@ -50,7 +53,7 @@ test "read form-data" {
     };
     var target = Data{};
 
-    try read_formdata(testing.allocator, &reader, &target);
+    try readFormdata(testing.allocator, &reader, &target);
     defer testing.allocator.free(target.key);
     defer testing.allocator.free(target.foo);
 
@@ -68,7 +71,7 @@ test "read form-data decode" {
     };
     var target = Data{};
 
-    try read_formdata(testing.allocator, &reader, &target);
+    try readFormdata(testing.allocator, &reader, &target);
     defer testing.allocator.free(target.key);
     defer testing.allocator.free(target.@"foo/bar");
 

@@ -1,4 +1,6 @@
-//! HTTP request handling.
+//! HTTP request: method, URI, version, headers, and a streaming
+//! `BodyReader` that handles `Content-Length`, chunked
+//! `Transfer-Encoding`, and transparent `Content-Encoding: gzip|deflate`.
 
 pub const Method = enum {
     GET,
@@ -110,9 +112,7 @@ pub const Connection = enum(u1) {
     close = 1,
 
     pub fn parse(bytes: []const u8) ?Connection {
-        // comptime loop for each possible value in the enum
         inline for (std.meta.fields(@This())) |field| {
-            // convert from _ to -
             const name = comptime blk: {
                 var buf: [field.name.len]u8 = undefined;
                 _ = std.mem.replace(u8, field.name, "_", "-", &buf);
@@ -130,7 +130,6 @@ pub const TransferEncoding = enum {
     chunked,
 
     pub fn parse(bytes: []const u8) ?TransferEncoding {
-        // comptime loop for each possible value in the enum
         inline for (std.meta.fields(@This())) |field| {
             if (std.ascii.eqlIgnoreCase(bytes, field.name)) {
                 return @enumFromInt(field.value);

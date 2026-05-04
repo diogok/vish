@@ -1,4 +1,6 @@
-//! Nothing yet
+//! Public surface of `vish`. Re-exports `Request`, `Response`, `Server`,
+//! `Loop`, `Handler`, the error set, and the `utils` namespace. New
+//! public symbols belong here.
 
 const request = @import("http/request.zig");
 const response = @import("http/response.zig");

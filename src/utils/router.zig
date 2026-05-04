@@ -1,6 +1,7 @@
-//! HTTP request routing module.
-//!
-//! Provides flexible routing mechanisms for dispatching HTTP requests to appropriate handlers based on method and path patterns.
+//! Routers: `StructRouter` (method+path methods on a struct),
+//! `PrefixRouter` (mount sub-handlers under a path prefix),
+//! `CombinedRouter` (try a chain of handlers), `StaticRouter` (serve a
+//! comptime asset map).
 
 /// Provider a Handler for a Router where each route pattern is a struct method.
 /// Example:
@@ -41,11 +42,10 @@ pub fn StructRouter(comptime HandlerType: type) type {
                 const hasMatching = comptime std.mem.indexOf(u8, fn_path, "?") != null;
 
                 if (hasMatching) {
-                    const maybe_matches = check_match(fn_path, path);
+                    const maybe_matches = checkMatch(fn_path, path);
                     if (maybe_matches) |matches| {
                         if (std.mem.eql(u8, fn_method, @tagName(req.method))) {
                             const func = @field(HandlerType, decl.name);
-                            // TODO: can I make the args a struct?
                             const args = .{ self.handler, req, res, matches[0..] };
                             try @call(.auto, func, args);
                             return;
@@ -96,7 +96,6 @@ test "struct router" {
             var body_reader = try req.bodyReader(&buffer);
             var reader = body_reader.interface();
             res.body = try reader.allocRemaining(testing.allocator, .unlimited);
-            //defer testing.allocator.free(res.body);
         }
         pub fn @"GET /echo/?"(_: @This(), _: Request, res: *Response, params: []const []const u8) !void {
             res.body = params[0];
@@ -348,9 +347,9 @@ test "combined router" {
     try testing.expectEqualStrings("baz", res.body);
 }
 
-/// Count the number of wildcard parameters ("?") in a route pattern.
-/// Used to determine the size of the params array at compile time.
-fn params_len(src_route: []const u8) usize {
+/// Number of `?` wildcards in a route pattern. Used at comptime to size
+/// the params array.
+fn paramsLen(src_route: []const u8) usize {
     const route = std.mem.trimEnd(u8, src_route, "/");
     var size: usize = 0;
     for (route) |c| {
@@ -361,139 +360,96 @@ fn params_len(src_route: []const u8) usize {
     return size;
 }
 
-/// Match a request path against a route pattern with wildcard support.
-///
-/// Route patterns can contain "?" as wildcards that match any single path segment.
-/// The matched segments are captured and returned in the params array.
-///
-/// Examples
-/// - Route "/users/?/posts" matches path "/users/123/posts" -> params = ["123"]
-/// - Route "/?" matches path "/anything" -> params = ["anything"]
-/// - Route "/foo/bar" matches path "/foo/bar" exactly (no params)
-///
-/// Returns null if the path doesn't match the route pattern.
-fn check_match(comptime src_route: []const u8, src_path: []const u8) ?[params_len(src_route)][]const u8 {
-    // Normalize paths by trimming trailing slashes
+/// Match `src_path` against `src_route`. `?` segments match any single
+/// path segment; matched segments are returned in the params array, in
+/// order. Returns null if the path does not match.
+fn checkMatch(comptime src_route: []const u8, src_path: []const u8) ?[paramsLen(src_route)][]const u8 {
     const route = comptime std.mem.trimEnd(u8, src_route, "/");
     const path = std.mem.trimEnd(u8, src_path, "/");
 
-    var params: [params_len(route)][]const u8 = undefined;
+    var params: [paramsLen(route)][]const u8 = undefined;
 
-    // Empty route matches empty path
     if (route.len == 0 and path.len == 0) {
         return params;
     }
 
-    // Count segments in route pattern (compile-time)
-    const route_len: usize = comptime blk: {
-        var size: usize = 0;
-        for (route) |c| {
-            if (c == '/') {
-                size += 1;
-            }
-        }
-        break :blk size;
-    };
+    const route_len: usize = comptime countSlashes(route);
+    const path_len: usize = countSlashes(path);
 
-    // Count segments in request path (runtime)
-    const path_len: usize = blk: {
-        var size: usize = 0;
-        for (path) |c| {
-            if (c == '/') {
-                size += 1;
-            }
-        }
-        break :blk size;
-    };
-
-    // Paths with different number of segments cannot match
     if (path_len != route_len) {
         return null;
     }
-
-    // Routes with no segments match (both are empty or "/")
     if (route_len == 0) {
         return params;
     }
-
-    // Routes with no wildcards: early return if segment counts match
     if (params.len == 0) {
         return params;
     }
 
-    // Split route into segments (compile-time)
-    const route_parts: [route_len][]const u8 = blk: {
-        var parts: [route_len][]const u8 = undefined;
-        var index: usize = 0;
-        var split = std.mem.splitScalar(u8, route, '/');
-        _ = split.first(); // skip empty string before first "/"
-        while (split.next()) |part| {
-            parts[index] = part;
-            index += 1;
-        }
-        break :blk parts;
-    };
-
-    // Split request path into segments (runtime)
-    const req_parts: [route_len][]const u8 = blk: {
-        var parts: [route_len][]const u8 = undefined;
-        var index: usize = 0;
-        var split = std.mem.splitScalar(u8, path, '/');
-        _ = split.first(); // skip empty string before first "/"
-        while (split.next()) |part| {
-            parts[index] = part;
-            index += 1;
-        }
-        break :blk parts;
-    };
+    const route_parts: [route_len][]const u8 = comptime splitSegments(route_len, route);
+    const req_parts: [route_len][]const u8 = splitSegments(route_len, path);
 
     var count: usize = 0;
     var i: usize = 0;
-    while (i < route_len) {
-        const req_part = req_parts[i];
+    while (i < route_len) : (i += 1) {
         const route_part = route_parts[i];
+        const req_part = req_parts[i];
         if (std.mem.eql(u8, route_part, "?")) {
-            // match any
             params[count] = req_part;
             count += 1;
-        } else if (std.mem.eql(u8, route_part, req_part)) {
-            // match exact
-        } else {
-            // does not match
+        } else if (!std.mem.eql(u8, route_part, req_part)) {
             return null;
         }
-        i += 1;
     }
 
     return params;
 }
 
+fn countSlashes(s: []const u8) usize {
+    var n: usize = 0;
+    for (s) |c| {
+        if (c == '/') n += 1;
+    }
+    return n;
+}
+
+fn splitSegments(comptime n: usize, s: []const u8) [n][]const u8 {
+    var parts: [n][]const u8 = undefined;
+    var index: usize = 0;
+    var split = std.mem.splitScalar(u8, s, '/');
+    _ = split.first();
+    while (split.next()) |part| : (index += 1) {
+        parts[index] = part;
+    }
+    return parts;
+}
+
 test "matching paths" {
-    const m1 = check_match("/", "/");
+    const m1 = checkMatch("/", "/");
     try testing.expect(m1 != null);
 
-    const m2 = check_match("/", "/foo");
+    const m2 = checkMatch("/", "/foo");
     try testing.expect(m2 == null);
 
-    const m3 = check_match("/foo", "/");
+    const m3 = checkMatch("/foo", "/");
     try testing.expect(m3 == null);
 
-    const m4 = check_match("/foo/bar", "/foo");
+    const m4 = checkMatch("/foo/bar", "/foo");
     try testing.expect(m4 == null);
 
-    const m5 = check_match("/foo/bar", "/foo/bar");
+    const m5 = checkMatch("/foo/bar", "/foo/bar");
     try testing.expect(m5 != null);
 
-    const m6 = check_match("/foo/bar", "/foo/bar/baz");
+    const m6 = checkMatch("/foo/bar", "/foo/bar/baz");
     try testing.expect(m6 == null);
 
-    const m7 = check_match("/foo/?", "/foo/bar/baz");
+    const m7 = checkMatch("/foo/?", "/foo/bar/baz");
     try testing.expect(m7 == null);
 
-    const m8 = check_match("/foo/?/baz", "/foo/bar");
+    const m8 = checkMatch("/foo/?/baz", "/foo/bar");
     try testing.expect(m8 == null);
 
-    const m9 = check_match("/foo/?/baz", "/foo/bar/baz");
+    const m9 = checkMatch("/foo/?/baz", "/foo/bar/baz");
     try testing.expect(m9 != null);
     try testing.expectEqualStrings(m9.?[0], "bar");
 }

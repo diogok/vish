@@ -1,8 +1,11 @@
-//! HTTP response handling.
+//! HTTP response: status, typed headers, body, and helpers for one-shot
+//! sends, chunked streaming, and Server-Sent Events. Set
+//! `headers.content_encoding` for buffered gzip/deflate compression on
+//! `send()`.
 
 pub const Status = enum(u16) {
     OK = 200,
-    Moved_Permanentely = 301,
+    Moved_Permanently = 301,
     Found = 302,
     See_Other = 303,
     Not_Modified = 304,
@@ -101,11 +104,9 @@ pub const Headers = struct {
     extra: []const ExtraHeader = &.{},
 };
 
-/// HTTP response builder with state tracking for incremental sending.
-///
-/// The response can be sent in multiple ways:
-/// 1. Simple: Set body and call send() - sends everything at once
-/// 2. Chunked: Call writeChunk() multiple times, then end()
+/// HTTP response. Use `send()` for one-shot bodies, `writeChunk` + `end`
+/// for chunked transfer-encoding, or `writeSSE` / `writeEvent` /
+/// `writeSSEComment` for Server-Sent Events.
 pub const Response = struct {
     version: request.Version = .HTTP_1_1,
 
@@ -201,7 +202,6 @@ pub const Response = struct {
     fn sendHeaders(
         self: *@This(),
     ) !void {
-        // set content-length if not set and we have a string body
         if (self.headers.content_length == null and self.body.len > 0) {
             self.headers.content_length = self.body.len;
         }

@@ -1,3 +1,5 @@
+//! UTC timestamp formatting for HTTP date strings.
+
 pub const Timestamp = struct {
     epoch: i64,
     day: u5,
@@ -97,7 +99,7 @@ test "timestamp" {
     try testing.expectEqualStrings("00", &ts.getSecond());
 }
 
-pub fn get_current_date(io: std.Io) [date_len]u8 {
+pub fn getCurrentDate(io: std.Io) [date_len]u8 {
     var date: [date_len]u8 = undefined;
 
     const timestamp = Timestamp.now(io);

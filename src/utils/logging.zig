@@ -1,4 +1,6 @@
-/// A handler for logging request in Common Log Format.
+//! Common Log Format request logging middleware.
+
+/// Wraps another `Handler` and writes one CLF line to stdout per request.
 pub const Common = struct {
     io: std.Io,
     handler: Handler,
@@ -14,7 +16,7 @@ pub const Common = struct {
     ) HandlerError!void {
         try self.handler.handle(req, res);
 
-        const date = get_current_date(self.io);
+        const date = getCurrentDate(self.io);
 
         const fmt = "{s} - - [{s}] \"{s} {s} {s}\" {d} {?d}\n";
         const args = .{
@@ -87,4 +89,4 @@ const Response = @import("../http/response.zig").Response;
 const Handler = @import("../loop/handler.zig").Handler;
 const HandlerError = @import("../loop/handler.zig").Error;
 
-const get_current_date = @import("timestamp.zig").get_current_date;
+const getCurrentDate = @import("timestamp.zig").getCurrentDate;

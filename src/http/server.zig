@@ -1,17 +1,6 @@
-//! HTTP server and connection management module.
-//!
-//! This module provides the core server infrastructure for accepting TCP
-//! connections and managing their lifecycle.
-//!
-//! It handles socket configuration (keep-alive, no-delay) and buffer
-//! allocation for efficient request/response processing.
-//!
-//! Each connection gets its own arena allocator that is reset between
-//! requests. Calling `stop` unblocks the accept loop; `deinit` releases
-//! resources.
-//!
-//! Idle keep-alive connections are reaped after `idle_timeout_in_millis`
-//! ms with no new request — see `ListenOptions`.
+//! `Server` accepts TCP connections; `Connection` owns the per-socket
+//! arena, read/write buffers, and per-request parser. The accept/worker
+//! loop on top is driven by `Loop` (in `loop/loop.zig`).
 
 pub const ListenOptions = struct {
     kernel_backlog: u31 = 1024,
@@ -170,7 +159,6 @@ pub const Connection = struct {
     }
 
     pub fn next(self: *@This()) !?Request {
-        // Reset arena for each new request (reuses memory from previous request)
         _ = self.arena.reset(.retain_capacity);
 
         return Request.read(

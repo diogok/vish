@@ -1,3 +1,7 @@
+//! File-extension to MIME-type lookup. `guess(path)` returns the type
+//! string, falling back to `application/octet-stream` for unknown
+//! extensions.
+
 pub fn guess(file: []const u8) []const u8 {
     const ext = std.fs.path.extension(file);
     if (extension_map.get(ext)) |v| {

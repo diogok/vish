@@ -60,7 +60,7 @@ pub const MyHandler = struct {
         var params = Params{};
         var query_reader = std.Io.Reader.fixed(req.uri.query);
 
-        vish.utils.formdata.read_formdata(
+        vish.utils.formdata.readFormdata(
             self.allocator,
             &query_reader,
             &params,
@@ -96,7 +96,7 @@ pub const MyHandler = struct {
         var buf: [1024]u8 = undefined;
         var body_reader = try req.bodyReader(&buf);
 
-        vish.utils.formdata.read_formdata(
+        vish.utils.formdata.readFormdata(
             self.allocator,
             body_reader.interface(),
             &params,

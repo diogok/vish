@@ -1,27 +1,7 @@
-//! Event loop for handling concurrent HTTP connections.
-//!
-//! Provides a multi-threaded event loop that accepts connections and
-//! dispatches them to handler functions, one task per connection.
-//!
-//! ## Main flow
-//! - The accept loop runs in its own task, waiting for new connections.
-//! - Each accepted connection is handed off to a worker task, which
-//!   under the default `Io` becomes its own OS thread.
-//! - Workers process requests in a keep-alive loop until the connection
-//!   closes or the idle deadline elapses between requests.
-//! - `stop()` stops accepting new connections. `deinit()` releases the
-//!   loop and cancels any workers still blocked in I/O.
-//!
-//! ## Lifecycle
-//! - Accept task receives a connection and spawns a worker.
-//! - For each request the worker first waits for the first byte under
-//!   an idle deadline (`ListenOptions.idle_timeout_in_millis`); once
-//!   data is in flight the deadline is cancelled and parsing runs
-//!   without one.
-//! - Each request is passed to the handler, which populates the response.
-//! - Response is flushed; connection continues or closes based on the
-//!   `Connection` header.
-//! - Connection arena is reset between requests for memory efficiency.
+//! Concurrent accept/worker loop on top of `std.Io`. One task accepts
+//! connections, each connection runs on its own worker task and
+//! processes keep-alive requests until the client closes, the idle
+//! deadline elapses, or `stop()` is called.
 
 pub const Loop = struct {
     io: std.Io,
@@ -108,16 +88,9 @@ pub const Loop = struct {
         }
     }
 
-    /// Handle a single TCP connection, processing multiple HTTP requests (keep-alive).
-    ///
-    /// Runs in its own task and processes requests in a loop until either:
-    /// - The connection is closed (`Connection: close` header)
-    /// - A read error occurs or the client disconnects
-    /// - The idle deadline elapses between requests
-    /// - The server is shutting down (`self.active == false`)
-    ///
-    /// Memory for each request is managed by the Connection's arena,
-    /// which is reset between requests.
+    /// Drive one TCP connection through its keep-alive loop. Returns when
+    /// the connection closes, the idle deadline elapses, a read fails, or
+    /// the loop is shutting down.
     fn onConnection(
         self: *@This(),
         connection: http.Connection,
@@ -190,12 +163,9 @@ pub const Loop = struct {
         stream.shutdown(io, .both) catch {};
     }
 
-    /// Process a single HTTP request and determine if the connection should continue.
-    ///
-    /// Returns `.close` if either the request or response has
-    /// `Connection: close`, meaning the connection should be terminated
-    /// after this response. Returns `.keep` to continue processing
-    /// requests on this connection.
+    /// Run the handler for one request and decide whether to continue.
+    /// Returns `.close` when either side sent `Connection: close`,
+    /// `.keep` otherwise.
     fn onRequest(
         _: *@This(),
         handler: Handler,

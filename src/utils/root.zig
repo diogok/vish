@@ -1,3 +1,6 @@
+//! Helper namespace re-exported as `vish.utils`: routers, middleware,
+//! form-data parsing, MIME guessing, timestamps, URI encoding.
+
 pub const logging = @import("logging.zig");
 pub const router = @import("router.zig");
 pub const formdata = @import("formdata.zig");

@@ -1,4 +1,6 @@
-//! Handler is an "interface" (using a vtable) for handling HTTP Requests.
+//! Type-erased HTTP request handler. `Handler` is a `ptr + vtable` value
+//! type; concrete handlers plug in via `Handler.wrap(T)` or by exposing
+//! their own `interface()` method.
 
 pub const VTable = struct {
     handle: *const fn (h: Handler, req: Request, res: *Response) Error!void,

@@ -1,8 +1,6 @@
-//! Signal handling utils.
-//!
-//! Block the calling task until SIGINT or SIGHUP is received. Typical
-//! use is at the bottom of `main` after starting the server loop, so
-//! Ctrl-C triggers a clean shutdown.
+//! `wait(io)` blocks until SIGINT or SIGHUP arrives. Called at the end
+//! of `main` to hold the program until Ctrl-C, then let the deferred
+//! `Loop`/`Server` deinit run.
 
 var interrupt_event: std.Io.Event = .unset;
 var interrupt_io: ?std.Io = null;

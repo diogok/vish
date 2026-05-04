@@ -1,11 +1,5 @@
-//! URL encoding and decoding.
-//!
-//! Provides functions for percent-encoding and decoding strings
-//! according to RFC 3986.
-//!
-//! It's used for encoding special characters in URLs
-//! and decoding form data/query parameters.
-//!
+//! Percent-encoding and decoding per RFC 3986. Used for URL components
+//! and `application/x-www-form-urlencoded` payloads.
 
 pub fn encode(reader: *std.Io.Reader, writer: *std.Io.Writer) !void {
     while (true) {

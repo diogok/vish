@@ -1,15 +1,8 @@
-//! Socket configuration utilities for TCP server operations.
-//!
-//! Provides helpers for setting common TCP server socket options
-//! (keep-alive, no-delay) on the listening socket.
+//! TCP listener socket option helpers. Linux only; other platforms are
+//! no-ops.
 
-/// Set common TCP server socket options.
-///
-/// ## Options
-/// - `tcp_keep_alive`: Enable TCP keep-alive probes to detect dead connections
-/// - `tcp_no_delay`: Disable Nagle's algorithm for lower latency (sends small packets immediately)
-///
-/// Note: Currently only implemented for Linux. Other platforms are no-ops.
+/// Set listener socket options. `tcp_keep_alive` enables `SO_KEEPALIVE`;
+/// `tcp_no_delay` enables `TCP_NODELAY` (disables Nagle).
 pub fn setServerFlags(fd: std.posix.socket_t, options: struct { tcp_keep_alive: bool, tcp_no_delay: bool }) !void {
     switch (builtin.os.tag) {
         .linux => {
