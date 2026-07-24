@@ -205,59 +205,96 @@ You also need `*const T` (or `*T`) when the address must outlive the call — e.
 
 ## Type-erased interfaces
 
-Follow the `std.io.Reader` pattern for polymorphic interfaces. The interface is a small value type (two pointers). VTable functions take a pointer to the interface as the first parameter. `wrap(T)` returns a typed wrapper that produces the type-erased interface on demand.
+Follow the `std.Io.Reader` pattern. The interface is a small struct holding a
+`*const VTable` plus any state the interface itself owns (buffers, cursors,
+small per-call context). The concrete implementation **embeds** the interface
+as a named field. VTable functions take a pointer to the interface and recover
+the concrete type with `@fieldParentPtr`.
 
 ```zig
-// The interface: ptr + vtable.
-pub const Handler = struct {
-    ptr: *anyopaque,
+// The interface: state + *const VTable.
+pub const Widget = struct {
     vtable: *const VTable,
+    rect: Rect = .{},
 
     pub const VTable = struct {
         // VTable functions take a pointer to the interface, not *anyopaque.
-        handle: *const fn (Handler, Request, *Response) HandleError!void,
+        render: *const fn (widget: *Widget, surface: *Surface) void,
+        resize: *const fn (widget: *Widget, rect: Rect) void,
     };
 
-    // Convenience methods forward to vtable, passing self.
-    pub fn handle(self: Handler, req: Request, res: *Response) HandleError!void {
-        return self.vtable.handle(self, req, res);
+    // Convenience methods forward to the vtable, passing self.
+    pub fn render(widget: *Widget, surface: *Surface) void {
+        widget.vtable.render(widget, surface);
     }
-
-    /// Return a typed wrapper for the given concrete type.
-    pub fn wrap(T: type) type {
-        return struct {
-            ptr: *T,
-
-            pub fn init(ptr: *T) @This() {
-                return .{ .ptr = ptr };
-            }
-
-            /// Produce the type-erased interface.
-            pub fn interface(self: @This()) Handler {
-                return .{ .ptr = self.ptr, .vtable = &vtable_instance };
-            }
-
-            const vtable_instance = VTable{ .handle = handleFn };
-
-            fn handleFn(h: Handler, req: Request, res: *Response) HandleError!void {
-                const concrete: *T = @ptrCast(@alignCast(h.ptr));
-                return concrete.handle(req, res);
-            }
-        };
+    pub fn resize(widget: *Widget, rect: Rect) void {
+        widget.vtable.resize(widget, rect);
     }
 };
 ```
 
-Two ways for a concrete type to plug in — see [Handler pattern](#handler-pattern) below.
+Concrete type — embeds the interface as a field, vtable functions recover the
+concrete with `@fieldParentPtr`:
+
+```zig
+const Button = struct {
+    label: []const u8,
+    layout_dirty: bool = false,
+    widget: Widget,
+
+    pub fn init(label: []const u8) Button {
+        return .{
+            .label = label,
+            .widget = .{ .vtable = &vtable_instance },
+        };
+    }
+
+    const vtable_instance: Widget.VTable = .{
+        .render = render,
+        .resize = resize,
+    };
+
+    fn render(widget: *Widget, surface: *Surface) void {
+        const button: *Button = @fieldParentPtr("widget", widget);
+        surface.drawText(button.label, widget.rect);
+    }
+
+    fn resize(widget: *Widget, rect: Rect) void {
+        const button: *Button = @fieldParentPtr("widget", widget);
+        button.layout_dirty = true;
+        widget.rect = rect;
+    }
+};
+```
+
+Usage — callers hold `*Widget`, never the concrete type:
+
+```zig
+var btn = Button.init("OK");
+const widget: *Widget = &btn.widget;
+widget.render(surface);   // dispatches through the vtable, recovers Button
+```
 
 Rules:
 
-- VTable functions take a **pointer to the interface type** as the first parameter (not `*anyopaque`). The wrapper casts `h.ptr` to the concrete type.
+- The interface struct holds `vtable: *const VTable` and any state the
+  interface itself owns. Everything else belongs to the concrete type.
+- The concrete type embeds the interface as a named field (`widget: Widget`,
+  `reader: std.Io.Reader`). The field name is what `@fieldParentPtr` keys on;
+  don't rename it without updating the vtable bodies.
+- VTable functions take `*Interface` as the first parameter and recover the
+  concrete with `const self: *Concrete = @fieldParentPtr("field_name", iface);`.
 - VTable field names match the convenience method names (no `Fn` suffix).
-- `wrap(T)` returns a comptime-generated wrapper struct with a typed pointer and a static vtable instance.
-- Concrete types provide a named method returning the interface (e.g. `.interface()`).
-- The caller owns the concrete type. The interface borrows a pointer.
-- The interface does not have `deinit` — lifetime is the caller's responsibility.
+- The vtable is a single `const` instance per concrete type — no per-instance
+  allocation for dispatch.
+- The interface has no `deinit` — lifetime is the caller's responsibility,
+  like `ArrayList` not freeing its elements.
+- Callers receive `*Interface` (a pointer to the embedded field, obtained as
+  `&concrete.field`). They never see the concrete type through the interface.
+
+> Note: the [Handler pattern](#handler-pattern) section below documents the
+> older `wrap(T)` + `*anyopaque` form currently used by vish's `Handler` API.
+> The pattern above is the target shape; migrate when the code changes.
 
 ## Imports
 
@@ -303,7 +340,7 @@ pub fn init(allocator: std.mem.Allocator, stream: std.Io.net.Stream) !@This() {
 }
 ```
 
-When you catch a domain-specific error (e.g. `error.InvalidJson`), translate it to one of `HandleError`'s arms (typically `BadRequest`) before propagating — see [HandleError is a closed set](#handleerror-is-a-closed-set).
+Inside handlers, errors never reach the loop: `Handler.wrap` and the routers convert them into responses at the boundary — see [Errors stop at the handler boundary](#errors-stop-at-the-handler-boundary). Translate domain-specific errors (e.g. `error.InvalidJson`) to one of `HandleError`'s named arms (typically `BadRequest`) when you want a status other than 500.
 
 ## Memory management
 
@@ -328,10 +365,10 @@ Sync primitives now live under `std.Io` (`std.Io.Mutex`, `std.Io.Condition`, `st
 
 ## Juicy Main
 
-`main` takes a `std.process.Init` and pulls `io` and `gpa` from it, rather than constructing them. This is the only place either should be created — every other function receives them as parameters.
+`main` takes a `std.process.Init` and pulls `io` and `gpa` from it, rather than constructing them. This is the only place either should be created — every other function receives them as parameters. (`main` itself returns `u8`, not `!void` — see [Fatal errors exit 1](#fatal-errors-exit-1).)
 
 ```zig
-pub fn main(init: std.process.Init) !void {
+fn run(init: std.process.Init) !void {
     const io = init.io;
     const allocator = init.gpa;
 
@@ -404,6 +441,30 @@ pub fn copyHeaders(src: Headers, dst: *Headers) void
 
 // Good — destination first, reads naturally: dst.fillFrom(src)
 pub fn fillFrom(self: *Headers, src: Headers) void
+```
+
+### Blank lines between guards and action
+
+Use a blank line to separate guard clauses (early returns, validation, state
+checks) from the work that follows. Do the same between distinct phases. The
+visual break tells a reader where setup ends and the actual operation begins.
+
+```zig
+pub fn send(self: *Session, frame: Frame) !void {
+    switch (self.send_state) {
+        .init => return error.NotStarted,
+        .closed => return error.AlreadyClosed,
+        .open => {},
+    }
+
+    if (std.mem.eql(u8, &frame.code, "S0")) return error.AlreadyStarted;
+
+    if (std.mem.eql(u8, &frame.code, "S9") or std.mem.eql(u8, &frame.code, "S2")) {
+        return error.UseCloseOrFail;
+    }
+
+    try frame.write(self.writer);
+}
 ```
 
 ## Comments
@@ -500,13 +561,13 @@ Handlers do **not** receive `io` as a parameter — they get it indirectly via `
 
 Two equivalent ways to expose a `Handler`:
 
-**1. `Handler.wrap(T)` — for simple, stateless handlers.** The wrapper generates the vtable; the concrete type just implements `handle`:
+**1. `Handler.wrap(T)` — for simple, stateless handlers.** The wrapper generates the vtable; the concrete type just implements `handle`, returning `void`, `Outcome`, or an error union of either:
 
 ```zig
 const Hello = struct {
-    pub fn handle(_: @This(), _: vish.Request, res: *vish.Response) vish.HandleError!void {
+    pub fn handle(_: @This(), _: vish.Request, res: *vish.Response) void {
         res.body = "hi";
-        try res.send();
+        res.send();
     }
 };
 
@@ -521,33 +582,47 @@ pub fn interface(self: *@This()) Handler {
     return .{ .ptr = self, .vtable = &.{ .handle = handle } };
 }
 
-fn handle(h: Handler, req: Request, res: *Response) HandlerError!void {
+fn handle(h: Handler, req: Request, res: *Response) Outcome {
     const self: *@This() = @ptrCast(@alignCast(h.ptr));
-    try self.route(req, res);
+    return self.route(req, res);
 }
 ```
 
 Use this form when the handler has state, owns child handlers, or needs to be addressable by pointer (so `interface()` takes `*@This()` and the caller `&`s the value).
 
-## error.Skipped is a contract
+## Outcome, and error.Skipped as a contract
 
-Routers and middleware return `error.Skipped` to mean "I don't match, try the next one." `CombinedRouter` treats it as a continuation; `Loop.onRequest` converts an uncaught `Skipped` to `404 Not Found`.
+The type-erased `Handler` vtable returns `Outcome` (`.handled` or `.skipped`), never an error. `.skipped` means "I don't match, try the next one": `CombinedRouter` treats it as a continuation, and `Loop.onRequest` converts a top-level `.skipped` into `404 Not Found`.
 
-If your handler legitimately can't process a request, return `Skipped` rather than fabricating a 404 — let the chain decide. Reserve the other errors in `HandleError` (`Internal`, `BadRequest`, `Unauthorized`) for real failures.
+Inside concrete (fallible) handlers and route methods, `error.Skipped` expresses the same thing — the boundary turns it into `.skipped`. If your handler legitimately can't process a request, return it rather than fabricating a 404 — let the chain decide.
 
-## HandleError is a closed set
+## Errors stop at the handler boundary
 
-`HandleError` is the union of every error a handler may legitimately return:
+Concrete handlers and route methods may use any error set — `try` freely. What they cannot do is leak an error to the loop: `Handler.wrap`, the routers, and `callOutcome` convert every error into a sent response at the boundary via `errorOutcome`:
+
+- `error.Skipped` → `.skipped` (routing control flow, not a failure)
+- `error.BadRequest` → 400, `error.Unauthorized` → 401, `error.StreamTooLong` → 413
+- everything else → 500
+
+`HandleError` names the errors with a defined mapping — translate domain errors (e.g. `error.InvalidJson` → `BadRequest`) when a 500 isn't the right answer. Declare `onError(self, err, req, res)` next to `handle` to replace the default mapping (custom error pages).
+
+Transport errors don't exist in handler code at all: `Response.send`/`writeChunk`/`writeSSE`/`flush` return `void` and latch `res.failed` on a broken connection. Streaming loops should check `res.failed` to stop early; the loop closes the connection when it's set.
+
+## Fatal errors exit 1
+
+Only startup can be fatal (bad address, port permissions, `ConcurrencyUnavailable`). `main` returns `u8`, delegates to a fallible `run`, and converts failure into a logged message and exit code 1 — never an error return trace:
 
 ```zig
-pub const Error = error{
-    StreamTooLong, OutOfMemory, ReadFailed, WriteFailed, NoSpaceLeft,
-    Skipped,
-    Internal, BadRequest, Unauthorized,
-};
+pub fn main(init: std.process.Init) u8 {
+    run(init) catch |err| {
+        log.err("startup failed: {t}", .{err});
+        return 1;
+    };
+    return 0;
+}
 ```
 
-When you catch a domain-specific error (e.g. `error.InvalidJson`), translate it to one of these (`BadRequest`) before propagating. Don't broaden the error set — every caller in the chain has to handle it.
+Once the loop is running, nothing may bring the process down: accept failures log and retry, connection failures close that connection, handler failures become error responses.
 
 ## Logging
 
