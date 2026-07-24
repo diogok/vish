@@ -23,6 +23,10 @@ pub const ListenOptions = server.ListenOptions;
 
 pub const Handler = handler.Handler;
 pub const HandleError = handler.Error;
+pub const Outcome = handler.Outcome;
+pub const errorOutcome = handler.errorOutcome;
+pub const statusForError = handler.statusForError;
+pub const callOutcome = handler.callOutcome;
 pub const Loop = loop.Loop;
 
 pub const waitInterrupt = signal.wait;

@@ -13,8 +13,10 @@ pub const Common = struct {
         self: @This(),
         req: Request,
         res: *Response,
-    ) HandlerError!void {
-        try self.handler.handle(req, res);
+    ) Outcome {
+        // Skipped requests aren't logged here: the final status (404)
+        // is decided by the loop after the whole chain has passed.
+        if (self.handler.handle(req, res) == .skipped) return .skipped;
 
         const date = getCurrentDate(self.io);
 
@@ -38,6 +40,8 @@ pub const Common = struct {
         if (!@import("builtin").is_test) {
             stdout.flush() catch {};
         }
+
+        return .handled;
     }
 
     pub fn interface(self: *@This()) Handler {
@@ -47,9 +51,9 @@ pub const Common = struct {
         };
     }
 
-    fn handle(h: Handler, req: Request, res: *Response) HandlerError!void {
+    fn handle(h: Handler, req: Request, res: *Response) Outcome {
         const self: *@This() = @ptrCast(@alignCast(h.ptr));
-        try self.log(req, res);
+        return self.log(req, res);
     }
 };
 
@@ -61,7 +65,7 @@ test "common logs" {
             self: *@This(),
             req: Request,
             res: *Response,
-        ) HandlerError!void {
+        ) void {
             _ = req;
             _ = res;
             self.called = true;
@@ -76,7 +80,7 @@ test "common logs" {
 
     const req: Request = .example;
     var res = Response.fromRequest(req);
-    try logger.interface().handle(req, &res);
+    try testing.expectEqual(.handled, logger.interface().handle(req, &res));
 
     try testing.expect(my_handler.called);
 }
@@ -87,6 +91,6 @@ const testing = std.testing;
 const Request = @import("../http/request.zig").Request;
 const Response = @import("../http/response.zig").Response;
 const Handler = @import("../loop/handler.zig").Handler;
-const HandlerError = @import("../loop/handler.zig").Error;
+const Outcome = @import("../loop/handler.zig").Outcome;
 
 const getCurrentDate = @import("timestamp.zig").getCurrentDate;

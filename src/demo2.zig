@@ -1,4 +1,12 @@
-pub fn main(init: std.process.Init) !void {
+pub fn main(init: std.process.Init) u8 {
+    run(init) catch |err| {
+        log.err("startup failed: {t}", .{err});
+        return 1;
+    };
+    return 0;
+}
+
+fn run(init: std.process.Init) !void {
     const io = init.io;
     const allocator = init.gpa;
 
@@ -35,17 +43,18 @@ pub const MyHandler = struct {
         _: @This(),
         _: vish.Request,
         res: *vish.Response,
-    ) vish.HandleError!void {
+    ) void {
         res.body = "hello";
 
-        try res.send();
+        res.send();
     }
 
     pub fn @"GET /err"(
         _: @This(),
         _: vish.Request,
         _: *vish.Response,
-    ) vish.HandleError!void {
+    ) !void {
+        // Escapes to the router boundary, which turns it into a 500.
         return error.Internal;
     }
 
@@ -53,7 +62,7 @@ pub const MyHandler = struct {
         self: @This(),
         req: vish.Request,
         res: *vish.Response,
-    ) vish.HandleError!void {
+    ) !void {
         const Params = struct {
             name: ?[]const u8 = null,
         };
@@ -81,14 +90,14 @@ pub const MyHandler = struct {
         _ = try greeting.writer.write("!");
 
         res.body = greeting.written();
-        try res.send();
+        res.send();
     }
 
     pub fn @"POST /hello"(
         self: @This(),
         req: vish.Request,
         res: *vish.Response,
-    ) vish.HandleError!void {
+    ) !void {
         const Params = struct {
             name: ?[]const u8 = null,
         };
@@ -117,7 +126,7 @@ pub const MyHandler = struct {
         _ = try greeting.writer.write("!");
 
         res.body = greeting.written();
-        try res.send();
+        res.send();
     }
 };
 

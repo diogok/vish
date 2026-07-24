@@ -121,6 +121,12 @@ pub const Response = struct {
     /// True after the blank line separating headers from body has been sent
     sent_newline: bool = false,
 
+    /// Sticky transport-failure flag. Set on the first failed write;
+    /// every later write call is a no-op. Streaming handlers should
+    /// check it to stop producing output; the loop closes the
+    /// connection when it is set.
+    failed: bool = false,
+
     buffer: [9]u8 = undefined,
 
     writer: *std.Io.Writer,
@@ -144,9 +150,36 @@ pub const Response = struct {
         };
     }
 
-    pub fn send(self: *@This()) !void {
+    /// Send status line, headers, and body. Infallible: a transport
+    /// failure sets `failed` (see the field doc) instead of returning
+    /// an error — there is nothing a handler can do about a dead client.
+    pub fn send(self: *@This()) void {
+        if (self.failed) return;
+        self.sendFallible() catch |err| self.markFailed(err);
+    }
+
+    /// Discard whatever was being built and answer with a bare `status`.
+    /// If the status line is already on the wire the response cannot be
+    /// rewritten — the connection is marked for close instead, so the
+    /// client sees a truncated response rather than a corrupted one.
+    pub fn sendError(self: *@This(), status: Status) void {
+        if (self.sent_status) {
+            self.headers.connection = .close;
+            return;
+        }
+        self.status = status;
+        self.headers = .{ .connection = self.headers.connection };
+        self.body = "";
+        self.send();
+    }
+
+    fn sendFallible(self: *@This()) !void {
         if (self.headers.content_encoding) |enc| {
-            if (self.body.len > 0) try self.compressBody(enc);
+            // Compression is best-effort: if it fails (e.g. allocation),
+            // fall back to sending the original body uncompressed.
+            if (self.body.len > 0) self.compressBody(enc) catch {
+                self.headers.content_encoding = null;
+            };
         }
         try self.sendStatus();
         try self.sendHeaders();
@@ -267,7 +300,12 @@ pub const Response = struct {
     pub fn writeChunk(
         self: *@This(),
         chunk: []const u8,
-    ) !void {
+    ) void {
+        if (self.failed) return;
+        self.writeChunkFallible(chunk) catch |err| self.markFailed(err);
+    }
+
+    fn writeChunkFallible(self: *@This(), chunk: []const u8) !void {
         // Streaming compression (compressor → chunked encoder) is not
         // implemented. Use the buffered path: set `body` and call `send()`.
         std.debug.assert(self.headers.content_encoding == null);
@@ -288,7 +326,12 @@ pub const Response = struct {
         _ = try self.writer.write("\r\n");
     }
 
-    pub fn end(self: *@This()) !void {
+    pub fn end(self: *@This()) void {
+        if (self.failed) return;
+        self.endFallible() catch |err| self.markFailed(err);
+    }
+
+    fn endFallible(self: *@This()) !void {
         if (!self.sent_newline) {
             try self.sendNewline();
         }
@@ -302,20 +345,14 @@ pub const Response = struct {
     /// if not already set.
     ///
     /// Format: "event: <type>\ndata: <data>\n\n" or "data: <data>\n\n"
-    pub fn writeEvent(self: *@This(), event_type: ?[]const u8, data: []const u8) !void {
-        // SSE + compression breaks per-event flush semantics — refuse.
-        std.debug.assert(self.headers.content_encoding == null);
-        if (!self.sent_status) {
-            if (self.headers.content_type.len == 0) {
-                self.headers.content_type = "text/event-stream";
-            }
-            if (self.headers.cache_control.len == 0) {
-                self.headers.cache_control = "no-cache";
-            }
-            try self.sendStatus();
-            try self.sendHeaders();
-            try self.sendNewline();
-        }
+    pub fn writeEvent(self: *@This(), event_type: ?[]const u8, data: []const u8) void {
+        if (self.failed) return;
+        self.writeEventFallible(event_type, data) catch |err| self.markFailed(err);
+    }
+
+    fn writeEventFallible(self: *@This(), event_type: ?[]const u8, data: []const u8) !void {
+        try self.ensureSSEHeaders();
+
         if (event_type) |et| {
             try self.writer.print("event: {s}\n", .{et});
         }
@@ -343,7 +380,12 @@ pub const Response = struct {
     /// Multi-line `data` is split on `\n` into multiple `data:` lines per SSE spec.
     /// Auto-sets `Content-Type: text/event-stream` and `Cache-Control: no-cache`
     /// on the first call (like `writeEvent`).
-    pub fn writeSSE(self: *@This(), ev: SSEMessage) !void {
+    pub fn writeSSE(self: *@This(), ev: SSEMessage) void {
+        if (self.failed) return;
+        self.writeSSEFallible(ev) catch |err| self.markFailed(err);
+    }
+
+    fn writeSSEFallible(self: *@This(), ev: SSEMessage) !void {
         try self.ensureSSEHeaders();
 
         if (ev.id) |id| {
@@ -371,7 +413,12 @@ pub const Response = struct {
     /// Emit an SSE comment line (`: <text>\n\n`). Used for heartbeats and debug.
     /// Auto-sets SSE headers on first call. If `text` contains `\n`, each line
     /// after the first is prefixed with a fresh `: `.
-    pub fn writeSSEComment(self: *@This(), text: []const u8) !void {
+    pub fn writeSSEComment(self: *@This(), text: []const u8) void {
+        if (self.failed) return;
+        self.writeSSECommentFallible(text) catch |err| self.markFailed(err);
+    }
+
+    fn writeSSECommentFallible(self: *@This(), text: []const u8) !void {
         try self.ensureSSEHeaders();
 
         var it = std.mem.splitScalar(u8, text, '\n');
@@ -383,8 +430,16 @@ pub const Response = struct {
     }
 
     /// Flush the underlying writer to ensure data is sent to the client.
-    pub fn flush(self: *@This()) !void {
-        try self.writer.flush();
+    pub fn flush(self: *@This()) void {
+        if (self.failed) return;
+        self.writer.flush() catch |err| self.markFailed(err);
+    }
+
+    /// Record a transport failure and latch `failed`. From here on the
+    /// response is dead: every write method returns without writing.
+    fn markFailed(self: *@This(), err: anyerror) void {
+        self.failed = true;
+        log.debug("Response write failed: {any}", .{err});
     }
 };
 
@@ -398,7 +453,7 @@ test "basic response writing" {
         .body = "hello",
         .writer = &writer,
     };
-    try res.send();
+    res.send();
 
     const content = buffer[0..writer.end];
 
@@ -414,8 +469,8 @@ test "chunked response writing" {
         .headers = .{ .content_type = "text/plain" },
         .writer = &writer,
     };
-    try res.writeChunk("hello");
-    try res.end();
+    res.writeChunk("hello");
+    res.end();
 
     const content = buffer[0..writer.end];
 
@@ -431,9 +486,9 @@ test "chunked response sizes are hex per RFC 7230" {
         .writer = &writer,
     };
     // 16 bytes: decimal "16" vs hex "10". 26 bytes: decimal "26" vs hex "1a".
-    try res.writeChunk("0123456789abcdef"); // 16 bytes -> "10"
-    try res.writeChunk("0123456789abcdefghijklmnop"); // 26 bytes -> "1a"
-    try res.end();
+    res.writeChunk("0123456789abcdef"); // 16 bytes -> "10"
+    res.writeChunk("0123456789abcdefghijklmnop"); // 26 bytes -> "1a"
+    res.end();
 
     const content = buffer[0..writer.end];
     try testing.expectEqualStrings(
@@ -476,10 +531,10 @@ test "multiple chunks in chunked response" {
         .status = .OK,
         .writer = &writer,
     };
-    try res.writeChunk("first");
-    try res.writeChunk("second");
-    try res.writeChunk("third");
-    try res.end();
+    res.writeChunk("first");
+    res.writeChunk("second");
+    res.writeChunk("third");
+    res.end();
 
     const content = buffer[0..writer.end];
     try testing.expectEqualStrings("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nfirst\r\n6\r\nsecond\r\n5\r\nthird\r\n0\r\n\r\n", content);
@@ -493,7 +548,7 @@ test "SSE event writing" {
         .status = .OK,
         .writer = &writer,
     };
-    try res.writeEvent("message", "{\"hello\":\"world\"}");
+    res.writeEvent("message", "{\"hello\":\"world\"}");
 
     const content = buffer[0..writer.end];
     try testing.expectEqualStrings("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\nevent: message\ndata: {\"hello\":\"world\"}\n\n", content);
@@ -507,7 +562,7 @@ test "SSE event without event type" {
         .status = .OK,
         .writer = &writer,
     };
-    try res.writeEvent(null, "{\"data\":1}");
+    res.writeEvent(null, "{\"data\":1}");
 
     const content = buffer[0..writer.end];
     try testing.expectEqualStrings("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\ndata: {\"data\":1}\n\n", content);
@@ -521,8 +576,8 @@ test "SSE multiple events" {
         .status = .OK,
         .writer = &writer,
     };
-    try res.writeEvent("message", "first");
-    try res.writeEvent("message", "second");
+    res.writeEvent("message", "first");
+    res.writeEvent("message", "second");
 
     const content = buffer[0..writer.end];
     try testing.expectEqualStrings("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\nevent: message\ndata: first\n\nevent: message\ndata: second\n\n", content);
@@ -536,7 +591,7 @@ test "writeSSE with only data emits SSE headers and data line" {
         .status = .OK,
         .writer = &writer,
     };
-    try res.writeSSE(.{ .data = "hello" });
+    res.writeSSE(.{ .data = "hello" });
 
     const content = buffer[0..writer.end];
     try testing.expectEqualStrings(
@@ -553,7 +608,7 @@ test "writeSSE with id, event, and data emits fields in spec order" {
         .status = .OK,
         .writer = &writer,
     };
-    try res.writeSSE(.{ .id = "42", .event = "token", .data = "hi" });
+    res.writeSSE(.{ .id = "42", .event = "token", .data = "hi" });
 
     const content = buffer[0..writer.end];
     try testing.expectEqualStrings(
@@ -570,7 +625,7 @@ test "writeSSE splits multi-line data into multiple data lines" {
         .status = .OK,
         .writer = &writer,
     };
-    try res.writeSSE(.{ .data = "line1\nline2" });
+    res.writeSSE(.{ .data = "line1\nline2" });
 
     const content = buffer[0..writer.end];
     try testing.expectEqualStrings(
@@ -587,7 +642,7 @@ test "writeSSE with empty data emits bare data field" {
         .status = .OK,
         .writer = &writer,
     };
-    try res.writeSSE(.{});
+    res.writeSSE(.{});
 
     const content = buffer[0..writer.end];
     try testing.expectEqualStrings(
@@ -604,7 +659,7 @@ test "writeSSE with retry_ms emits retry field" {
         .status = .OK,
         .writer = &writer,
     };
-    try res.writeSSE(.{ .retry_ms = 5000, .data = "soon" });
+    res.writeSSE(.{ .retry_ms = 5000, .data = "soon" });
 
     const content = buffer[0..writer.end];
     try testing.expectEqualStrings(
@@ -621,7 +676,7 @@ test "writeSSEComment emits comment line" {
         .status = .OK,
         .writer = &writer,
     };
-    try res.writeSSEComment("heartbeat");
+    res.writeSSEComment("heartbeat");
 
     const content = buffer[0..writer.end];
     try testing.expectEqualStrings(
@@ -638,7 +693,7 @@ test "writeSSEComment with multi-line text prefixes each line" {
         .status = .OK,
         .writer = &writer,
     };
-    try res.writeSSEComment("first\nsecond\nthird");
+    res.writeSSEComment("first\nsecond\nthird");
 
     const content = buffer[0..writer.end];
     try testing.expectEqualStrings(
@@ -655,9 +710,9 @@ test "multiple writeSSE and writeSSEComment calls send headers once" {
         .status = .OK,
         .writer = &writer,
     };
-    try res.writeSSE(.{ .id = "1", .data = "a" });
-    try res.writeSSEComment("ping");
-    try res.writeSSE(.{ .id = "2", .data = "b" });
+    res.writeSSE(.{ .id = "1", .data = "a" });
+    res.writeSSEComment("ping");
+    res.writeSSE(.{ .id = "2", .data = "b" });
 
     const content = buffer[0..writer.end];
     try testing.expectEqualStrings(
@@ -682,7 +737,7 @@ test "new status codes render correct status line" {
         var buffer: [256]u8 = undefined;
         var writer = std.Io.Writer.fixed(&buffer);
         var res = Response{ .status = case.status, .writer = &writer };
-        try res.send();
+        res.send();
         const content = buffer[0..writer.end];
         try testing.expectEqualStrings(case.expected, content);
     }
@@ -709,11 +764,63 @@ test "empty body response" {
         .status = .Not_Modified,
         .writer = &writer,
     };
-    try res.send();
+    res.send();
 
     const content = buffer[0..writer.end];
     // 304 responses typically have no body, but blank line is always required
     try testing.expectEqualStrings("HTTP/1.1 304 Not Modified\r\n\r\n", content);
+}
+
+test "write failure latches failed and later writes are no-ops" {
+    // A buffer too small for even the status line forces NoSpaceLeft.
+    var buffer: [4]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+
+    var res = Response{
+        .body = "hello",
+        .writer = &writer,
+    };
+    res.send();
+    try testing.expect(res.failed);
+
+    // Subsequent writes must not crash or write anything further.
+    res.send();
+    res.writeChunk("more");
+    res.end();
+    try testing.expect(res.failed);
+}
+
+test "sendError before status line replaces the in-progress response" {
+    var buffer: [4 * 1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+
+    var res = Response{
+        .headers = .{ .content_type = "application/json", .connection = .keep_alive },
+        .body = "{\"partial\":true}",
+        .writer = &writer,
+    };
+    res.sendError(.Internal_Server_Error);
+
+    const content = buffer[0..writer.end];
+    try testing.expectEqualStrings("HTTP/1.1 500 Internal Server Error\r\nConnection: keep-alive\r\n\r\n", content);
+}
+
+test "sendError after status line marks connection for close" {
+    var buffer: [4 * 1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+
+    var res = Response{
+        .headers = .{ .connection = .keep_alive },
+        .writer = &writer,
+    };
+    res.writeChunk("partial");
+    const written_before = writer.end;
+
+    res.sendError(.Internal_Server_Error);
+
+    // Nothing further was written; the response is marked for close.
+    try testing.expectEqual(written_before, writer.end);
+    try testing.expectEqual(Connection.close, res.headers.connection.?);
 }
 
 fn assertCompressedResponseRoundTrips(
@@ -734,7 +841,7 @@ fn assertCompressedResponseRoundTrips(
         .writer = &writer,
         .allocator = arena.allocator(),
     };
-    try res.send();
+    res.send();
 
     const wire = out_buf[0..writer.end];
 
@@ -787,7 +894,7 @@ test "Response with content_encoding but empty body skips compression" {
         .writer = &writer,
         .allocator = arena.allocator(),
     };
-    try res.send();
+    res.send();
 
     const wire = out_buf[0..writer.end];
     // Header is still emitted (the field is set), but no compression ran.

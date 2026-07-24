@@ -60,6 +60,11 @@ pub const Loop = struct {
         };
     }
 
+    /// How long the accept loop pauses after a failed accept before
+    /// retrying, so a persistent failure (e.g. fd exhaustion) doesn't
+    /// spin it hot.
+    const accept_retry_delay_ms = 10;
+
     fn acceptLoop(
         self: *@This(),
         server: *http.Server,
@@ -70,9 +75,17 @@ pub const Loop = struct {
 
         while (self.active) {
             log.debug("Waiting connection...", .{});
-            const connection = server.accept() catch |err| {
-                log.err("Error accepting connection: {any}", .{err});
-                return;
+            const connection = server.accept() catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                else => {
+                    // Accept failures are transient (fd exhaustion,
+                    // aborted handshake, allocation): log, pause, and
+                    // keep accepting — one bad accept must never stop
+                    // the server.
+                    log.err("Error accepting connection: {any}", .{err});
+                    try std.Io.sleep(self.io, .fromMilliseconds(accept_retry_delay_ms), .awake);
+                    continue;
+                },
             };
             if (connection) |conn| {
                 log.debug("Got a connection...", .{});
@@ -164,8 +177,10 @@ pub const Loop = struct {
     }
 
     /// Run the handler for one request and decide whether to continue.
-    /// Returns `.close` when either side sent `Connection: close`,
-    /// `.keep` otherwise.
+    /// Guarantees every request gets a response: a `.skipped` outcome
+    /// becomes 404, and a response the handler built but never sent is
+    /// sent here. Returns `.close` when either side sent
+    /// `Connection: close` or the transport failed, `.keep` otherwise.
     fn onRequest(
         _: *@This(),
         handler: Handler,
@@ -175,25 +190,22 @@ pub const Loop = struct {
 
         var res = http.Response.fromRequest(req);
 
-        handler.handle(req, &res) catch |err| {
-            switch (err) {
-                error.Skipped => {
-                    res.status = .Not_Found;
-                    res.send() catch |err2| {
-                        log.err("Send Not Found error: {any}", .{err2});
-                    };
-                },
-                else => {
-                    log.err("Handle error: {any}", .{err});
-                },
-            }
-        };
+        switch (handler.handle(req, &res)) {
+            .handled => {},
+            .skipped => res.status = .Not_Found,
+        }
+        if (!res.sent_status) res.send();
 
-        log.debug("Response: {any}", .{res});
+        // Don't log the full response here: `res.body` points at
+        // handler-owned memory that may already be freed once the
+        // handler returned (the body was sent inside `handle`).
+        log.debug("Response: status={any}, content_length={any}", .{ res.status, res.headers.content_length });
 
         req.writer.flush() catch |err| {
             log.err("Writer flush error: {any}", .{err});
+            return .close;
         };
+        if (res.failed) return .close;
 
         const req_conn = req.headers.connection orelse .close;
         const res_conn = res.headers.connection orelse .close;
@@ -206,9 +218,9 @@ pub const Loop = struct {
 };
 
 const HelloHandler = struct {
-    pub fn handle(_: @This(), _: http.Request, res: *http.Response) HandlerError!void {
+    pub fn handle(_: @This(), _: http.Request, res: *http.Response) void {
         res.body = "hello";
-        try res.send();
+        res.send();
     }
 };
 
@@ -381,6 +393,74 @@ test "loop returns 404 when handler skips" {
     defer allocator.free(response);
 
     try testing.expect(std.mem.indexOf(u8, response, "404 Not Found") != null);
+}
+
+test "loop returns 500 when handler errors" {
+    const io = testing.io;
+    const allocator = testing.allocator;
+
+    const FailAll = struct {
+        pub fn handle(_: @This(), _: http.Request, _: *http.Response) HandlerError!void {
+            return error.Internal;
+        }
+    };
+
+    var state = FailAll{};
+    const wrapped = Handler.wrap(FailAll).init(&state);
+
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = http.Server.init(io, allocator, address, .{});
+    defer server.deinit();
+    try server.listen();
+
+    var loop = try Loop.init(io, &server, wrapped.interface());
+    defer loop.deinit();
+    try loop.start();
+
+    const response = try sendRequest(
+        io,
+        allocator,
+        server.getAddress().?,
+        "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    );
+    defer allocator.free(response);
+
+    try testing.expect(std.mem.indexOf(u8, response, "500 Internal Server Error") != null);
+}
+
+test "loop sends a built-but-unsent response" {
+    const io = testing.io;
+    const allocator = testing.allocator;
+
+    const Builder = struct {
+        pub fn handle(_: @This(), _: http.Request, res: *http.Response) void {
+            res.body = "built";
+            // No res.send() — the loop must send it.
+        }
+    };
+
+    var state = Builder{};
+    const wrapped = Handler.wrap(Builder).init(&state);
+
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = http.Server.init(io, allocator, address, .{});
+    defer server.deinit();
+    try server.listen();
+
+    var loop = try Loop.init(io, &server, wrapped.interface());
+    defer loop.deinit();
+    try loop.start();
+
+    const response = try sendRequest(
+        io,
+        allocator,
+        server.getAddress().?,
+        "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    );
+    defer allocator.free(response);
+
+    try testing.expect(std.mem.indexOf(u8, response, "200 OK") != null);
+    try testing.expect(std.mem.indexOf(u8, response, "built") != null);
 }
 
 test "loop shuts down cleanly with idle worker" {

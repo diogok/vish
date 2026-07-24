@@ -19,7 +19,7 @@ pub fn StructRouter(comptime HandlerType: type) type {
             return .{ .handler = handler };
         }
 
-        pub fn route(self: @This(), req: Request, res: *Response) HandlerError!void {
+        pub fn route(self: @This(), req: Request, res: *Response) Outcome {
             var path = req.uri.path;
             if (path.len == 0) {
                 path = "/";
@@ -47,8 +47,7 @@ pub fn StructRouter(comptime HandlerType: type) type {
                         if (std.mem.eql(u8, fn_method, @tagName(req.method))) {
                             const func = @field(HandlerType, decl.name);
                             const args = .{ self.handler, req, res, matches[0..] };
-                            try @call(.auto, func, args);
-                            return;
+                            return handlers.callOutcome(self.handler, func, args, req, res);
                         }
                     }
                 } else {
@@ -56,14 +55,13 @@ pub fn StructRouter(comptime HandlerType: type) type {
                         if (std.mem.eql(u8, fn_method, @tagName(req.method))) {
                             const func = @field(HandlerType, decl.name);
                             const args = .{ self.handler, req, res };
-                            try @call(.auto, func, args);
-                            return;
+                            return handlers.callOutcome(self.handler, func, args, req, res);
                         }
                     }
                 }
             }
 
-            return error.Skipped;
+            return .skipped;
         }
 
         pub fn interface(self: *@This()) Handler {
@@ -73,9 +71,9 @@ pub fn StructRouter(comptime HandlerType: type) type {
             };
         }
 
-        fn handle(h: Handler, req: Request, res: *Response) HandlerError!void {
+        fn handle(h: Handler, req: Request, res: *Response) Outcome {
             const self: *@This() = @ptrCast(@alignCast(h.ptr));
-            try self.route(req, res);
+            return self.route(req, res);
         }
     };
 }
@@ -106,22 +104,22 @@ test "struct router" {
 
     var req: Request = .example;
     var res: Response = .fromRequest(req);
-    try router.interface().handle(req, &res);
+    try testing.expectEqual(.handled, router.interface().handle(req, &res));
     try testing.expectEqualStrings("hi", res.body);
 
     req.uri.path = "/";
     res = .fromRequest(req);
-    try router.interface().handle(req, &res);
+    try testing.expectEqual(.handled, router.interface().handle(req, &res));
     try testing.expectEqualStrings("hi", res.body);
 
     req.uri.path = "/foo";
     res = .fromRequest(req);
-    try router.interface().handle(req, &res);
+    try testing.expectEqual(.handled, router.interface().handle(req, &res));
     try testing.expectEqualStrings("bar", res.body);
 
     req.uri.path = "/foo/bar";
     res = .fromRequest(req);
-    try router.interface().handle(req, &res);
+    try testing.expectEqual(.handled, router.interface().handle(req, &res));
     try testing.expectEqualStrings("baz", res.body);
 
     var echo = std.Io.Reader.fixed("echo");
@@ -130,31 +128,51 @@ test "struct router" {
     req.headers.content_length = 4;
     req.reader = &echo;
     res = .fromRequest(req);
-    try router.interface().handle(req, &res);
+    try testing.expectEqual(.handled, router.interface().handle(req, &res));
     try testing.expectEqualStrings("echo", res.body);
     testing.allocator.free(res.body);
 
     req.method = .GET;
     req.uri.path = "/echo";
     res = .fromRequest(req);
-    const err = router.interface().handle(req, &res);
+    try testing.expectEqual(.skipped, router.interface().handle(req, &res));
     try testing.expectEqualStrings("", res.body);
-    try testing.expectError(error.Skipped, err);
 
     var world = std.Io.Reader.fixed("world");
     req.method = .GET;
     req.uri.path = "/echo/hello";
     req.reader = &world;
     res = .fromRequest(req);
-    try router.interface().handle(req, &res);
+    try testing.expectEqual(.handled, router.interface().handle(req, &res));
     try testing.expectEqualStrings("hello", res.body);
 
     // Wildcard routes must check HTTP method — POST /echo/hello should not match GET /echo/?
     req.method = .POST;
     req.uri.path = "/echo/hello";
     res = .fromRequest(req);
-    const err2 = router.interface().handle(req, &res);
-    try testing.expectError(error.Skipped, err2);
+    try testing.expectEqual(.skipped, router.interface().handle(req, &res));
+}
+
+test "struct router maps route errors to responses" {
+    const MyRouter = struct {
+        pub fn @"GET /bad"(_: @This(), _: Request, _: *Response) !void {
+            return error.BadRequest;
+        }
+    };
+
+    var buffer: [1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+
+    var router = StructRouter(MyRouter).init(.{});
+
+    var req: Request = .example;
+    req.uri.path = "/bad";
+    req.writer = &writer;
+    var res: Response = .fromRequest(req);
+    try testing.expectEqual(.handled, router.interface().handle(req, &res));
+
+    const content = buffer[0..writer.end];
+    try testing.expectEqualStrings("HTTP/1.1 400 Bad Request\r\n\r\n", content);
 }
 
 /// Routes to a handler if the URI perfix matches.
@@ -169,24 +187,24 @@ pub const PrefixRouter = struct {
         };
     }
 
-    pub fn route(self: @This(), src_req: Request, res: *Response) HandlerError!void {
-        if (std.mem.startsWith(u8, src_req.uri.path, self.prefix)) {
-            const req = Request{
-                .method = src_req.method,
-                .headers = src_req.headers,
-                .version = src_req.version,
-                .uri = .{
-                    .path = src_req.uri.path[self.prefix.len..],
-                    .query = src_req.uri.query,
-                },
-                .reader = src_req.reader,
-                .writer = src_req.writer,
-                .allocator = src_req.allocator,
-            };
-            try self.handler.handle(req, res);
-        } else {
-            return error.Skipped;
+    pub fn route(self: @This(), src_req: Request, res: *Response) Outcome {
+        if (!std.mem.startsWith(u8, src_req.uri.path, self.prefix)) {
+            return .skipped;
         }
+
+        const req = Request{
+            .method = src_req.method,
+            .headers = src_req.headers,
+            .version = src_req.version,
+            .uri = .{
+                .path = src_req.uri.path[self.prefix.len..],
+                .query = src_req.uri.query,
+            },
+            .reader = src_req.reader,
+            .writer = src_req.writer,
+            .allocator = src_req.allocator,
+        };
+        return self.handler.handle(req, res);
     }
 
     pub fn interface(self: *@This()) Handler {
@@ -196,9 +214,9 @@ pub const PrefixRouter = struct {
         };
     }
 
-    fn handle(h: Handler, req: Request, res: *Response) HandlerError!void {
+    fn handle(h: Handler, req: Request, res: *Response) Outcome {
         const self: *@This() = @ptrCast(@alignCast(h.ptr));
-        try self.route(req, res);
+        return self.route(req, res);
     }
 };
 
@@ -218,34 +236,30 @@ test "prefix router" {
 
     var req: Request = .example;
     var res: Response = .fromRequest(req);
-    var err = router.interface().handle(req, &res);
-    try testing.expectError(error.Skipped, err);
+    try testing.expectEqual(.skipped, router.interface().handle(req, &res));
 
     req.uri.path = "/bar";
     res = .fromRequest(req);
-    err = router.interface().handle(req, &res);
-    try testing.expectError(error.Skipped, err);
+    try testing.expectEqual(.skipped, router.interface().handle(req, &res));
 
     req.uri.path = "/foo";
     res = .fromRequest(req);
-    err = router.interface().handle(req, &res);
-    try testing.expectError(error.Skipped, err);
+    try testing.expectEqual(.skipped, router.interface().handle(req, &res));
 
     req.uri.path = "/foo/bar";
     res = .fromRequest(req);
-    try router.interface().handle(req, &res);
+    try testing.expectEqual(.handled, router.interface().handle(req, &res));
     try testing.expectEqual(.OK, res.status);
 
     req.uri.path = "/foo/baz";
     res = .fromRequest(req);
-    try router.interface().handle(req, &res);
+    try testing.expectEqual(.handled, router.interface().handle(req, &res));
     try testing.expectEqual(.OK, res.status);
     try testing.expectEqualStrings(res.body, "/baz");
 
     req.uri.path = "/foo/barz";
     res = .fromRequest(req);
-    err = router.interface().handle(req, &res);
-    try testing.expectError(error.Skipped, err);
+    try testing.expectEqual(.skipped, router.interface().handle(req, &res));
 }
 
 /// Handler that attempts a series of routers until one matches.
@@ -256,17 +270,11 @@ pub const CombinedRouter = struct {
         return .{ .routers = routers };
     }
 
-    pub fn route(self: @This(), req: Request, res: *Response) HandlerError!void {
+    pub fn route(self: @This(), req: Request, res: *Response) Outcome {
         for (self.routers) |router| {
-            router.handle(req, res) catch |err| {
-                switch (err) {
-                    error.Skipped => continue,
-                    else => return err,
-                }
-            };
-            return;
+            if (router.handle(req, res) == .handled) return .handled;
         }
-        return error.Skipped;
+        return .skipped;
     }
 
     pub fn interface(self: *@This()) Handler {
@@ -276,9 +284,9 @@ pub const CombinedRouter = struct {
         };
     }
 
-    fn handle(h: Handler, req: Request, res: *Response) HandlerError!void {
+    fn handle(h: Handler, req: Request, res: *Response) Outcome {
         const self: *@This() = @ptrCast(@alignCast(h.ptr));
-        try self.route(req, res);
+        return self.route(req, res);
     }
 };
 
@@ -312,37 +320,37 @@ test "combined router" {
     var req: Request = .example;
     var res: Response = .fromRequest(req);
 
-    try router.interface().handle(req, &res);
+    try testing.expectEqual(.handled, router.interface().handle(req, &res));
     try testing.expectEqual(.OK, res.status);
     try testing.expectEqualStrings("hi", res.body);
 
     req.uri.path = "/";
     res = .fromRequest(req);
-    try router.interface().handle(req, &res);
+    try testing.expectEqual(.handled, router.interface().handle(req, &res));
     try testing.expectEqual(.OK, res.status);
     try testing.expectEqualStrings("hi", res.body);
 
     req.uri.path = "/foo";
     res = .fromRequest(req);
-    try router.interface().handle(req, &res);
+    try testing.expectEqual(.handled, router.interface().handle(req, &res));
     try testing.expectEqual(.OK, res.status);
     try testing.expectEqualStrings("bar", res.body);
 
     req.uri.path = "/sub/foo";
     res = .fromRequest(req);
-    try router.interface().handle(req, &res);
+    try testing.expectEqual(.handled, router.interface().handle(req, &res));
     try testing.expectEqual(.OK, res.status);
     try testing.expectEqualStrings("bar", res.body);
 
     req.uri.path = "/foo/bar";
     res = .fromRequest(req);
-    try router.interface().handle(req, &res);
+    try testing.expectEqual(.handled, router.interface().handle(req, &res));
     try testing.expectEqual(.OK, res.status);
     try testing.expectEqualStrings("baz", res.body);
 
     req.uri.path = "/sub/foo/bar";
     res = .fromRequest(req);
-    try router.interface().handle(req, &res);
+    try testing.expectEqual(.handled, router.interface().handle(req, &res));
     try testing.expectEqual(.OK, res.status);
     try testing.expectEqualStrings("baz", res.body);
 }
@@ -459,7 +467,7 @@ test "matching paths" {
 /// `get(io, allocator, path) ?Asset` function returning a value with
 /// a `content: []const u8` field and a `deinit()` method.
 ///
-/// Only responds to GET requests. Returns `error.Skipped` for non-GET
+/// Only responds to GET requests. Returns `.skipped` for non-GET
 /// methods, empty paths, path traversal attempts, or missing files.
 ///
 /// Example:
@@ -475,24 +483,25 @@ pub fn StaticRouter(comptime Assets: type) type {
             return .{ .io = io };
         }
 
-        pub fn route(self: @This(), req: Request, res: *Response) HandlerError!void {
-            if (req.method != .GET) return error.Skipped;
+        pub fn route(self: @This(), req: Request, res: *Response) Outcome {
+            if (req.method != .GET) return .skipped;
 
             const path = std.mem.trimStart(u8, req.uri.path, "/");
-            if (path.len == 0) return error.Skipped;
-            if (std.fs.path.isAbsolute(path)) return error.Skipped;
+            if (path.len == 0) return .skipped;
+            if (std.fs.path.isAbsolute(path)) return .skipped;
 
             // Reject path traversal: ".." as a segment (start, middle, or end)
             var it = std.mem.splitScalar(u8, path, '/');
             while (it.next()) |segment| {
-                if (std.mem.eql(u8, segment, "..")) return error.Skipped;
+                if (std.mem.eql(u8, segment, "..")) return .skipped;
             }
 
-            const asset = Assets.get(self.io, req.allocator, path) orelse return error.Skipped;
+            const asset = Assets.get(self.io, req.allocator, path) orelse return .skipped;
             defer asset.deinit();
             res.headers.content_type = mime.guess(path);
             res.body = asset.content;
-            try res.send();
+            res.send();
+            return .handled;
         }
 
         pub fn interface(self: *@This()) Handler {
@@ -502,9 +511,9 @@ pub fn StaticRouter(comptime Assets: type) type {
             };
         }
 
-        fn handle(h: Handler, req: Request, res: *Response) HandlerError!void {
+        fn handle(h: Handler, req: Request, res: *Response) Outcome {
             const self: *@This() = @ptrCast(@alignCast(h.ptr));
-            try self.route(req, res);
+            return self.route(req, res);
         }
     };
 }
@@ -531,32 +540,32 @@ test "static router" {
     req.uri.path = "/index.html";
     req.writer = &writer;
     var res: Response = .fromRequest(req);
-    try router.interface().handle(req, &res);
+    try testing.expectEqual(.handled, router.interface().handle(req, &res));
     try testing.expectEqualStrings("<html></html>", res.body);
     try testing.expectEqualStrings("text/html", res.headers.content_type);
 
     req.uri.path = "/style.css";
     res = .fromRequest(req);
-    try router.interface().handle(req, &res);
+    try testing.expectEqual(.handled, router.interface().handle(req, &res));
     try testing.expectEqualStrings("body {}", res.body);
     try testing.expectEqualStrings("text/css", res.headers.content_type);
 
     req.uri.path = "/missing.html";
     res = .fromRequest(req);
-    try testing.expectError(error.Skipped, router.interface().handle(req, &res));
+    try testing.expectEqual(.skipped, router.interface().handle(req, &res));
 
     req.uri.path = "/../etc/passwd";
     res = .fromRequest(req);
-    try testing.expectError(error.Skipped, router.interface().handle(req, &res));
+    try testing.expectEqual(.skipped, router.interface().handle(req, &res));
 
     req.uri.path = "/";
     res = .fromRequest(req);
-    try testing.expectError(error.Skipped, router.interface().handle(req, &res));
+    try testing.expectEqual(.skipped, router.interface().handle(req, &res));
 
     req.method = .POST;
     req.uri.path = "/index.html";
     res = .fromRequest(req);
-    try testing.expectError(error.Skipped, router.interface().handle(req, &res));
+    try testing.expectEqual(.skipped, router.interface().handle(req, &res));
 }
 
 const std = @import("std");
@@ -565,5 +574,6 @@ const testing = std.testing;
 const mime = @import("mime.zig");
 const Request = @import("../http/request.zig").Request;
 const Response = @import("../http/response.zig").Response;
-const Handler = @import("../loop/handler.zig").Handler;
-const HandlerError = @import("../loop/handler.zig").Error;
+const handlers = @import("../loop/handler.zig");
+const Handler = handlers.Handler;
+const Outcome = handlers.Outcome;

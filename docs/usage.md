@@ -25,7 +25,15 @@ Static-asset bundling is opt-in. If you want it, also pull `addStaticAssets` fro
 ## Minimal server
 
 ```zig
-pub fn main(init: std.process.Init) !void {
+pub fn main(init: std.process.Init) u8 {
+    run(init) catch |err| {
+        std.log.err("startup failed: {t}", .{err});
+        return 1;
+    };
+    return 0;
+}
+
+fn run(init: std.process.Init) !void {
     const io = init.io;
     const allocator = init.gpa;
 
@@ -46,9 +54,9 @@ pub fn main(init: std.process.Init) !void {
 }
 
 const Hello = struct {
-    pub fn handle(_: @This(), _: vish.Request, res: *vish.Response) vish.HandleError!void {
+    pub fn handle(_: @This(), _: vish.Request, res: *vish.Response) void {
         res.body = "Hello, World!";
-        try res.send();
+        res.send();
     }
 };
 
@@ -56,22 +64,24 @@ const std = @import("std");
 const vish = @import("vish");
 ```
 
+Startup errors (bad address, port permissions, no concurrency) are the only fatal ones: `main` logs them and exits 1. Once the loop is running, nothing a handler or client does can bring the server down.
+
 Run with `zig build run`.
 
 ## Routing — StructRouter
 
-Define routes as struct methods named `"<METHOD> <PATH>"`. The router matches on method + path; non-matches return `error.Skipped`.
+Define routes as struct methods named `"<METHOD> <PATH>"`. The router matches on method + path; non-matches produce `.skipped`, which the loop turns into `404 Not Found` if nothing else in the chain handles the request.
 
 ```zig
 const Routes = struct {
-    pub fn @"GET /"(_: @This(), _: vish.Request, res: *vish.Response) vish.HandleError!void {
+    pub fn @"GET /"(_: @This(), _: vish.Request, res: *vish.Response) void {
         res.body = "home";
-        try res.send();
+        res.send();
     }
 
-    pub fn @"POST /users"(_: @This(), _: vish.Request, res: *vish.Response) vish.HandleError!void {
+    pub fn @"POST /users"(_: @This(), _: vish.Request, res: *vish.Response) !void {
         res.status = .Created;
-        try res.send();
+        res.send();
     }
 };
 
@@ -79,18 +89,20 @@ var routes = vish.utils.router.StructRouter(Routes).init(.{});
 var loop = try vish.Loop.init(io, &server, routes.interface());
 ```
 
+Route methods may return `void` or an error union. Errors never escape the router — see [Error handling](#error-handling).
+
 ### Path params
 
 Use `?` as a single-segment wildcard. Matched segments are passed as a 4th parameter `params: []const []const u8`:
 
 ```zig
-pub fn @"GET /users/?"(_: @This(), _: Request, res: *Response, params: []const []const u8) !void {
+pub fn @"GET /users/?"(_: @This(), _: Request, res: *Response, params: []const []const u8) void {
     const user_id = params[0];           // "123" for /users/123
     res.body = user_id;
-    try res.send();
+    res.send();
 }
 
-pub fn @"GET /users/?/posts/?"(_: @This(), _: Request, res: *Response, params: []const []const u8) !void {
+pub fn @"GET /users/?/posts/?"(_: @This(), _: Request, res: *Response, params: []const []const u8) void {
     const user_id = params[0];
     const post_id = params[1];
     _ = .{ user_id, post_id };
@@ -122,7 +134,7 @@ var combined = vish.utils.router.CombinedRouter.init(&.{
 });
 ```
 
-`CombinedRouter` tries each handler in order; `error.Skipped` falls through to the next. The first non-Skipped result wins.
+`CombinedRouter` tries each handler in order; `.skipped` falls through to the next. The first handler that answers `.handled` wins.
 
 ## Static assets
 
@@ -142,7 +154,7 @@ var static = vish.utils.router.StaticRouter(assets).init(io);
 // add static.interface() to a CombinedRouter
 ```
 
-Debug builds read from disk on each request (live edits, no rebuild). Release builds `@embedFile` everything into the binary. `StaticRouter` only handles `GET`, rejects path-traversal, and returns `Skipped` on miss so a `CombinedRouter` can fall through.
+Debug builds read from disk on each request (live edits, no rebuild). Release builds `@embedFile` everything into the binary. `StaticRouter` only handles `GET`, rejects path-traversal, and returns `.skipped` on miss so a `CombinedRouter` can fall through.
 
 ## Middleware — request logging
 
@@ -157,6 +169,38 @@ var loop = try vish.Loop.init(io, &server, logger.interface());
 
 Custom middleware is just a handler that holds a wrapped `Handler`, calls it, and adds behavior — see `src/utils/logging.zig` for the template.
 
+## Error handling
+
+The type-erased `Handler` interface cannot return errors — it returns `vish.Outcome` (`.handled` or `.skipped`). Concrete handlers and route methods may still be fallible; `Handler.wrap` and the routers convert any error into a response at the boundary:
+
+| Error               | Response                    |
+|---------------------|-----------------------------|
+| `error.Skipped`     | `.skipped` (chain continues; 404 if nothing handles it) |
+| `error.BadRequest`  | `400 Bad Request`           |
+| `error.Unauthorized`| `401 Unauthorized`          |
+| `error.StreamTooLong` | `413 Payload Too Large`   |
+| anything else       | `500 Internal Server Error` |
+
+```zig
+pub fn @"POST /users"(_: @This(), req: vish.Request, res: *vish.Response) !void {
+    const body = try parse(req);        // any error here becomes a 500...
+    if (body.name == null) return error.BadRequest; // ...this one a 400
+    res.send();
+}
+```
+
+To customize the conversion, declare `onError` next to `handle` (or the route methods) — it replaces the default mapping:
+
+```zig
+pub fn onError(_: @This(), err: anyerror, _: vish.Request, res: *vish.Response) void {
+    res.status = vish.statusForError(err);
+    res.body = "{\"error\":true}";
+    res.send();
+}
+```
+
+Response writes are infallible: a transport failure (client gone) latches `res.failed` and turns every later write into a no-op — the loop closes the connection afterwards. A handler that returns `.handled` without ever calling `send()` is fine too: the loop sends whatever was built. Every request gets exactly one complete response, or a closed connection; nothing a handler does can take the server down.
+
 ## Reading a body
 
 `Request.bodyReader(buffer)` returns a `BodyReader` that handles both `Content-Length` and `Transfer-Encoding: chunked`, and (transparently) `Content-Encoding: gzip|deflate`. Always read through `.interface()`:
@@ -170,7 +214,7 @@ pub fn @"POST /upload"(_: @This(), req: Request, res: *Response) !void {
     const body = try body_reader.interface().allocRemaining(req.allocator, .unlimited);
     // body is arena-owned; do not free.
     res.body = body;
-    try res.send();
+    res.send();
 }
 ```
 
@@ -193,7 +237,7 @@ pub fn @"GET /hello"(self: @This(), req: Request, res: *Response) !void {
     try out.writer.print("Hello, {s}!", .{ params.name orelse "world" });
 
     res.body = out.written();
-    try res.send();
+    res.send();
 }
 ```
 
@@ -222,7 +266,7 @@ pub fn @"POST /hello"(self: @This(), req: Request, res: *Response) !void {
 res.status = .Created;
 res.headers.content_type = "application/json";
 res.body = "{\"ok\":true}";
-try res.send();
+res.send();
 ```
 
 `Content-Length` is filled in automatically from `body.len` if not set.
@@ -230,20 +274,31 @@ try res.send();
 ### Chunked streaming
 
 ```zig
-try res.writeChunk("first");
-try res.writeChunk("second");
-try res.end();
+res.writeChunk("first");
+res.writeChunk("second");
+res.end();
 ```
 
 `writeChunk` sends `Transfer-Encoding: chunked` headers on the first call; chunk sizes are emitted in hex per RFC 7230.
 
+Writes never fail — a broken connection latches `res.failed`. Long-running streaming loops should check it to stop producing early:
+
+```zig
+while (nextChunk()) |chunk| {
+    if (res.failed) break;   // client is gone
+    res.writeChunk(chunk);
+    res.flush();
+}
+res.end();
+```
+
 ### Server-Sent Events
 
 ```zig
-try res.writeSSE(.{ .id = "1", .event = "token", .data = "hello" });
-try res.writeSSEComment("heartbeat");           // ": heartbeat\n\n"
-try res.writeSSE(.{ .data = "multi\nline" });   // splits on \n into multiple data: lines
-try res.flush();
+res.writeSSE(.{ .id = "1", .event = "token", .data = "hello" });
+res.writeSSEComment("heartbeat");           // ": heartbeat\n\n"
+res.writeSSE(.{ .data = "multi\nline" });   // splits on \n into multiple data: lines
+res.flush();
 ```
 
 The first SSE call sets `Content-Type: text/event-stream` and `Cache-Control: no-cache` if not already set. SSE is incompatible with `Content-Encoding` (asserts in debug).
@@ -253,7 +308,7 @@ The first SSE call sets `Content-Type: text/event-stream` and `Cache-Control: no
 ```zig
 res.headers.content_encoding = .gzip;   // or .deflate
 res.body = big_payload;
-try res.send();
+res.send();
 ```
 
 `send()` compresses into the per-request arena, sets `Content-Length` to the compressed size, and writes status/headers/body. Streaming compression is **not** supported — don't combine `content_encoding` with `writeChunk`/`writeSSE`.
@@ -265,7 +320,7 @@ res.headers.extra = &.{
     .{ .name = "X-Request-ID", .value = req_id },
     .{ .name = "X-Trace-ID",   .value = trace_id },
 };
-try res.send();
+res.send();
 ```
 
 For frequently-used headers, prefer adding a typed field to `response.Headers` instead — the comptime serializer picks it up automatically.

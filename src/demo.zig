@@ -1,4 +1,12 @@
-pub fn main(init: std.process.Init) !void {
+pub fn main(init: std.process.Init) u8 {
+    run(init) catch |err| {
+        log.err("startup failed: {t}", .{err});
+        return 1;
+    };
+    return 0;
+}
+
+fn run(init: std.process.Init) !void {
     const io = init.io;
     const allocator = init.gpa;
 
@@ -25,12 +33,12 @@ pub const MyHandler = struct {
         _: @This(),
         req: vish.Request,
         res: *vish.Response,
-    ) vish.HandleError!void {
+    ) void {
         log.debug("Request: {any}", .{req});
 
         res.body = "hello";
 
-        try res.send();
+        res.send();
     }
 };
 

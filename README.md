@@ -11,7 +11,8 @@ A vtable-based interface that allows any struct with a `handle(Request, *Respons
 - Use `Handler.wrap(T)` to convert any struct with a compatible `handle` method into a `Handler`
 - All handlers expose an `.interface()` method that returns the common `Handler` type
 - Handlers can be composed and chained together, enabling middleware-like patterns
-- Return `error.Skipped` from a handler to indicate it didn't match, allowing fallback to the next handler
+- The interface returns an `Outcome` (`.handled` or `.skipped`), never an error: handler failures are converted into proper error responses (400/401/413/500) at the wrap/router boundary, so no request error can take the server down
+- Return `error.Skipped` from a concrete handler to indicate it didn't match, allowing fallback to the next handler
 
 ### Accept/read/write Loop
 
@@ -102,7 +103,15 @@ exe.root_module.addImport("vish", vish.module("vish"));
 const std = @import("std");
 const vish = @import("vish");
 
-pub fn main(init: std.process.Init) !void {
+pub fn main(init: std.process.Init) u8 {
+    run(init) catch |err| {
+        std.log.err("startup failed: {t}", .{err});
+        return 1;
+    };
+    return 0;
+}
+
+fn run(init: std.process.Init) !void {
     const io = init.io;
     const allocator = init.gpa;
 
@@ -127,10 +136,10 @@ const MyHandler = struct {
         _: @This(),
         req: vish.Request,
         res: *vish.Response,
-    ) vish.HandleError!void {
+    ) void {
         _ = req;
         res.body = "Hello, World!";
-        try res.send();
+        res.send();
     }
 };
 ```

@@ -115,7 +115,13 @@ pub const Server = struct {
                 }
             };
 
-            return try Connection.init(self, stream);
+            const connection = Connection.init(self, stream) catch |err| {
+                // Don't leak the accepted socket when the connection's
+                // buffers fail to allocate.
+                stream.close(self.io);
+                return err;
+            };
+            return connection;
         }
         return null;
     }
