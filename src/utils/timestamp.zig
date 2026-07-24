@@ -17,15 +17,15 @@ pub const Timestamp = struct {
     pub fn init(epoch: i64) @This() {
         const timestamp = std.time.epoch.EpochSeconds{ .secs = @as(u64, @intCast(epoch)) };
         const day = timestamp.getEpochDay();
-        const yearDay = day.calculateYearDay();
-        const monthDay = yearDay.calculateMonthDay();
+        const year_day = day.calculateYearDay();
+        const month_day = year_day.calculateMonthDay();
         const hours = timestamp.getDaySeconds();
 
         return .{
             .epoch = epoch,
-            .day = monthDay.day_index + 1,
-            .month = monthDay.month.numeric(),
-            .year = yearDay.year,
+            .day = month_day.day_index + 1,
+            .month = month_day.month.numeric(),
+            .year = year_day.year,
             .hour = hours.getHoursIntoDay(),
             .minute = hours.getMinutesIntoHour(),
             .second = hours.getSecondsIntoMinute(),

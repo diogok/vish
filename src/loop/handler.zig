@@ -1,12 +1,7 @@
 //! Type-erased HTTP request handler. `Handler` is a `ptr + vtable` value
 //! type; concrete handlers plug in via `Handler.wrap(T)` or by exposing
-//! their own `interface()` method.
-//!
-//! The vtable returns an `Outcome`, never an error: by the time control
-//! reaches the loop, every failure has been converted into a response.
-//! Concrete handlers may still be fallible — `Handler.wrap` and the
-//! routers call `errorOutcome` at the boundary to turn errors into
-//! responses (or into `.skipped` for `error.Skipped`).
+//! their own `interface()` method. The vtable returns an `Outcome`,
+//! never an error — `errorOutcome` converts failures at the boundary.
 
 /// What a handler did with a request. `.skipped` means "I don't match,
 /// try the next handler" — the loop converts a top-level `.skipped`
@@ -117,6 +112,7 @@ pub fn statusForError(err: anyerror) Status {
         error.BadRequest => .Bad_Request,
         error.Unauthorized => .Unauthorized,
         error.StreamTooLong => .Payload_Too_Large,
+        error.Internal => .Internal_Server_Error,
         else => .Internal_Server_Error,
     };
 }

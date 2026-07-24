@@ -179,6 +179,7 @@ The type-erased `Handler` interface cannot return errors — it returns `vish.Ou
 | `error.BadRequest`  | `400 Bad Request`           |
 | `error.Unauthorized`| `401 Unauthorized`          |
 | `error.StreamTooLong` | `413 Payload Too Large`   |
+| `error.Internal`    | `500 Internal Server Error` |
 | anything else       | `500 Internal Server Error` |
 
 ```zig
@@ -220,20 +221,19 @@ pub fn @"POST /upload"(_: @This(), req: Request, res: *Response) !void {
 
 ## Form data and query strings
 
-`readFormdata` parses `application/x-www-form-urlencoded` data into a struct of `?[]const u8` (or `[]const u8`) fields. Field names match form keys; URL-decoded values are arena-allocated.
+`readFormdata` parses `application/x-www-form-urlencoded` data into a struct of `?[]const u8` (or `[]const u8`) fields. Field names match form keys; URL-decoded values are allocated from the allocator you pass. Pass `req.allocator` (the per-request arena): values then live until the handler returns and need no `free`.
 
 ### Query string
 
 ```zig
-pub fn @"GET /hello"(self: @This(), req: Request, res: *Response) !void {
+pub fn @"GET /hello"(_: @This(), req: Request, res: *Response) !void {
     const Params = struct { name: ?[]const u8 = null };
     var params = Params{};
 
     var query = std.Io.Reader.fixed(req.uri.query);
-    vish.utils.formdata.readFormdata(self.allocator, &query, &params) catch {};
+    vish.utils.formdata.readFormdata(req.allocator, &query, &params) catch {};
 
-    var out = std.Io.Writer.Allocating.init(self.allocator);
-    defer out.deinit();
+    var out = std.Io.Writer.Allocating.init(req.allocator);
     try out.writer.print("Hello, {s}!", .{ params.name orelse "world" });
 
     res.body = out.written();
@@ -244,19 +244,17 @@ pub fn @"GET /hello"(self: @This(), req: Request, res: *Response) !void {
 ### Form body
 
 ```zig
-pub fn @"POST /hello"(self: @This(), req: Request, res: *Response) !void {
+pub fn @"POST /hello"(_: @This(), req: Request, res: *Response) !void {
     const Params = struct { name: ?[]const u8 = null };
     var params = Params{};
 
     var buf: [1024]u8 = undefined;
     var body_reader = try req.bodyReader(&buf);
-    vish.utils.formdata.readFormdata(self.allocator, body_reader.interface(), &params) catch {};
+    vish.utils.formdata.readFormdata(req.allocator, body_reader.interface(), &params) catch {};
 
     // ...
 }
 ```
-
-`StructRouter` instances need an allocator if their handlers use one; construct with `.init(.{ .allocator = allocator })` and access via `self.allocator`.
 
 ## Responses
 
@@ -360,7 +358,7 @@ vish.Server.init(io, allocator, address, .{
 
 ## Shutdown
 
-`vish.waitInterrupt(io)` blocks on SIGINT/SIGHUP. The deferred `loop.deinit()` and `server.deinit()` then run in reverse declaration order to:
+`vish.waitInterrupt(io)` blocks on SIGINT, SIGTERM, or SIGHUP. The deferred `loop.deinit()` and `server.deinit()` then run in reverse declaration order to:
 
 1. Set `loop.active = false` and shut down the listener — accept returns null.
 2. Cancel the accept group and worker group — any task blocked in I/O is unblocked.

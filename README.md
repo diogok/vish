@@ -134,10 +134,9 @@ fn run(init: std.process.Init) !void {
 const MyHandler = struct {
     pub fn handle(
         _: @This(),
-        req: vish.Request,
+        _: vish.Request,
         res: *vish.Response,
     ) void {
-        _ = req;
         res.body = "Hello, World!";
         res.send();
     }
@@ -149,10 +148,10 @@ See [src/demo.zig](src/demo.zig) and [src/demo2.zig](src/demo2.zig) for runnable
 ## AI Usage
 
 - This library was mostly hand written. 
-- Some functions, fixes and zig version migratation were AI assisted.
+- Some functions, fixes and zig version migration were AI assisted.
 - Comments and docs were AI written and human edited.
 - All was human reviewed.
-- The design, interfaces and archtecture is my own.
+- The design, interfaces and architecture is my own.
 
 ## License
 

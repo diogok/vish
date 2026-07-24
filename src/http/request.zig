@@ -4,14 +4,16 @@
 
 pub const Method = enum {
     GET,
+    HEAD,
     POST,
     PUT,
     DELETE,
     PATCH,
+    OPTIONS,
 
     pub fn read(reader: *std.Io.Reader) !Method {
-        const bytes0 = try reader.takeDelimiter(' ');
-        if (bytes0) |bytes| {
+        const maybe_bytes = try reader.takeDelimiter(' ');
+        if (maybe_bytes) |bytes| {
             return @This().parse(bytes);
         } else {
             return error.NoData;
@@ -21,6 +23,8 @@ pub const Method = enum {
     pub fn parse(bytes: []const u8) !Method {
         if (std.mem.eql(u8, bytes, "GET")) {
             return .GET;
+        } else if (std.mem.eql(u8, bytes, "HEAD")) {
+            return .HEAD;
         } else if (std.mem.eql(u8, bytes, "POST")) {
             return .POST;
         } else if (std.mem.eql(u8, bytes, "PUT")) {
@@ -29,6 +33,8 @@ pub const Method = enum {
             return .DELETE;
         } else if (std.mem.eql(u8, bytes, "PATCH")) {
             return .PATCH;
+        } else if (std.mem.eql(u8, bytes, "OPTIONS")) {
+            return .OPTIONS;
         } else {
             // Client-controlled bytes: escape (log injection) and cap the
             // length before logging. Malformed input is client noise, not
@@ -48,8 +54,8 @@ pub const URI = struct {
     query: []const u8 = "",
 
     pub fn read(allocator: std.mem.Allocator, reader: *std.Io.Reader) !URI {
-        const bytes0 = try reader.takeDelimiter(' ');
-        if (bytes0) |bytes| {
+        const maybe_bytes = try reader.takeDelimiter(' ');
+        if (maybe_bytes) |bytes| {
             return @This().parse(allocator, bytes);
         } else {
             return error.InvalidURI;
@@ -73,8 +79,8 @@ pub const Version = enum {
     HTTP_1_1,
 
     pub fn read(reader: *std.Io.Reader) !Version {
-        const bytes0 = try reader.takeDelimiter('\n');
-        if (bytes0) |bytes| {
+        const maybe_bytes = try reader.takeDelimiter('\n');
+        if (maybe_bytes) |bytes| {
             return @This().parse(bytes[0 .. bytes.len - 1]);
         } else {
             return error.InvalidHTTPVersion;
@@ -115,17 +121,7 @@ pub const Connection = enum(u1) {
     close = 1,
 
     pub fn parse(bytes: []const u8) ?Connection {
-        inline for (std.meta.fields(@This())) |field| {
-            const name = comptime blk: {
-                var buf: [field.name.len]u8 = undefined;
-                _ = std.mem.replace(u8, field.name, "_", "-", &buf);
-                break :blk buf;
-            };
-            if (std.ascii.eqlIgnoreCase(bytes, &name)) {
-                return @enumFromInt(field.value);
-            }
-        }
-        return null;
+        return parseHeaderEnum(Connection, bytes);
     }
 };
 
@@ -133,12 +129,7 @@ pub const TransferEncoding = enum {
     chunked,
 
     pub fn parse(bytes: []const u8) ?TransferEncoding {
-        inline for (std.meta.fields(@This())) |field| {
-            if (std.ascii.eqlIgnoreCase(bytes, field.name)) {
-                return @enumFromInt(field.value);
-            }
-        }
-        return null;
+        return parseHeaderEnum(TransferEncoding, bytes);
     }
 };
 
@@ -149,12 +140,7 @@ pub const ContentEncoding = enum(u1) {
     deflate = 1,
 
     pub fn parse(bytes: []const u8) ?ContentEncoding {
-        inline for (std.meta.fields(@This())) |field| {
-            if (std.ascii.eqlIgnoreCase(bytes, field.name)) {
-                return @enumFromInt(field.value);
-            }
-        }
-        return null;
+        return parseHeaderEnum(ContentEncoding, bytes);
     }
 
     pub fn container(self: @This()) std.compress.flate.Container {
@@ -164,6 +150,23 @@ pub const ContentEncoding = enum(u1) {
         };
     }
 };
+
+/// Match a header-value token against an enum's tags, case-insensitively,
+/// with `_` in the tag standing for `-` on the wire (`keep_alive` matches
+/// `keep-alive`). Returns null when no tag matches.
+fn parseHeaderEnum(EnumType: type, bytes: []const u8) ?EnumType {
+    inline for (std.meta.fields(EnumType)) |field| {
+        const name = comptime blk: {
+            var buf: [field.name.len]u8 = undefined;
+            _ = std.mem.replace(u8, field.name, "_", "-", &buf);
+            break :blk buf;
+        };
+        if (std.ascii.eqlIgnoreCase(bytes, &name)) {
+            return @enumFromInt(field.value);
+        }
+    }
+    return null;
+}
 
 pub const Headers = struct {
     content_length: usize = 0,
@@ -187,26 +190,24 @@ pub const Headers = struct {
     /// space. Backed by the per-connection arena.
     extras: std.StringHashMapUnmanaged([]const u8) = .{},
 
-    /// True when `Headers.read` was called with `parse_extras = true`.
-    /// Used by `get` to assert in debug builds that the caller didn't
-    /// forget to enable the flag.
+    /// True when `Headers.read` was called with `parse_extras = true`,
+    /// i.e. when `extras` was populated at all.
     parsed_extras: bool = false,
 
-    pub fn free(self: @This(), allocator: std.mem.Allocator) void {
+    pub fn free(self: *@This(), allocator: std.mem.Allocator) void {
         inline for (std.meta.fields(@This())) |field| {
             if (field.type == []const u8) {
-                allocator.free(@field(self, field.name));
+                allocator.free(@field(self.*, field.name));
             }
         }
         // In production `allocator` is an arena (per-connection) and these
         // frees are no-ops; in tests it's the GPA, so they prevent leaks.
-        var mut = self.extras;
-        var it = mut.iterator();
+        var it = self.extras.iterator();
         while (it.next()) |entry| {
             allocator.free(entry.key_ptr.*);
             allocator.free(entry.value_ptr.*);
         }
-        mut.deinit(allocator);
+        self.extras.deinit(allocator);
     }
 
     /// Look up an arbitrary request header by name (case-insensitive).
@@ -214,7 +215,6 @@ pub const Headers = struct {
     /// not enabled. Pre-parsed fields (Host, Content-Type, etc.) are
     /// NOT mirrored here — read them via the typed field instead.
     pub fn get(self: @This(), name: []const u8) ?[]const u8 {
-        std.debug.assert(self.parsed_extras); // enable ListenOptions.parse_extra_headers
         var buf: [128]u8 = undefined;
         if (name.len > buf.len) return null;
         const lower = std.ascii.lowerString(buf[0..name.len], name);
@@ -331,7 +331,7 @@ pub const Request = struct {
 
         const version = try Version.read(reader);
 
-        const headers = try Headers.read(allocator, reader, options.parse_extra_headers);
+        var headers = try Headers.read(allocator, reader, options.parse_extra_headers);
         errdefer headers.free(allocator);
 
         return .{
@@ -346,7 +346,7 @@ pub const Request = struct {
         };
     }
 
-    pub fn deinit(self: @This()) void {
+    pub fn deinit(self: *@This()) void {
         self.allocator.free(self.uri.path);
         self.allocator.free(self.uri.query);
         self.headers.free(self.allocator);
@@ -356,6 +356,9 @@ pub const Request = struct {
         return BodyReader.init(self.allocator, self.headers, self.reader, buffer);
     }
 
+    /// Test-only fixture: a minimal parsed `GET /` request for handler
+    /// and router tests. References `std.testing.allocator`, so it only
+    /// compiles inside test code.
     pub const example: Request = .{
         .version = .HTTP_1_1,
         .method = .GET,
@@ -370,308 +373,6 @@ pub const Request = struct {
 };
 
 var discarding = std.Io.Writer.Discarding.init(&[_]u8{});
-
-test "Parse basic http request with body" {
-    const request = "POST /foo/bar?fuz=baz HTTP/1.1\r\nContent-Type: application/form-data\r\nContent-Length: 9 \r\n\r\nkey=value";
-
-    var reader = std.Io.Reader.fixed(request);
-    var writer = std.Io.Writer.Discarding.init(&[_]u8{});
-
-    const req = try Request.read(testing.allocator, &reader, &writer.writer, .{});
-    defer req.deinit();
-
-    try testing.expectEqual(req.method, .POST);
-    try testing.expectEqualStrings("/foo/bar", req.uri.path);
-    try testing.expectEqualStrings("fuz=baz", req.uri.query);
-    try testing.expectEqualStrings("application/form-data", req.headers.content_type);
-    try testing.expectEqual(9, req.headers.content_length);
-
-    var body_reader = try req.bodyReader(&[0]u8{});
-    var b_reader = body_reader.interface();
-    const body = try b_reader.allocRemaining(testing.allocator, .unlimited);
-    defer testing.allocator.free(body);
-    try testing.expectEqualStrings("key=value", body);
-}
-
-test "Parse http request without body" {
-    const request = "POST /foo/bar?fuz=baz HTTP/1.1\r\nContent-Type: application/form-data\r\nContent-Length: 0 \r\n\r\n";
-
-    var reader = std.Io.Reader.fixed(request);
-    var writer = std.Io.Writer.Discarding.init(&[_]u8{});
-
-    const req = try Request.read(testing.allocator, &reader, &writer.writer, .{});
-    defer req.deinit();
-
-    try testing.expectEqual(req.method, .POST);
-    try testing.expectEqualStrings("/foo/bar", req.uri.path);
-    try testing.expectEqualStrings("fuz=baz", req.uri.query);
-    try testing.expectEqualStrings("application/form-data", req.headers.content_type);
-    try testing.expectEqual(0, req.headers.content_length);
-
-    var body_reader = try req.bodyReader(&[0]u8{});
-    var b_reader = body_reader.interface();
-    const body = try b_reader.allocRemaining(testing.allocator, .unlimited);
-    defer testing.allocator.free(body);
-    try testing.expectEqualStrings("", body);
-}
-
-test "Parse http request without headers, body" {
-    const request = "POST /foo/bar?fuz=baz HTTP/1.1\r\n\r\n";
-
-    var reader = std.Io.Reader.fixed(request);
-    var writer = std.Io.Writer.Discarding.init(&[_]u8{});
-
-    const req = try Request.read(testing.allocator, &reader, &writer.writer, .{});
-    defer req.deinit();
-
-    try testing.expectEqual(req.method, .POST);
-    try testing.expectEqualStrings("/foo/bar", req.uri.path);
-    try testing.expectEqualStrings("fuz=baz", req.uri.query);
-    try testing.expectEqualStrings("", req.headers.content_type);
-    try testing.expectEqual(0, req.headers.content_length);
-
-    var body_reader = try req.bodyReader(&[0]u8{});
-    var b_reader = body_reader.interface();
-    const body = try b_reader.allocRemaining(testing.allocator, .unlimited);
-    defer testing.allocator.free(body);
-    try testing.expectEqualStrings("", body);
-}
-
-test "Parse http request without headers, body and qs" {
-    const request = "POST /foo/bar HTTP/1.1\r\n\r\n";
-
-    var reader = std.Io.Reader.fixed(request);
-    var writer = std.Io.Writer.Discarding.init(&[_]u8{});
-
-    const req = try Request.read(testing.allocator, &reader, &writer.writer, .{});
-    defer req.deinit();
-
-    try testing.expectEqual(req.method, .POST);
-    try testing.expectEqualStrings("/foo/bar", req.uri.path);
-    try testing.expectEqualStrings("", req.uri.query);
-    try testing.expectEqualStrings("", req.headers.content_type);
-    try testing.expectEqual(0, req.headers.content_length);
-}
-
-test "Parse http request with chunked body" {
-    const request = "POST / HTTP/1.1\r\nContent-Type: application/form-data\r\nTransfer-Encoding: chunked \r\n\r\n4\r\nkey=\r\n5\r\nvalue\r\n0\r\n\r\n";
-
-    var reader = std.Io.Reader.fixed(request);
-    var writer = std.Io.Writer.Discarding.init(&[_]u8{});
-
-    const req = try Request.read(testing.allocator, &reader, &writer.writer, .{});
-    defer req.deinit();
-
-    try testing.expectEqual(req.method, .POST);
-    try testing.expectEqualStrings("/", req.uri.path);
-    try testing.expectEqual(.chunked, req.headers.transfer_encoding.?);
-
-    var body_reader = try req.bodyReader(&[0]u8{});
-    var b_reader = body_reader.interface();
-    const body = try b_reader.allocRemaining(testing.allocator, .unlimited);
-    defer testing.allocator.free(body);
-    try testing.expectEqualStrings("key=value", body);
-}
-
-test "Parse http request with extended headers" {
-    const request =
-        "GET /stream HTTP/1.1\r\n" ++
-        "Host: example.com\r\n" ++
-        "User-Agent: test-agent/1.0\r\n" ++
-        "Accept: text/event-stream\r\n" ++
-        "Last-Event-ID: 42\r\n" ++
-        "If-Match: \"etag-one\"\r\n" ++
-        "If-None-Match: \"etag-two\"\r\n" ++
-        "Idempotency-Key: abc-123\r\n" ++
-        "\r\n";
-
-    var reader = std.Io.Reader.fixed(request);
-    var writer = std.Io.Writer.Discarding.init(&[_]u8{});
-
-    const req = try Request.read(testing.allocator, &reader, &writer.writer, .{});
-    defer req.deinit();
-
-    try testing.expectEqualStrings("example.com", req.headers.host);
-    try testing.expectEqualStrings("test-agent/1.0", req.headers.user_agent);
-    try testing.expectEqualStrings("text/event-stream", req.headers.accept);
-    try testing.expectEqualStrings("42", req.headers.last_event_id);
-    try testing.expectEqualStrings("\"etag-one\"", req.headers.if_match);
-    try testing.expectEqualStrings("\"etag-two\"", req.headers.if_none_match);
-    try testing.expectEqualStrings("abc-123", req.headers.idempotency_key);
-}
-
-test "extras: arbitrary headers populated when parse_extras=true" {
-    const request =
-        "GET /x HTTP/1.1\r\n" ++
-        "Host: example.com\r\n" ++
-        "X-Request-ID: abc-123\r\n" ++
-        "X-Forwarded-For: 1.2.3.4\r\n" ++
-        "\r\n";
-
-    var reader = std.Io.Reader.fixed(request);
-    var writer = std.Io.Writer.Discarding.init(&[_]u8{});
-
-    const req = try Request.read(testing.allocator, &reader, &writer.writer, .{ .parse_extra_headers = true });
-    defer req.deinit();
-
-    // Case-insensitive lookup
-    try testing.expectEqualStrings("abc-123", req.headers.get("x-request-id").?);
-    try testing.expectEqualStrings("abc-123", req.headers.get("X-Request-ID").?);
-    try testing.expectEqualStrings("1.2.3.4", req.headers.get("X-Forwarded-For").?);
-
-    // Pre-parsed fields are NOT mirrored into extras
-    try testing.expectEqual(@as(?[]const u8, null), req.headers.get("host"));
-
-    // Missing header returns null
-    try testing.expectEqual(@as(?[]const u8, null), req.headers.get("X-Missing"));
-}
-
-test "extras: empty when parse_extras=false even with custom headers" {
-    const request =
-        "GET /x HTTP/1.1\r\n" ++
-        "Host: example.com\r\n" ++
-        "X-Request-ID: abc-123\r\n" ++
-        "X-Forwarded-For: 1.2.3.4\r\n" ++
-        "\r\n";
-
-    var reader = std.Io.Reader.fixed(request);
-    var writer = std.Io.Writer.Discarding.init(&[_]u8{});
-
-    const req = try Request.read(testing.allocator, &reader, &writer.writer, .{});
-    defer req.deinit();
-
-    try testing.expectEqual(@as(usize, 0), req.headers.extras.count());
-    try testing.expectEqualStrings("example.com", req.headers.host);
-}
-
-test "extras: empty when parse_extras=true and only pre-parsed headers present" {
-    const request =
-        "GET /x HTTP/1.1\r\n" ++
-        "Host: example.com\r\n" ++
-        "Accept: text/html\r\n" ++
-        "\r\n";
-
-    var reader = std.Io.Reader.fixed(request);
-    var writer = std.Io.Writer.Discarding.init(&[_]u8{});
-
-    const req = try Request.read(testing.allocator, &reader, &writer.writer, .{ .parse_extra_headers = true });
-    defer req.deinit();
-
-    try testing.expectEqual(@as(usize, 0), req.headers.extras.count());
-}
-
-test "Parse chunked body with hex chunk sizes" {
-    // Chunk sizes in HTTP are hexadecimal per RFC 7230 §4.1
-    // 'a' = 10 bytes, '5' = 5 bytes
-    const request = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked \r\n\r\na\r\n0123456789\r\n5\r\nabcde\r\n0\r\n\r\n";
-
-    var reader = std.Io.Reader.fixed(request);
-    var writer = std.Io.Writer.Discarding.init(&[_]u8{});
-
-    const req = try Request.read(testing.allocator, &reader, &writer.writer, .{});
-    defer req.deinit();
-
-    var body_reader = try req.bodyReader(&[0]u8{});
-    var b_reader = body_reader.interface();
-    const body = try b_reader.allocRemaining(testing.allocator, .unlimited);
-    defer testing.allocator.free(body);
-    try testing.expectEqualStrings("0123456789abcde", body);
-}
-
-fn buildEncodedRequest(
-    allocator: std.mem.Allocator,
-    plaintext: []const u8,
-    container: std.compress.flate.Container,
-    encoding_header: []const u8,
-) ![]u8 {
-    const cbuf = try allocator.alloc(u8, std.compress.flate.max_window_len);
-    defer allocator.free(cbuf);
-
-    // Compress.init asserts output.buffer.len > 8.
-    var sink = try std.Io.Writer.Allocating.initCapacity(allocator, 4096);
-    defer sink.deinit();
-    var compressor = try std.compress.flate.Compress.init(&sink.writer, cbuf, container, .default);
-    try compressor.writer.writeAll(plaintext);
-    try compressor.finish();
-    const compressed = sink.written();
-
-    var out = try std.Io.Writer.Allocating.initCapacity(allocator, 4096);
-    errdefer out.deinit();
-    try out.writer.print(
-        "POST /upload HTTP/1.1\r\nContent-Length: {d}\r\nContent-Encoding: {s}\r\n\r\n",
-        .{ compressed.len, encoding_header },
-    );
-    try out.writer.writeAll(compressed);
-    return out.toOwnedSlice();
-}
-
-test "Request body decompresses Content-Encoding: gzip" {
-    const plaintext = "Hello, world! This is a test of gzip decompression over HTTP.";
-    const request_bytes = try buildEncodedRequest(testing.allocator, plaintext, .gzip, "gzip");
-    defer testing.allocator.free(request_bytes);
-
-    var reader = std.Io.Reader.fixed(request_bytes);
-    var writer = std.Io.Writer.Discarding.init(&[_]u8{});
-    const req = try Request.read(testing.allocator, &reader, &writer.writer, .{});
-    defer req.deinit();
-
-    try testing.expectEqual(ContentEncoding.gzip, req.headers.content_encoding.?);
-
-    var body_reader = try req.bodyReader(&[0]u8{});
-    defer body_reader.deinit();
-    var b_reader = body_reader.interface();
-    const body = try b_reader.allocRemaining(testing.allocator, .unlimited);
-    defer testing.allocator.free(body);
-    try testing.expectEqualStrings(plaintext, body);
-}
-
-test "Request body decompresses Content-Encoding: deflate" {
-    const plaintext = "deflate (zlib-wrapped) request bodies should round-trip back to plaintext.";
-    // HTTP "deflate" is RFC 1950 zlib-wrapped raw deflate.
-    const request_bytes = try buildEncodedRequest(testing.allocator, plaintext, .zlib, "deflate");
-    defer testing.allocator.free(request_bytes);
-
-    var reader = std.Io.Reader.fixed(request_bytes);
-    var writer = std.Io.Writer.Discarding.init(&[_]u8{});
-    const req = try Request.read(testing.allocator, &reader, &writer.writer, .{});
-    defer req.deinit();
-
-    try testing.expectEqual(ContentEncoding.deflate, req.headers.content_encoding.?);
-
-    var body_reader = try req.bodyReader(&[0]u8{});
-    defer body_reader.deinit();
-    var b_reader = body_reader.interface();
-    const body = try b_reader.allocRemaining(testing.allocator, .unlimited);
-    defer testing.allocator.free(body);
-    try testing.expectEqualStrings(plaintext, body);
-}
-
-test "URI.parse() handles various path formats" {
-    // Path with query
-    const uri1 = try URI.parse(testing.allocator, "/path?query=value");
-    defer testing.allocator.free(uri1.path);
-    defer testing.allocator.free(uri1.query);
-    try testing.expectEqualStrings("/path", uri1.path);
-    try testing.expectEqualStrings("query=value", uri1.query);
-
-    // Path without query
-    const uri2 = try URI.parse(testing.allocator, "/path/to/resource");
-    defer testing.allocator.free(uri2.path);
-    try testing.expectEqualStrings("/path/to/resource", uri2.path);
-    try testing.expectEqualStrings("", uri2.query);
-
-    // Root path
-    const uri3 = try URI.parse(testing.allocator, "/");
-    defer testing.allocator.free(uri3.path);
-    try testing.expectEqualStrings("/", uri3.path);
-
-    // Path with empty query
-    const uri4 = try URI.parse(testing.allocator, "/path?");
-    defer testing.allocator.free(uri4.path);
-    defer testing.allocator.free(uri4.query);
-    try testing.expectEqualStrings("/path", uri4.path);
-    try testing.expectEqualStrings("", uri4.query);
-}
 
 /// A streaming body reader that handles both Content-Length and chunked Transfer-Encoding.
 /// When the request carries `Content-Encoding: gzip|deflate`, `interface()` lazily
@@ -708,8 +409,9 @@ pub const BodyReader = struct {
         // `source.buffer.len >= peek_size`. The user-supplied `buffer`
         // may be empty (some callers pass `&[0]u8{}`), so when an
         // encoding is present we allocate a dedicated inner buffer.
+        const inner_buffer_size = 4 * 1024;
         const inner_buffer: []u8 = if (has_encoding)
-            try allocator.alloc(u8, 4 * 1024)
+            try allocator.alloc(u8, inner_buffer_size)
         else
             buffer;
 
@@ -780,11 +482,11 @@ pub const BodyReader = struct {
     }
 
     fn readChunk(self: *@This()) std.Io.Reader.Error!void {
-        const line0 = self.reader.takeDelimiter('\n') catch return error.ReadFailed;
-        if (line0 == null or line0.?.len == 1) {
+        const maybe_line = self.reader.takeDelimiter('\n') catch return error.ReadFailed;
+        if (maybe_line == null or maybe_line.?.len == 1) {
             return error.EndOfStream;
         }
-        const len = std.fmt.parseInt(usize, line0.?[0 .. line0.?.len - 1], 16) catch 0;
+        const len = std.fmt.parseInt(usize, maybe_line.?[0 .. maybe_line.?.len - 1], 16) catch 0;
         if (len == 0) {
             self.reader.toss(2); // \r\n
             return error.EndOfStream;
@@ -813,10 +515,320 @@ pub const BodyReader = struct {
 };
 
 /// Cap client-controlled bytes destined for a log line so a hostile
-/// request can't flood the log.
-fn truncateForLog(bytes: []const u8) []const u8 {
+/// request can't flood the log; callers pair it with
+/// `std.ascii.hexEscape` so control bytes can't forge log lines.
+pub fn truncateForLog(bytes: []const u8) []const u8 {
     const max_log_bytes = 32;
     return bytes[0..@min(bytes.len, max_log_bytes)];
+}
+
+test "Method.parse accepts every method tag" {
+    inline for (std.meta.fields(Method)) |field| {
+        try testing.expectEqual(@field(Method, field.name), try Method.parse(field.name));
+    }
+    try testing.expectError(error.InvalidHTTPMethod, Method.parse("BREW"));
+}
+
+test "Parse basic http request with body" {
+    const request = "POST /foo/bar?fuz=baz HTTP/1.1\r\nContent-Type: application/form-data\r\nContent-Length: 9 \r\n\r\nkey=value";
+
+    var reader = std.Io.Reader.fixed(request);
+    var writer = std.Io.Writer.Discarding.init(&[_]u8{});
+
+    var req = try Request.read(testing.allocator, &reader, &writer.writer, .{});
+    defer req.deinit();
+
+    try testing.expectEqual(req.method, .POST);
+    try testing.expectEqualStrings("/foo/bar", req.uri.path);
+    try testing.expectEqualStrings("fuz=baz", req.uri.query);
+    try testing.expectEqualStrings("application/form-data", req.headers.content_type);
+    try testing.expectEqual(9, req.headers.content_length);
+
+    var body_reader = try req.bodyReader(&[0]u8{});
+    var b_reader = body_reader.interface();
+    const body = try b_reader.allocRemaining(testing.allocator, .unlimited);
+    defer testing.allocator.free(body);
+    try testing.expectEqualStrings("key=value", body);
+}
+
+test "Parse http request without body" {
+    const request = "POST /foo/bar?fuz=baz HTTP/1.1\r\nContent-Type: application/form-data\r\nContent-Length: 0 \r\n\r\n";
+
+    var reader = std.Io.Reader.fixed(request);
+    var writer = std.Io.Writer.Discarding.init(&[_]u8{});
+
+    var req = try Request.read(testing.allocator, &reader, &writer.writer, .{});
+    defer req.deinit();
+
+    try testing.expectEqual(req.method, .POST);
+    try testing.expectEqualStrings("/foo/bar", req.uri.path);
+    try testing.expectEqualStrings("fuz=baz", req.uri.query);
+    try testing.expectEqualStrings("application/form-data", req.headers.content_type);
+    try testing.expectEqual(0, req.headers.content_length);
+
+    var body_reader = try req.bodyReader(&[0]u8{});
+    var b_reader = body_reader.interface();
+    const body = try b_reader.allocRemaining(testing.allocator, .unlimited);
+    defer testing.allocator.free(body);
+    try testing.expectEqualStrings("", body);
+}
+
+test "Parse http request without headers, body" {
+    const request = "POST /foo/bar?fuz=baz HTTP/1.1\r\n\r\n";
+
+    var reader = std.Io.Reader.fixed(request);
+    var writer = std.Io.Writer.Discarding.init(&[_]u8{});
+
+    var req = try Request.read(testing.allocator, &reader, &writer.writer, .{});
+    defer req.deinit();
+
+    try testing.expectEqual(req.method, .POST);
+    try testing.expectEqualStrings("/foo/bar", req.uri.path);
+    try testing.expectEqualStrings("fuz=baz", req.uri.query);
+    try testing.expectEqualStrings("", req.headers.content_type);
+    try testing.expectEqual(0, req.headers.content_length);
+
+    var body_reader = try req.bodyReader(&[0]u8{});
+    var b_reader = body_reader.interface();
+    const body = try b_reader.allocRemaining(testing.allocator, .unlimited);
+    defer testing.allocator.free(body);
+    try testing.expectEqualStrings("", body);
+}
+
+test "Parse http request without headers, body and qs" {
+    const request = "POST /foo/bar HTTP/1.1\r\n\r\n";
+
+    var reader = std.Io.Reader.fixed(request);
+    var writer = std.Io.Writer.Discarding.init(&[_]u8{});
+
+    var req = try Request.read(testing.allocator, &reader, &writer.writer, .{});
+    defer req.deinit();
+
+    try testing.expectEqual(req.method, .POST);
+    try testing.expectEqualStrings("/foo/bar", req.uri.path);
+    try testing.expectEqualStrings("", req.uri.query);
+    try testing.expectEqualStrings("", req.headers.content_type);
+    try testing.expectEqual(0, req.headers.content_length);
+}
+
+test "Parse http request with chunked body" {
+    const request = "POST / HTTP/1.1\r\nContent-Type: application/form-data\r\nTransfer-Encoding: chunked \r\n\r\n4\r\nkey=\r\n5\r\nvalue\r\n0\r\n\r\n";
+
+    var reader = std.Io.Reader.fixed(request);
+    var writer = std.Io.Writer.Discarding.init(&[_]u8{});
+
+    var req = try Request.read(testing.allocator, &reader, &writer.writer, .{});
+    defer req.deinit();
+
+    try testing.expectEqual(req.method, .POST);
+    try testing.expectEqualStrings("/", req.uri.path);
+    try testing.expectEqual(.chunked, req.headers.transfer_encoding.?);
+
+    var body_reader = try req.bodyReader(&[0]u8{});
+    var b_reader = body_reader.interface();
+    const body = try b_reader.allocRemaining(testing.allocator, .unlimited);
+    defer testing.allocator.free(body);
+    try testing.expectEqualStrings("key=value", body);
+}
+
+test "Parse http request with extended headers" {
+    const request =
+        "GET /stream HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "User-Agent: test-agent/1.0\r\n" ++
+        "Accept: text/event-stream\r\n" ++
+        "Last-Event-ID: 42\r\n" ++
+        "If-Match: \"etag-one\"\r\n" ++
+        "If-None-Match: \"etag-two\"\r\n" ++
+        "Idempotency-Key: abc-123\r\n" ++
+        "\r\n";
+
+    var reader = std.Io.Reader.fixed(request);
+    var writer = std.Io.Writer.Discarding.init(&[_]u8{});
+
+    var req = try Request.read(testing.allocator, &reader, &writer.writer, .{});
+    defer req.deinit();
+
+    try testing.expectEqualStrings("example.com", req.headers.host);
+    try testing.expectEqualStrings("test-agent/1.0", req.headers.user_agent);
+    try testing.expectEqualStrings("text/event-stream", req.headers.accept);
+    try testing.expectEqualStrings("42", req.headers.last_event_id);
+    try testing.expectEqualStrings("\"etag-one\"", req.headers.if_match);
+    try testing.expectEqualStrings("\"etag-two\"", req.headers.if_none_match);
+    try testing.expectEqualStrings("abc-123", req.headers.idempotency_key);
+}
+
+test "extras: arbitrary headers populated when parse_extras=true" {
+    const request =
+        "GET /x HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "X-Request-ID: abc-123\r\n" ++
+        "X-Forwarded-For: 1.2.3.4\r\n" ++
+        "\r\n";
+
+    var reader = std.Io.Reader.fixed(request);
+    var writer = std.Io.Writer.Discarding.init(&[_]u8{});
+
+    var req = try Request.read(testing.allocator, &reader, &writer.writer, .{ .parse_extra_headers = true });
+    defer req.deinit();
+
+    // Case-insensitive lookup
+    try testing.expectEqualStrings("abc-123", req.headers.get("x-request-id").?);
+    try testing.expectEqualStrings("abc-123", req.headers.get("X-Request-ID").?);
+    try testing.expectEqualStrings("1.2.3.4", req.headers.get("X-Forwarded-For").?);
+
+    // Pre-parsed fields are NOT mirrored into extras
+    try testing.expectEqual(@as(?[]const u8, null), req.headers.get("host"));
+
+    // Missing header returns null
+    try testing.expectEqual(@as(?[]const u8, null), req.headers.get("X-Missing"));
+}
+
+test "extras: empty when parse_extras=false even with custom headers" {
+    const request =
+        "GET /x HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "X-Request-ID: abc-123\r\n" ++
+        "X-Forwarded-For: 1.2.3.4\r\n" ++
+        "\r\n";
+
+    var reader = std.Io.Reader.fixed(request);
+    var writer = std.Io.Writer.Discarding.init(&[_]u8{});
+
+    var req = try Request.read(testing.allocator, &reader, &writer.writer, .{});
+    defer req.deinit();
+
+    try testing.expectEqual(@as(usize, 0), req.headers.extras.count());
+    try testing.expectEqualStrings("example.com", req.headers.host);
+}
+
+test "extras: empty when parse_extras=true and only pre-parsed headers present" {
+    const request =
+        "GET /x HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Accept: text/html\r\n" ++
+        "\r\n";
+
+    var reader = std.Io.Reader.fixed(request);
+    var writer = std.Io.Writer.Discarding.init(&[_]u8{});
+
+    var req = try Request.read(testing.allocator, &reader, &writer.writer, .{ .parse_extra_headers = true });
+    defer req.deinit();
+
+    try testing.expectEqual(@as(usize, 0), req.headers.extras.count());
+}
+
+test "Parse chunked body with hex chunk sizes" {
+    // Chunk sizes in HTTP are hexadecimal per RFC 7230 §4.1
+    // 'a' = 10 bytes, '5' = 5 bytes
+    const request = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked \r\n\r\na\r\n0123456789\r\n5\r\nabcde\r\n0\r\n\r\n";
+
+    var reader = std.Io.Reader.fixed(request);
+    var writer = std.Io.Writer.Discarding.init(&[_]u8{});
+
+    var req = try Request.read(testing.allocator, &reader, &writer.writer, .{});
+    defer req.deinit();
+
+    var body_reader = try req.bodyReader(&[0]u8{});
+    var b_reader = body_reader.interface();
+    const body = try b_reader.allocRemaining(testing.allocator, .unlimited);
+    defer testing.allocator.free(body);
+    try testing.expectEqualStrings("0123456789abcde", body);
+}
+
+fn buildEncodedRequest(
+    allocator: std.mem.Allocator,
+    plaintext: []const u8,
+    container: std.compress.flate.Container,
+    encoding_header: []const u8,
+) ![]u8 {
+    const cbuf = try allocator.alloc(u8, std.compress.flate.max_window_len);
+    defer allocator.free(cbuf);
+
+    // Compress.init asserts output.buffer.len > 8.
+    var sink = try std.Io.Writer.Allocating.initCapacity(allocator, 4096);
+    defer sink.deinit();
+    var compressor = try std.compress.flate.Compress.init(&sink.writer, cbuf, container, .default);
+    try compressor.writer.writeAll(plaintext);
+    try compressor.finish();
+    const compressed = sink.written();
+
+    var out = try std.Io.Writer.Allocating.initCapacity(allocator, 4096);
+    errdefer out.deinit();
+    try out.writer.print(
+        "POST /upload HTTP/1.1\r\nContent-Length: {d}\r\nContent-Encoding: {s}\r\n\r\n",
+        .{ compressed.len, encoding_header },
+    );
+    try out.writer.writeAll(compressed);
+    return out.toOwnedSlice();
+}
+
+test "Request body decompresses Content-Encoding: gzip" {
+    const plaintext = "Hello, world! This is a test of gzip decompression over HTTP.";
+    const request_bytes = try buildEncodedRequest(testing.allocator, plaintext, .gzip, "gzip");
+    defer testing.allocator.free(request_bytes);
+
+    var reader = std.Io.Reader.fixed(request_bytes);
+    var writer = std.Io.Writer.Discarding.init(&[_]u8{});
+    var req = try Request.read(testing.allocator, &reader, &writer.writer, .{});
+    defer req.deinit();
+
+    try testing.expectEqual(ContentEncoding.gzip, req.headers.content_encoding.?);
+
+    var body_reader = try req.bodyReader(&[0]u8{});
+    defer body_reader.deinit();
+    var b_reader = body_reader.interface();
+    const body = try b_reader.allocRemaining(testing.allocator, .unlimited);
+    defer testing.allocator.free(body);
+    try testing.expectEqualStrings(plaintext, body);
+}
+
+test "Request body decompresses Content-Encoding: deflate" {
+    const plaintext = "deflate (zlib-wrapped) request bodies should round-trip back to plaintext.";
+    // HTTP "deflate" is RFC 1950 zlib-wrapped raw deflate.
+    const request_bytes = try buildEncodedRequest(testing.allocator, plaintext, .zlib, "deflate");
+    defer testing.allocator.free(request_bytes);
+
+    var reader = std.Io.Reader.fixed(request_bytes);
+    var writer = std.Io.Writer.Discarding.init(&[_]u8{});
+    var req = try Request.read(testing.allocator, &reader, &writer.writer, .{});
+    defer req.deinit();
+
+    try testing.expectEqual(ContentEncoding.deflate, req.headers.content_encoding.?);
+
+    var body_reader = try req.bodyReader(&[0]u8{});
+    defer body_reader.deinit();
+    var b_reader = body_reader.interface();
+    const body = try b_reader.allocRemaining(testing.allocator, .unlimited);
+    defer testing.allocator.free(body);
+    try testing.expectEqualStrings(plaintext, body);
+}
+
+test "URI.parse() handles various path formats" {
+    // Path with query
+    const uri1 = try URI.parse(testing.allocator, "/path?query=value");
+    defer testing.allocator.free(uri1.path);
+    defer testing.allocator.free(uri1.query);
+    try testing.expectEqualStrings("/path", uri1.path);
+    try testing.expectEqualStrings("query=value", uri1.query);
+
+    // Path without query
+    const uri2 = try URI.parse(testing.allocator, "/path/to/resource");
+    defer testing.allocator.free(uri2.path);
+    try testing.expectEqualStrings("/path/to/resource", uri2.path);
+    try testing.expectEqualStrings("", uri2.query);
+
+    // Root path
+    const uri3 = try URI.parse(testing.allocator, "/");
+    defer testing.allocator.free(uri3.path);
+    try testing.expectEqualStrings("/", uri3.path);
+
+    // Path with empty query
+    const uri4 = try URI.parse(testing.allocator, "/path?");
+    defer testing.allocator.free(uri4.path);
+    defer testing.allocator.free(uri4.query);
+    try testing.expectEqualStrings("/path", uri4.path);
+    try testing.expectEqualStrings("", uri4.query);
 }
 
 const std = @import("std");

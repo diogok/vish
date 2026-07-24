@@ -12,6 +12,8 @@ Zig style for this project. Generic conventions first, then the vish-specific la
 | Tagged union tags | `snake_case` | `gzip`, `deflate`, `chunked`                 |
 | Type aliases      | `PascalCase` | `Status`, `Method`, `Version`                |
 
+Exception: `Method` and `Status` tags mirror the HTTP wire format (`GET`, `Not_Found`) — the status reason phrase is derived from the tag name at send time (`_` becomes a space) — so they are deliberately not `snake_case`.
+
 ### Spell out names
 
 Avoid single-letter and cryptic abbreviations. Loop variables should say what they iterate over.
@@ -612,8 +614,8 @@ Inside concrete (fallible) handlers and route methods, `error.Skipped` expresses
 Concrete handlers and route methods may use any error set — `try` freely. What they cannot do is leak an error to the loop: `Handler.wrap`, the routers, and `callOutcome` convert every error into a sent response at the boundary via `errorOutcome`:
 
 - `error.Skipped` → `.skipped` (routing control flow, not a failure)
-- `error.BadRequest` → 400, `error.Unauthorized` → 401, `error.StreamTooLong` → 413
-- everything else → 500
+- `error.BadRequest` → 400, `error.Unauthorized` → 401, `error.StreamTooLong` → 413, `error.Internal` → 500
+- any other error → 500
 
 `HandleError` names the errors with a defined mapping — translate domain errors (e.g. `error.InvalidJson` → `BadRequest`) when a 500 isn't the right answer. Declare `onError(self, err, req, res)` next to `handle` to replace the default mapping (custom error pages).
 

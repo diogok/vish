@@ -1,6 +1,9 @@
-//! Percent-encoding and decoding per RFC 3986. Used for URL components
-//! and `application/x-www-form-urlencoded` payloads.
+//! Percent-encoding and decoding for query strings and
+//! `application/x-www-form-urlencoded` payloads.
 
+/// Percent-encode `reader` into `writer`. Unreserved characters
+/// (letters, digits, `_`, `.`, `-`) pass through; every other byte,
+/// including space and `+`, becomes `%XX`.
 pub fn encode(reader: *std.Io.Reader, writer: *std.Io.Writer) !void {
     while (true) {
         const char = reader.takeByte() catch |err| {
@@ -18,6 +21,8 @@ pub fn encode(reader: *std.Io.Reader, writer: *std.Io.Writer) !void {
     }
 }
 
+/// Decode `%XX` escapes and, per form-urlencoded rules, `+` as space.
+/// Not suitable for URL path components, where a literal `+` is data.
 pub fn decode(reader: *std.Io.Reader, writer: *std.Io.Writer) !void {
     while (true) {
         const char = reader.takeByte() catch |err| {

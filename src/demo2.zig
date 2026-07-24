@@ -18,9 +18,7 @@ fn run(init: std.process.Init) !void {
     defer server.deinit();
     try server.listen();
 
-    var struct_handler = vish.utils.router.StructRouter(MyHandler).init(.{
-        .allocator = allocator,
-    });
+    var struct_handler = vish.utils.router.StructRouter(MyHandler).init(.{});
     var static_handler = vish.utils.router.StaticRouter(assets).init(io);
     var combined_handlers = vish.utils.router.CombinedRouter.init(&.{
         struct_handler.interface(),
@@ -37,8 +35,6 @@ fn run(init: std.process.Init) !void {
 }
 
 pub const MyHandler = struct {
-    allocator: std.mem.Allocator,
-
     pub fn @"GET /"(
         _: @This(),
         _: vish.Request,
@@ -59,7 +55,7 @@ pub const MyHandler = struct {
     }
 
     pub fn @"GET /hello"(
-        self: @This(),
+        _: @This(),
         req: vish.Request,
         res: *vish.Response,
     ) !void {
@@ -69,20 +65,20 @@ pub const MyHandler = struct {
         var params = Params{};
         var query_reader = std.Io.Reader.fixed(req.uri.query);
 
+        // Everything below allocates from the per-request arena: no
+        // frees needed, memory is reclaimed when the request ends.
         vish.utils.formdata.readFormdata(
-            self.allocator,
+            req.allocator,
             &query_reader,
             &params,
         ) catch |err| {
             log.warn("error reading query string: {t}", .{err});
         };
 
-        var greeting = std.Io.Writer.Allocating.init(self.allocator);
-        defer greeting.deinit();
+        var greeting = std.Io.Writer.Allocating.init(req.allocator);
 
         _ = try greeting.writer.write("Hello, ");
         if (params.name) |name| {
-            defer self.allocator.free(name);
             _ = try greeting.writer.write(name);
         } else {
             _ = try greeting.writer.write("nameless");
@@ -94,7 +90,7 @@ pub const MyHandler = struct {
     }
 
     pub fn @"POST /hello"(
-        self: @This(),
+        _: @This(),
         req: vish.Request,
         res: *vish.Response,
     ) !void {
@@ -106,19 +102,17 @@ pub const MyHandler = struct {
         var body_reader = try req.bodyReader(&buf);
 
         vish.utils.formdata.readFormdata(
-            self.allocator,
+            req.allocator,
             body_reader.interface(),
             &params,
         ) catch |err| {
             log.warn("error reading body: {t}", .{err});
         };
 
-        var greeting = std.Io.Writer.Allocating.init(self.allocator);
-        defer greeting.deinit();
+        var greeting = std.Io.Writer.Allocating.init(req.allocator);
 
         _ = try greeting.writer.write("Hello, ");
         if (params.name) |name| {
-            defer self.allocator.free(name);
             _ = try greeting.writer.write(name);
         } else {
             _ = try greeting.writer.write("nameless");

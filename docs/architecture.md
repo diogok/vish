@@ -18,7 +18,8 @@ src/
 ├── loop/
 │   ├── loop.zig     — multi-task accept + worker loop, idle timeout babysitter
 │   ├── handler.zig  — Handler vtable interface and `wrap(T)` helper
-│   └── signal.zig   — SIGINT/SIGHUP -> std.Io.Event for graceful shutdown
+│   └── signal.zig   — SIGINT/SIGTERM/SIGHUP -> std.Io.Event for graceful
+│                      shutdown
 ├── utils/
 │   ├── root.zig     — utils namespace; registers submodule tests
 │   ├── router.zig   — StructRouter, PrefixRouter, CombinedRouter, StaticRouter

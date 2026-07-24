@@ -105,8 +105,8 @@ pub fn addStaticAssets(
 
     // Collect file paths from the asset directory
     var file_list: std.ArrayListUnmanaged([]const u8) = .empty;
-    var abs_dir = std.Io.Dir.cwd().openDir(io, b.pathFromRoot(dir), .{ .iterate = true }) catch
-        @panic("failed to open asset directory");
+    var abs_dir = std.Io.Dir.cwd().openDir(io, b.pathFromRoot(dir), .{ .iterate = true }) catch |err|
+        std.debug.panic("failed to open asset directory '{s}': {t}", .{ b.pathFromRoot(dir), err });
     defer abs_dir.close(io);
     collectFiles(io, b.allocator, abs_dir, "", &file_list);
 
@@ -167,6 +167,8 @@ pub fn addStaticAssets(
     });
 }
 
+// Failures panic rather than skip: a silently half-empty asset table
+// would only surface as unexplained 404s at runtime.
 fn collectFiles(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -175,16 +177,19 @@ fn collectFiles(
     list: *std.ArrayList([]const u8),
 ) void {
     var iter = base_dir.iterate();
-    while (iter.next(io) catch null) |entry| {
+    while (iter.next(io) catch |err|
+        std.debug.panic("failed to iterate asset directory '{s}': {t}", .{ prefix, err })) |entry|
+    {
         const name = if (prefix.len > 0)
-            std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, entry.name }) catch continue
+            std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, entry.name }) catch @panic("OOM")
         else
-            allocator.dupe(u8, entry.name) catch continue;
+            allocator.dupe(u8, entry.name) catch @panic("OOM");
 
         switch (entry.kind) {
-            .file => list.append(allocator, name) catch {},
+            .file => list.append(allocator, name) catch @panic("OOM"),
             .directory => {
-                var sub = base_dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
+                var sub = base_dir.openDir(io, entry.name, .{ .iterate = true }) catch |err|
+                    std.debug.panic("failed to open asset directory '{s}': {t}", .{ name, err });
                 defer sub.close(io);
                 collectFiles(io, allocator, sub, name, list);
             },

@@ -44,12 +44,14 @@ pub const Common = struct {
         else
             "-";
 
-        const fmt = "{s} - - [{s}] \"{s} {s} {s}\" {d} {s}\n";
+        // `req.uri.path` is client-controlled: cap and escape it so a
+        // path with CR/LF or control bytes can't forge log lines.
+        const fmt = "{s} - - [{s}] \"{s} {f} {s}\" {d} {s}\n";
         const args = .{
             host,
             date,
             req.method.string(),
-            req.uri.path,
+            std.ascii.hexEscape(request.truncateForLog(req.uri.path), .lower),
             req.version.string(),
             status,
             length,
@@ -64,13 +66,17 @@ pub const Common = struct {
         // Streaming, not positional: a positional writer starts at
         // offset 0 every request, so with stdout redirected to a file
         // each line would overwrite the previous one.
-        var stdout_buffer: [1024]u8 = undefined;
+        const stdout_buffer_size = 1024;
+        var stdout_buffer: [stdout_buffer_size]u8 = undefined;
         var stdout_writer = std.Io.File.stdout().writerStreaming(self.io, &stdout_buffer);
         const stdout = &stdout_writer.interface;
 
         stdout.print(fmt, args) catch {};
 
-        if (!@import("builtin").is_test) {
+        // Under the test runner the line stays in the local buffer and is
+        // never flushed, so tests exercise this path without writing to
+        // the runner's stdout.
+        if (!builtin.is_test) {
             stdout.flush() catch {};
         }
 
@@ -175,9 +181,11 @@ test "formatHost" {
     try testing.expectEqualStrings("2001:db8::1", formatHost(&buffer, ip6));
 }
 
+const builtin = @import("builtin");
 const std = @import("std");
 const testing = std.testing;
 
+const request = @import("../http/request.zig");
 const Request = @import("../http/request.zig").Request;
 const Response = @import("../http/response.zig").Response;
 const Status = @import("../http/response.zig").Status;

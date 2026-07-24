@@ -3,30 +3,33 @@
 //! `CombinedRouter` (try a chain of handlers), `StaticRouter` (serve a
 //! comptime asset map).
 
-/// Provider a Handler for a Router where each route pattern is a struct method.
+/// Provides a `Handler` that routes each request to the struct method
+/// named `"<METHOD> <PATH>"` matching it.
 /// Example:
 /// ```
 /// const MyRouter = struct {
-///   pub fn "GET /"(self: @This(), request: Request, response: *Response) !void {}
-///   pub fn "POST /hello/?"(self: @This(), request: Request, response: *Response) !void {}
+///   pub fn @"GET /"(self: @This(), request: Request, response: *Response) !void {}
+///   pub fn @"POST /hello/?"(self: @This(), request: Request, response: *Response) !void {}
 /// };
 /// ```
 pub fn StructRouter(comptime HandlerType: type) type {
     return struct {
         handler: HandlerType,
 
-        pub fn init(handler: HandlerType) @This() {
+        const Self = @This();
+
+        pub fn init(handler: HandlerType) Self {
             return .{ .handler = handler };
         }
 
-        pub fn route(self: @This(), req: Request, res: *Response) Outcome {
+        pub fn route(self: Self, req: Request, res: *Response) Outcome {
             var path = req.uri.path;
             if (path.len == 0) {
                 path = "/";
             }
 
-            const typeInfo = @typeInfo(HandlerType);
-            inline for (typeInfo.@"struct".decls) |decl| {
+            const type_info = @typeInfo(HandlerType);
+            inline for (type_info.@"struct".decls) |decl| {
                 const sep = comptime std.mem.indexOf(u8, decl.name, " ");
                 if (sep == null) {
                     continue;
@@ -39,9 +42,9 @@ pub fn StructRouter(comptime HandlerType: type) type {
                 const fn_method = comptime decl.name[0..sep.?];
                 const fn_path = comptime decl.name[sep.? + 1 ..];
 
-                const hasMatching = comptime std.mem.indexOf(u8, fn_path, "?") != null;
+                const has_matching = comptime std.mem.indexOf(u8, fn_path, "?") != null;
 
-                if (hasMatching) {
+                if (has_matching) {
                     const maybe_matches = checkMatch(fn_path, path);
                     if (maybe_matches) |matches| {
                         if (std.mem.eql(u8, fn_method, @tagName(req.method))) {
@@ -64,7 +67,7 @@ pub fn StructRouter(comptime HandlerType: type) type {
             return .skipped;
         }
 
-        pub fn interface(self: *@This()) Handler {
+        pub fn interface(self: *Self) Handler {
             return .{
                 .ptr = self,
                 .vtable = &.{ .handle = handle },
@@ -72,7 +75,7 @@ pub fn StructRouter(comptime HandlerType: type) type {
         }
 
         fn handle(h: Handler, req: Request, res: *Response) Outcome {
-            const self: *@This() = @ptrCast(@alignCast(h.ptr));
+            const self: *Self = @ptrCast(@alignCast(h.ptr));
             return self.route(req, res);
         }
     };
@@ -175,7 +178,7 @@ test "struct router maps route errors to responses" {
     try testing.expectEqualStrings("HTTP/1.1 400 Bad Request\r\n\r\n", content);
 }
 
-/// Routes to a handler if the URI perfix matches.
+/// Routes to a handler if the URI prefix matches.
 pub const PrefixRouter = struct {
     prefix: []const u8,
     handler: Handler,
@@ -192,18 +195,10 @@ pub const PrefixRouter = struct {
             return .skipped;
         }
 
-        const req = Request{
-            .method = src_req.method,
-            .headers = src_req.headers,
-            .version = src_req.version,
-            .uri = .{
-                .path = src_req.uri.path[self.prefix.len..],
-                .query = src_req.uri.query,
-            },
-            .reader = src_req.reader,
-            .writer = src_req.writer,
-            .allocator = src_req.allocator,
-        };
+        // Copy the whole request so every field (client_address, and any
+        // added later) survives; only the path is rewritten.
+        var req = src_req;
+        req.uri.path = src_req.uri.path[self.prefix.len..];
         return self.handler.handle(req, res);
     }
 
@@ -381,30 +376,27 @@ fn checkMatch(comptime src_route: []const u8, src_path: []const u8) ?[paramsLen(
         return params;
     }
 
-    const route_len: usize = comptime countSlashes(route);
-    const path_len: usize = countSlashes(path);
+    const route_segments: usize = comptime countSlashes(route);
+    const path_segments: usize = countSlashes(path);
 
-    if (path_len != route_len) {
+    if (path_segments != route_segments) {
         return null;
     }
-    if (route_len == 0) {
-        return params;
-    }
-    if (params.len == 0) {
+    if (route_segments == 0) {
         return params;
     }
 
-    const route_parts: [route_len][]const u8 = comptime splitSegments(route_len, route);
-    const req_parts: [route_len][]const u8 = splitSegments(route_len, path);
+    const route_parts: [route_segments][]const u8 = comptime splitSegments(route_segments, route);
+    const req_parts: [route_segments][]const u8 = splitSegments(route_segments, path);
 
-    var count: usize = 0;
-    var i: usize = 0;
-    while (i < route_len) : (i += 1) {
-        const route_part = route_parts[i];
-        const req_part = req_parts[i];
-        if (std.mem.eql(u8, route_part, "?")) {
+    // `route_parts` is comptime-known, so the `?`-store branch is only
+    // instantiated for wildcard segments — a literal-only route (whose
+    // `params` array is zero-length) compiles down to pure comparisons.
+    comptime var count: usize = 0;
+    inline for (route_parts, req_parts) |route_part, req_part| {
+        if (comptime std.mem.eql(u8, route_part, "?")) {
             params[count] = req_part;
-            count += 1;
+            comptime count += 1;
         } else if (!std.mem.eql(u8, route_part, req_part)) {
             return null;
         }
@@ -460,6 +452,13 @@ test "matching paths" {
     const m9 = checkMatch("/foo/?/baz", "/foo/bar/baz");
     try testing.expect(m9 != null);
     try testing.expectEqualStrings(m9.?[0], "bar");
+
+    // Literal-only routes must compare every segment, not just counts.
+    const m10 = checkMatch("/foo/bar", "/baz/qux");
+    try testing.expect(m10 == null);
+
+    const m11 = checkMatch("/foo/bar", "/foo/qux");
+    try testing.expect(m11 == null);
 }
 
 /// Serves static assets using a comptime `Assets` module (e.g. one
@@ -479,11 +478,13 @@ pub fn StaticRouter(comptime Assets: type) type {
     return struct {
         io: std.Io,
 
-        pub fn init(io: std.Io) @This() {
+        const Self = @This();
+
+        pub fn init(io: std.Io) Self {
             return .{ .io = io };
         }
 
-        pub fn route(self: @This(), req: Request, res: *Response) Outcome {
+        pub fn route(self: Self, req: Request, res: *Response) Outcome {
             if (req.method != .GET) return .skipped;
 
             const path = std.mem.trimStart(u8, req.uri.path, "/");
@@ -504,7 +505,7 @@ pub fn StaticRouter(comptime Assets: type) type {
             return .handled;
         }
 
-        pub fn interface(self: *@This()) Handler {
+        pub fn interface(self: *Self) Handler {
             return .{
                 .ptr = self,
                 .vtable = &.{ .handle = handle },
@@ -512,7 +513,7 @@ pub fn StaticRouter(comptime Assets: type) type {
         }
 
         fn handle(h: Handler, req: Request, res: *Response) Outcome {
-            const self: *@This() = @ptrCast(@alignCast(h.ptr));
+            const self: *Self = @ptrCast(@alignCast(h.ptr));
             return self.route(req, res);
         }
     };

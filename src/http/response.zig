@@ -3,6 +3,10 @@
 //! `headers.content_encoding` for buffered gzip/deflate compression on
 //! `send()`.
 
+/// Response status codes. Tag names are wire-visible: `sendStatus`
+/// derives the reason phrase from the tag by replacing `_` with a space
+/// (`Not_Found` → `404 Not Found`), so renaming a tag changes the
+/// status line on the wire.
 pub const Status = enum(u16) {
     OK = 200,
     Moved_Permanently = 301,
@@ -28,13 +32,17 @@ pub const Status = enum(u16) {
     Too_Many_Requests = 429,
     Internal_Server_Error = 500,
     Service_Unavailable = 503,
-    // TODO: rest of standard codes
+    // TODO(diogok): rest of standard codes
 
     pub fn int(self: @This()) u16 {
         return @intFromEnum(self);
     }
 };
 
+/// Response-side `Connection` header value. Kept in lockstep with
+/// `request.Connection` — same tags, same order, same values — because
+/// `Response.fromRequest` converts between the two with
+/// `@enumFromInt(@intFromEnum(...))`.
 pub const Connection = enum(u1) {
     keep_alive = 0,
     close = 1,
@@ -127,8 +135,6 @@ pub const Response = struct {
     /// connection when it is set.
     failed: bool = false,
 
-    buffer: [9]u8 = undefined,
-
     writer: *std.Io.Writer,
 
     /// Per-request allocator (typically the connection arena). Required
@@ -139,6 +145,8 @@ pub const Response = struct {
     /// Create a response pre-configured from the request.
     /// Copies the HTTP version and Connection header from the request.
     pub fn fromRequest(src: Request) @This() {
+        // Tag-value cast between the two Connection enums; see the
+        // lockstep invariant documented on `Connection` above.
         const conn: ?Connection = if (src.headers.connection) |conn| @enumFromInt(@intFromEnum(conn)) else null;
         return .{
             .version = src.version,
@@ -189,16 +197,20 @@ pub const Response = struct {
         }
     }
 
-    /// Compress `self.body` in place. `self.body` is replaced with an
-    /// arena-allocated compressed buffer; `Content-Length` is set to
-    /// the compressed size. Requires `self.allocator` to be set
-    /// (always true when constructed via `fromRequest`).
+    /// Compress `self.body` in place. `self.body` is replaced with a
+    /// compressed buffer allocated from `self.allocator` (the caller
+    /// owns it: the per-request arena in production); `Content-Length`
+    /// is set to the compressed size. Requires `self.allocator` to be
+    /// set (always true when constructed via `fromRequest`).
     fn compressBody(self: *@This(), enc: ContentEncoding) !void {
         const allocator = self.allocator.?;
         const work_buf = try allocator.alloc(u8, std.compress.flate.max_window_len);
+        defer allocator.free(work_buf);
         // Sink must satisfy Compress.init's `output.buffer.len > 8` assert.
         var sink = try std.Io.Writer.Allocating.initCapacity(allocator, 4 * 1024);
-        // Note: do not sink.deinit() — we hand its buffer off via toOwnedSlice.
+        // No-op after toOwnedSlice below; frees the partial buffer on
+        // the error paths.
+        defer sink.deinit();
         var compressor = try std.compress.flate.Compress.init(
             &sink.writer,
             work_buf,
@@ -210,14 +222,22 @@ pub const Response = struct {
         const compressed = try sink.toOwnedSlice();
         self.body = compressed;
         self.headers.content_length = compressed.len;
-        // `work_buf` is arena-owned; no explicit free needed in production.
-        // In tests with a non-arena allocator the caller must reset/free.
     }
+
+    /// Longest `Status` tag name; sizes the stack buffer `sendStatus`
+    /// expands the reason phrase into.
+    const max_status_tag_len = blk: {
+        var longest: usize = 0;
+        for (std.meta.fields(Status)) |field| {
+            longest = @max(longest, field.name.len);
+        }
+        break :blk longest;
+    };
 
     fn sendStatus(
         self: *@This(),
     ) !void {
-        var code_txt: [24]u8 = undefined;
+        var code_txt: [max_status_tag_len]u8 = undefined;
         _ = std.mem.replace(u8, @tagName(self.status), "_", " ", &code_txt);
         const code_name = code_txt[0..@tagName(self.status).len];
 
@@ -239,26 +259,26 @@ pub const Response = struct {
             self.headers.content_length = self.body.len;
         }
         inline for (std.meta.fields(Headers)) |field| {
-            const headerName = comptime capitalize(field.name);
+            const header_name = comptime capitalize(field.name);
             if (field.type == []const u8) {
                 if (@field(self.headers, field.name).len > 0) {
-                    try self.sendHeader(self.writer, &headerName, @field(self.headers, field.name));
+                    try self.sendHeader(self.writer, &header_name, @field(self.headers, field.name));
                 }
             } else if (field.type == ?Connection) {
                 if (@field(self.headers, field.name)) |conn| {
-                    try self.sendHeader(self.writer, &headerName, conn.getValue());
+                    try self.sendHeader(self.writer, &header_name, conn.getValue());
                 }
             } else if (field.type == ?TransferEncoding) {
                 if (@field(self.headers, field.name)) |te| {
-                    try self.sendHeader(self.writer, &headerName, te.getValue());
+                    try self.sendHeader(self.writer, &header_name, te.getValue());
                 }
             } else if (field.type == ?ContentEncoding) {
                 if (@field(self.headers, field.name)) |ce| {
-                    try self.sendHeader(self.writer, &headerName, ce.getValue());
+                    try self.sendHeader(self.writer, &header_name, ce.getValue());
                 }
             } else if (field.type == ?usize) {
                 if (@field(self.headers, field.name)) |val| {
-                    try self.writer.print("{s}: {d}\r\n", .{ &headerName, val });
+                    try self.writer.print("{s}: {d}\r\n", .{ &header_name, val });
                 }
             }
         }
@@ -443,6 +463,31 @@ pub const Response = struct {
     }
 };
 
+/// Comptime kebab-case-and-capitalize for wire header names:
+/// `content_length` → `Content-Length`.
+fn capitalize(comptime name: []const u8) [name.len]u8 {
+    var tmp: [name.len]u8 = undefined;
+    var cap = true;
+    for (name, 0..) |b, i| {
+        if (b == '_') {
+            tmp[i] = '-';
+            cap = true;
+        } else {
+            if (cap) {
+                tmp[i] = std.ascii.toUpper(b);
+                cap = false;
+            } else {
+                tmp[i] = b;
+            }
+        }
+    }
+    return tmp;
+}
+
+test "capitalize" {
+    try testing.expectEqualStrings("Content-Length", &capitalize("content_length"));
+}
+
 test "basic response writing" {
     var buffer: [4 * 1024]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
@@ -498,29 +543,6 @@ test "chunked response sizes are hex per RFC 7230" {
             "0\r\n\r\n",
         content,
     );
-}
-
-fn capitalize(comptime name: []const u8) [name.len]u8 {
-    var tmp: [name.len]u8 = undefined;
-    var cap = true;
-    for (name, 0..) |b, i| {
-        if (b == '_') {
-            tmp[i] = '-';
-            cap = true;
-        } else {
-            if (cap) {
-                tmp[i] = std.ascii.toUpper(b);
-                cap = false;
-            } else {
-                tmp[i] = b;
-            }
-        }
-    }
-    return tmp;
-}
-
-test "capitalize" {
-    try testing.expectEqualStrings("Content-Length", &capitalize("content_length"));
 }
 
 test "multiple chunks in chunked response" {

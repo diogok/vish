@@ -34,7 +34,11 @@ pub const MyHandler = struct {
         req: vish.Request,
         res: *vish.Response,
     ) void {
-        log.debug("Request: {s} {s}", .{ req.method.string(), req.uri.path });
+        // The path is client-controlled: cap and escape it so a hostile
+        // request can't forge or flood log lines.
+        const max_logged_path_bytes = 32;
+        const path = req.uri.path[0..@min(req.uri.path.len, max_logged_path_bytes)];
+        log.debug("Request: {s} {f}", .{ req.method.string(), std.ascii.hexEscape(path, .lower) });
 
         res.body = "hello";
 

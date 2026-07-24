@@ -118,9 +118,7 @@ pub const Loop = struct {
             // Race the wait-for-next-request against an idle deadline.
             // The deadline only guards the wait — once the first byte of
             // the next request arrives, the deadline is cancelled and
-            // the rest of the parse runs without one. This matches the
-            // shape `io.concurrentTimeout` will eventually provide; for
-            // now we approximate with an explicit babysitter task.
+            // the rest of the parse runs without one.
             if (!self.waitForNextRequest(&conn)) return;
 
             const request = conn.next() catch |err| {
@@ -190,7 +188,8 @@ pub const Loop = struct {
     ) enum { close, keep } {
         // Log the request line only: `{any}` on the full struct would
         // dump headers (Authorization, Cookie) and buffered body bytes.
-        log.debug("Request: {s} {s}", .{ req.method.string(), req.uri.path });
+        // The path is client-controlled, so cap and escape it.
+        log.debug("Request: {s} {f}", .{ req.method.string(), std.ascii.hexEscape(truncateForLog(req.uri.path), .lower) });
 
         var res = http.Response.fromRequest(req);
 
@@ -550,6 +549,7 @@ const std = @import("std");
 const testing = std.testing;
 
 const http = @import("../http/server.zig");
+const truncateForLog = @import("../http/request.zig").truncateForLog;
 
 const Handler = @import("handler.zig").Handler;
 const HandlerError = @import("handler.zig").Error;

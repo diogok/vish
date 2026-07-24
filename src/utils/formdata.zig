@@ -1,6 +1,7 @@
 //! `application/x-www-form-urlencoded` parser. Reads `key=value&...`
 //! pairs into matching fields of a struct (`?[]const u8` or
-//! `[]const u8`); URL-decoded values are arena-allocated.
+//! `[]const u8`); URL-decoded values are allocated from the caller's
+//! allocator (handlers: pass `req.allocator` for per-request lifetime).
 
 /// Read URL-encoded pairs from `reader` into matching fields of `target`.
 /// Unknown keys are skipped. Decoded values are allocated from `allocator`.

@@ -3,13 +3,23 @@
 
 var state: struct {
     event: std.Io.Event = .unset,
-    io: ?std.Io = null,
+    // Signal handlers read the `Io` through this atomic pointer, never
+    // directly: `io_storage` is multi-word, so an unsynchronized read
+    // from a handler could observe a torn value.
+    io: std.atomic.Value(?*const std.Io) = .init(null),
+    io_storage: std.Io = undefined,
     last_signo: std.atomic.Value(u32) = .init(0),
 } = .{};
 
-/// Wait on default interrupt (INT, TERM, or HUP) signals.
+/// Single waiter only: signal registration and the wakeup event live in
+/// module-global state, so a second call overwrites the first caller's
+/// registration.
 pub fn wait(io: std.Io) void {
-    state.io = io;
+    // Fill the storage, then publish, then register the handlers — a
+    // signal arriving mid-registration sees either null (no waiter yet)
+    // or a fully written `Io`.
+    state.io_storage = io;
+    state.io.store(&state.io_storage, .release);
 
     if (builtin.os.tag == .windows) {
         _ = SetConsoleCtrlHandler(receiveWindows, .TRUE);
@@ -36,12 +46,12 @@ pub fn wait(io: std.Io) void {
 
 fn receive(sig: std.posix.SIG) callconv(.c) void {
     state.last_signo.store(@intFromEnum(sig), .release);
-    if (state.io) |io| state.event.set(io);
+    if (state.io.load(.acquire)) |io| state.event.set(io.*);
 }
 
 fn receiveWindows(ctrl_type: windows.DWORD) callconv(.winapi) windows.BOOL {
     state.last_signo.store(ctrl_type, .release);
-    if (state.io) |io| state.event.set(io);
+    if (state.io.load(.acquire)) |io| state.event.set(io.*);
     return .TRUE;
 }
 

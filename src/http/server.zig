@@ -93,7 +93,7 @@ pub const Server = struct {
         return null;
     }
 
-    pub fn getAddressStringAlloc(self: *@This(), allocator: std.mem.Allocator) !?[]const u8 {
+    pub fn getAddressStringAlloc(self: @This(), allocator: std.mem.Allocator) !?[]const u8 {
         if (self.getAddress()) |addr| {
             var alloc_writer = std.Io.Writer.Allocating.init(allocator);
             defer alloc_writer.deinit();
@@ -193,7 +193,6 @@ pub const Connection = struct {
 const log = std.log.scoped(.vish);
 
 const std = @import("std");
-const testing = std.testing;
 
 const socket = @import("socket.zig");
 
