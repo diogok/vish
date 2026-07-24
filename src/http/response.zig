@@ -224,31 +224,23 @@ pub const Response = struct {
         self.headers.content_length = compressed.len;
     }
 
-    /// Longest `Status` tag name; sizes the stack buffer `sendStatus`
-    /// expands the reason phrase into.
-    const max_status_tag_len = blk: {
-        var longest: usize = 0;
-        for (std.meta.fields(Status)) |field| {
-            longest = @max(longest, field.name.len);
+    /// Comptime-rendered ` <code> <reason>\r\n` status-line suffix,
+    /// derived from the tag name (`Not_Found` → ` 404 Not Found\r\n`).
+    fn statusSuffix(status: Status) []const u8 {
+        switch (status) {
+            inline else => |s| return comptime blk: {
+                var reason: [@tagName(s).len]u8 = undefined;
+                _ = std.mem.replace(u8, @tagName(s), "_", " ", &reason);
+                break :blk std.fmt.comptimePrint(" {d} {s}\r\n", .{ @intFromEnum(s), reason[0..] });
+            },
         }
-        break :blk longest;
-    };
+    }
 
     fn sendStatus(
         self: *@This(),
     ) !void {
-        var code_txt: [max_status_tag_len]u8 = undefined;
-        _ = std.mem.replace(u8, @tagName(self.status), "_", " ", &code_txt);
-        const code_name = code_txt[0..@tagName(self.status).len];
-
-        try self.writer.print(
-            "{s} {d} {s}\r\n",
-            .{
-                self.version.string(),
-                self.status.int(),
-                code_name,
-            },
-        );
+        try self.writer.writeAll(self.version.string());
+        try self.writer.writeAll(statusSuffix(self.status));
         self.sent_status = true;
     }
 

@@ -16,7 +16,7 @@ src/
 │   │                  SSE, gzip/deflate)
 │   └── socket.zig   — TCP keep-alive / no-delay socket option setters
 ├── loop/
-│   ├── loop.zig     — multi-task accept + worker loop, idle timeout babysitter
+│   ├── loop.zig     — multi-task accept + worker loop, idle timeout
 │   ├── handler.zig  — Handler vtable interface and `wrap(T)` helper
 │   └── signal.zig   — SIGINT/SIGTERM/SIGHUP -> std.Io.Event for graceful
 │                      shutdown
@@ -60,7 +60,7 @@ Built on the Zig `std.Io` rework. There is no thread pool managed by this librar
 - **Accept task**: spawned via `accept_group.concurrent`. Loops on `server.accept()` and hands each connection to `worker_group.concurrent`.
 - **Workers**: one task per TCP connection. Process keep-alive requests in a loop until the client closes, the idle deadline fires, or `Loop.stop()` is called.
 - **Backpressure**: if `worker_group.concurrent` returns `error.ConcurrencyUnavailable`, the connection is handled inline on the accept task. This blocks the accept loop until the connection finishes, applying natural backpressure rather than dropping connections.
-- **Idle timeout**: implemented as a "babysitter" task that sleeps for `idle_timeout_in_millis` and shuts the stream down if not cancelled first. Only the wait-for-first-byte phase is timed; once a request starts arriving the babysitter is cancelled.
+- **Idle timeout**: implemented as a peek-with-timeout on the socket (`Socket.receiveManyTimeout` with `MSG_PEEK`, a non-blocking receive plus a `poll` under the default `Io`) while waiting for the first byte of the next request. Only the wait-for-first-byte phase is timed; once a request starts arriving it parses without a deadline.
 
 ## Request lifecycle
 

@@ -115,10 +115,9 @@ pub const Loop = struct {
 
         log.debug("Connection started", .{});
         while (self.active) {
-            // Race the wait-for-next-request against an idle deadline.
-            // The deadline only guards the wait — once the first byte of
-            // the next request arrives, the deadline is cancelled and
-            // the rest of the parse runs without one.
+            // The idle deadline only guards the wait for the first byte
+            // of the next request — once it arrives, the rest of the
+            // parse runs without one.
             if (!self.waitForNextRequest(&conn)) return;
 
             const request = conn.next() catch |err| {
@@ -143,37 +142,36 @@ pub const Loop = struct {
         const idle_ms = conn.server.options.idle_timeout_in_millis;
         const reader = &conn.net_reader.interface;
 
-        if (idle_ms == 0) {
-            // No deadline — block on first byte indefinitely.
-            reader.fill(1) catch return false;
-            return true;
+        // Pipelined requests may already be buffered — nothing to wait for.
+        if (reader.bufferedLen() > 0) return true;
+
+        if (idle_ms != 0) {
+            // Wait for the first byte under the idle deadline, peeking so
+            // the byte stays in the socket for the parser to consume.
+            var peek_buf: [1]u8 = undefined;
+            var messages: [1]std.Io.net.IncomingMessage = .{.init};
+            const maybe_err, _ = conn.stream.socket.receiveManyTimeout(
+                self.io,
+                &messages,
+                &peek_buf,
+                .{ .peek = true },
+                .{ .duration = .{ .raw = .fromMilliseconds(idle_ms), .clock = .awake } },
+            );
+            if (maybe_err) |err| switch (err) {
+                // Idle deadline elapsed with no next request: reap.
+                error.Timeout => return false,
+                // The Io implementation can't wait with a timeout; fall
+                // through to a blocking wait without a deadline.
+                error.ConcurrencyUnavailable => {
+                    log.warn("idle deadline unavailable for this cycle", .{});
+                },
+                // Reset, canceled, or otherwise dead: close.
+                else => return false,
+            };
         }
 
-        // Spawn a babysitter that shuts the stream down after idle_ms.
-        // `concurrent` (not `async`) — under saturation `async` would
-        // run the babysitter inline on this thread, which would block
-        // before we ever reached `fill(1)`.
-        var babysitter: std.Io.Group = .init;
-        var armed = false;
-        const stream = conn.stream;
-        if (babysitter.concurrent(self.io, idleBabysitter, .{ self.io, stream, idle_ms })) {
-            armed = true;
-        } else |err| switch (err) {
-            error.ConcurrencyUnavailable => {
-                log.warn("idle deadline unavailable for this cycle", .{});
-            },
-        }
-
-        const have_data = if (reader.fill(1)) |_| true else |_| false;
-        if (armed) babysitter.cancel(self.io);
-        return have_data;
-    }
-
-    /// Sleep for `idle_ms`; if not cancelled in time, shut down `stream`
-    /// to unblock the worker's pending read with EOF.
-    fn idleBabysitter(io: std.Io, stream: std.Io.net.Stream, idle_ms: u32) std.Io.Cancelable!void {
-        std.Io.sleep(io, .fromMilliseconds(@intCast(idle_ms)), .awake) catch return;
-        stream.shutdown(io, .both) catch {};
+        reader.fill(1) catch return false;
+        return true;
     }
 
     /// Run the handler for one request and decide whether to continue.

@@ -354,7 +354,7 @@ vish.Server.init(io, allocator, address, .{
 });
 ```
 
-`idle_timeout_in_millis` only times the wait-for-next-request gap on a keep-alive connection; once data starts arriving the deadline is cancelled and a slow request is allowed to complete.
+`idle_timeout_in_millis` only times the wait-for-next-request gap on a keep-alive connection; once data starts arriving the deadline no longer applies and a slow request is allowed to complete.
 
 ## Shutdown
 
