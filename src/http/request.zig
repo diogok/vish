@@ -30,7 +30,10 @@ pub const Method = enum {
         } else if (std.mem.eql(u8, bytes, "PATCH")) {
             return .PATCH;
         } else {
-            log.err("Invalid method: {s}", .{bytes});
+            // Client-controlled bytes: escape (log injection) and cap the
+            // length before logging. Malformed input is client noise, not
+            // a server fault, so warn — the caller maps it to a 4xx.
+            log.warn("Invalid method: {f}", .{std.ascii.hexEscape(truncateForLog(bytes), .lower)});
             return error.InvalidHTTPMethod;
         }
     }
@@ -87,7 +90,7 @@ pub const Version = enum {
         } else if (std.mem.eql(u8, bytes, "HTTP/0.9")) {
             return .HTTP_0_9;
         } else {
-            log.err("Invalid HTTP version: {s}", .{bytes});
+            log.warn("Invalid HTTP version: {f}", .{std.ascii.hexEscape(truncateForLog(bytes), .lower)});
             return error.InvalidHTTPVersion;
         }
     }
@@ -294,6 +297,10 @@ pub const Request = struct {
     uri: URI,
     version: Version,
     headers: Headers,
+
+    /// Peer address of the connection this request arrived on. Null for
+    /// requests parsed outside a live connection (tests, examples).
+    client_address: ?std.Io.net.IpAddress = null,
 
     reader: *std.Io.Reader,
     writer: *std.Io.Writer,
@@ -804,6 +811,13 @@ pub const BodyReader = struct {
         return wrote;
     }
 };
+
+/// Cap client-controlled bytes destined for a log line so a hostile
+/// request can't flood the log.
+fn truncateForLog(bytes: []const u8) []const u8 {
+    const max_log_bytes = 32;
+    return bytes[0..@min(bytes.len, max_log_bytes)];
+}
 
 const std = @import("std");
 const testing = std.testing;

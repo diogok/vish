@@ -98,9 +98,9 @@ pub fn errorOutcome(handler: anytype, err: anyerror, req: Request, res: *Respons
 
     const status = statusForError(err);
     if (status == .Internal_Server_Error) {
-        logInternal("Handler error: {any}", .{err});
+        logInternal("Handler error: {t}", .{err});
     } else {
-        log.debug("Handler error: {any} -> {any}", .{ err, status });
+        log.debug("Handler error: {t} -> {t}", .{ err, status });
     }
     res.sendError(status);
     return .handled;

@@ -439,7 +439,7 @@ pub const Response = struct {
     /// response is dead: every write method returns without writing.
     fn markFailed(self: *@This(), err: anyerror) void {
         self.failed = true;
-        log.debug("Response write failed: {any}", .{err});
+        log.debug("Response write failed: {t}", .{err});
     }
 };
 

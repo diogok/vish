@@ -34,7 +34,7 @@ pub const MyHandler = struct {
         req: vish.Request,
         res: *vish.Response,
     ) void {
-        log.debug("Request: {any}", .{req});
+        log.debug("Request: {s} {s}", .{ req.method.string(), req.uri.path });
 
         res.body = "hello";
 

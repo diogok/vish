@@ -74,7 +74,7 @@ pub const MyHandler = struct {
             &query_reader,
             &params,
         ) catch |err| {
-            log.err("error reading query string: {any}", .{err});
+            log.warn("error reading query string: {t}", .{err});
         };
 
         var greeting = std.Io.Writer.Allocating.init(self.allocator);
@@ -110,7 +110,7 @@ pub const MyHandler = struct {
             body_reader.interface(),
             &params,
         ) catch |err| {
-            log.err("error reading body: {any}", .{err});
+            log.warn("error reading body: {t}", .{err});
         };
 
         var greeting = std.Io.Writer.Allocating.init(self.allocator);

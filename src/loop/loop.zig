@@ -82,7 +82,7 @@ pub const Loop = struct {
                     // aborted handshake, allocation): log, pause, and
                     // keep accepting — one bad accept must never stop
                     // the server.
-                    log.err("Error accepting connection: {any}", .{err});
+                    log.err("Error accepting connection: {t}", .{err});
                     try std.Io.sleep(self.io, .fromMilliseconds(accept_retry_delay_ms), .awake);
                     continue;
                 },
@@ -111,9 +111,9 @@ pub const Loop = struct {
     ) std.Io.Cancelable!void {
         var conn = connection;
         defer conn.deinit();
-        defer log.info("Done with connection", .{});
+        defer log.debug("Done with connection", .{});
 
-        log.info("Connection started", .{});
+        log.debug("Connection started", .{});
         while (self.active) {
             // Race the wait-for-next-request against an idle deadline.
             // The deadline only guards the wait — once the first byte of
@@ -124,7 +124,9 @@ pub const Loop = struct {
             if (!self.waitForNextRequest(&conn)) return;
 
             const request = conn.next() catch |err| {
-                log.err("Error reading request: {any}", .{err});
+                // Unparseable requests are client noise, not a server
+                // fault — warn, close the connection, move on.
+                log.warn("Error reading request: {t}", .{err});
                 return;
             };
             const req = request orelse return;
@@ -186,7 +188,9 @@ pub const Loop = struct {
         handler: Handler,
         req: http.Request,
     ) enum { close, keep } {
-        log.debug("Request: {any}", .{req});
+        // Log the request line only: `{any}` on the full struct would
+        // dump headers (Authorization, Cookie) and buffered body bytes.
+        log.debug("Request: {s} {s}", .{ req.method.string(), req.uri.path });
 
         var res = http.Response.fromRequest(req);
 
@@ -199,10 +203,12 @@ pub const Loop = struct {
         // Don't log the full response here: `res.body` points at
         // handler-owned memory that may already be freed once the
         // handler returned (the body was sent inside `handle`).
-        log.debug("Response: status={any}, content_length={any}", .{ res.status, res.headers.content_length });
+        log.debug("Response: status={t}, content_length={?d}", .{ res.status, res.headers.content_length });
 
         req.writer.flush() catch |err| {
-            log.err("Writer flush error: {any}", .{err});
+            // Same event class as `Response.markFailed`: the client is
+            // gone mid-write. Routine, so debug like there — not err.
+            log.debug("Writer flush error: {t}", .{err});
             return .close;
         };
         if (res.failed) return .close;

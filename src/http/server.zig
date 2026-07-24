@@ -167,7 +167,7 @@ pub const Connection = struct {
     pub fn next(self: *@This()) !?Request {
         _ = self.arena.reset(.retain_capacity);
 
-        return Request.read(
+        var request = Request.read(
             self.arena.allocator(),
             &self.net_reader.interface,
             &self.net_writer.interface,
@@ -185,6 +185,8 @@ pub const Connection = struct {
             }
             return err;
         };
+        request.client_address = self.stream.socket.address;
+        return request;
     }
 };
 
