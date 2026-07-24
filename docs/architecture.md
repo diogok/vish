@@ -20,6 +20,7 @@ src/
 │   ├── handler.zig  — Handler vtable interface and `wrap(T)` helper
 │   └── signal.zig   — SIGINT/SIGHUP -> std.Io.Event for graceful shutdown
 ├── utils/
+│   ├── root.zig     — utils namespace; registers submodule tests
 │   ├── router.zig   — StructRouter, PrefixRouter, CombinedRouter, StaticRouter
 │   ├── logging.zig  — Common Log Format middleware
 │   ├── formdata.zig — URL-encoded form/query parsing into structs
@@ -68,7 +69,7 @@ Built on the Zig `std.Io` rework. There is no thread pool managed by this librar
    - `waitForNextRequest` blocks for the first byte (with optional idle deadline).
    - `Connection.next()` resets the arena and parses the request line + headers via `Request.read`.
    - `Response.fromRequest(req)` constructs a fresh response sharing the request's writer and arena allocator.
-   - `handler.handle(req, &res)` runs. Returning `error.Skipped` causes the loop to send `404 Not Found`.
+   - `handler.handle(req, &res)` runs. A top-level `.skipped` outcome (what `error.Skipped` from a concrete handler becomes at the boundary) causes the loop to send `404 Not Found`.
    - `req.writer.flush()` writes buffered bytes to the socket.
    - The connection continues unless either side sent `Connection: close`.
 

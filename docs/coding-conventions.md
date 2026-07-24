@@ -132,6 +132,14 @@ pub fn get(self: @This(), name: []const u8) ?[]const u8 { ... }
 fn parseExtra(self: *@This(), line: []const u8) !void { ... }
 ```
 
+This is a default, not a straitjacket. Locality often beats strict layering:
+
+- **A private helper may sit directly after its caller** — especially one called from a single place. Keeping it next to the code that uses it saves the reader a jump; the "all privates at the bottom" rule only pays off when a helper is shared by several callers.
+- **A focused test may sit directly after the function it tests.** When a test exercises one function, putting it right below keeps the contract and its proof together.
+- **Broad tests that stress the whole module go at the end.** Once a test spans several functions it belongs to the module, not to any one function — collect these at the bottom.
+
+The spirit: a reader scanning top-to-bottom should meet each piece near the code that gives it meaning. Reach for the default order when nothing pulls a helper or test toward a specific caller.
+
 ## Self parameter conventions
 
 Use `*@This()` for methods that mutate, `@This()` (by value) for pure queries.
@@ -469,9 +477,12 @@ pub fn send(self: *Session, frame: Frame) !void {
 
 ## Comments
 
-- `//!` for module-level doc comments (top of file).
-- `///` for public API doc comments.
+Full rules and examples: [`comment-conventions.md`](comment-conventions.md). The short version:
+
+- `//!` for module-level doc comments (top of file). Minimal orientation only — never a list of the module's functions or fields.
+- `///` for public API doc comments. Usage contract (ownership, errors, edge cases), not implementation — and only where the contract goes beyond what the name and conventions already say.
 - `//` for inline explanations. Only where the code isn't self-evident.
+- Concise everywhere: the shortest true statement.
 
 ```zig
 //! HTTP request parser, headers, and body reader.
@@ -486,7 +497,7 @@ pub fn get(self: Headers, name: []const u8) ?[]const u8 { ... }
 
 ### Describe what the code IS, not what changed
 
-Comments document the current state. History ("no longer depends on X", "moved from Y", "was previously Z") rots immediately and belongs in commit messages.
+Comments document the current state. History ("no longer depends on X", "moved from Y", "was previously Z") rots immediately and belongs in commit messages. Likewise, contrast phrasing like "Parser-native …" or "Minimal X" describes a refactor transition, not the type.
 
 ```zig
 // Bad — refactor residue
@@ -639,6 +650,10 @@ pub const std_options: std.Options = .{
     },
 };
 ```
+
+Levels: `err` is for server faults only (failed accept, unmapped 500s). Anything a client can trigger by sending garbage — malformed requests, parse failures — is `warn` at most; disconnects mid-write are `debug`. `info` is for lifecycle events (listen, stop), `debug` for per-request/per-connection detail.
+
+Never log request bodies, header values (`Authorization`, `Cookie`), or whole `Request`/`Response` structs (`{any}` dumps them). Client-controlled bytes that do get logged must be length-capped and escaped (`std.ascii.hexEscape`) so they can't forge log lines. Format errors and enums with `{t}`.
 
 ## Header naming
 
