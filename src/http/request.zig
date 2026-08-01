@@ -532,6 +532,10 @@ test "Method.parse accepts every method tag" {
     inline for (std.meta.fields(Method)) |field| {
         try testing.expectEqual(@field(Method, field.name), try Method.parse(field.name));
     }
+    // The invalid method intentionally logs a warning; anything the test
+    // runner writes to stderr fails `zig build test`, so silence warn-level
+    // logs here (the runner resets the level before each test).
+    testing.log_level = .err;
     try testing.expectError(error.InvalidHTTPMethod, Method.parse("BREW"));
 }
 
