@@ -77,9 +77,14 @@ Custom middleware can be implemented by creating a handler that wraps another ha
 ### Utilities
 
 - Form data parsing: Parse URL-encoded form data from query strings or request bodies into Zig structs
+- Multipart parsing: Iterate the fields and files of a `multipart/form-data` body (`utils.multipart`)
 - MIME types: MIME type detection and handling
 - URI encoding: URL encoding/decoding utilities
 - Timestamps: Date/time formatting for HTTP headers
+
+Middleware that resolves something for the request — a tenant, a
+scope — can attach it as `Request.context` on the copy it hands the
+inner handler, and handlers read it back downstream.
 
 ## Installation
 

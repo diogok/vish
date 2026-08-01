@@ -302,6 +302,12 @@ pub const Request = struct {
     /// requests parsed outside a live connection (tests, examples).
     client_address: ?std.Io.net.IpAddress = null,
 
+    /// Application data attached by routing middleware on the way in and
+    /// read by handlers downstream — a resolved tenant, say. Middleware
+    /// sets it on a copy of the request it hands the inner handler, so
+    /// the value needs to live only as long as the request.
+    context: ?*const anyopaque = null,
+
     reader: *std.Io.Reader,
     writer: *std.Io.Writer,
     allocator: std.mem.Allocator,

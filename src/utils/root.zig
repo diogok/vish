@@ -5,6 +5,7 @@ pub const logging = @import("logging.zig");
 pub const router = @import("router.zig");
 pub const formdata = @import("formdata.zig");
 pub const mime = @import("mime.zig");
+pub const multipart = @import("multipart.zig");
 pub const timestamp = @import("timestamp.zig");
 pub const uriencode = @import("uriencode.zig");
 
@@ -13,6 +14,7 @@ test {
     _ = router;
     _ = formdata;
     _ = mime;
+    _ = multipart;
     _ = timestamp;
     _ = uriencode;
 }

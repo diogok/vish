@@ -111,6 +111,8 @@ pub fn statusForError(err: anyerror) Status {
     return switch (err) {
         error.BadRequest => .Bad_Request,
         error.Unauthorized => .Unauthorized,
+        error.Forbidden => .Forbidden,
+        error.NotFound => .Not_Found,
         error.StreamTooLong => .Payload_Too_Large,
         error.Internal => .Internal_Server_Error,
         else => .Internal_Server_Error,
