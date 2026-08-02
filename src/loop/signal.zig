@@ -41,7 +41,19 @@ pub fn wait(io: std.Io) void {
 
     log.info("Waiting for stop signal.", .{});
     state.event.waitUncancelable(io);
-    log.info("Signal received: {d}", .{state.last_signo.load(.acquire)});
+    const signo = state.last_signo.load(.acquire);
+    if (signo == 0) {
+        log.info("Stop requested in process", .{});
+    } else {
+        log.info("Signal received: {d}", .{signo});
+    }
+}
+
+/// Release `wait` as though a stop signal had arrived, for a stop the
+/// process asks for itself — a tray menu, an admin endpoint. The wakeup
+/// is latched, so calling this before `wait` still ends that `wait`.
+pub fn interrupt(io: std.Io) void {
+    state.event.set(io);
 }
 
 fn receive(sig: std.posix.SIG) callconv(.c) void {

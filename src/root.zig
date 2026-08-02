@@ -30,6 +30,7 @@ pub const callOutcome = handler.callOutcome;
 pub const Loop = loop.Loop;
 
 pub const waitInterrupt = signal.wait;
+pub const interrupt = signal.interrupt;
 
 pub const utils = @import("utils/root.zig");
 
