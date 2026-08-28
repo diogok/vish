@@ -1,5 +1,18 @@
 # Progress — WebSocket review fixes
 
+## Session 2 — T1: fragment reassembly (S1)
+
+Landed the F1 fix: `next()` now zeroes `frag_len` after a complete
+fragmented message (buffer kept — the returned slice points into it),
+and `appendFrag` starts fresh on `frag_len == 0` using `realloc`
+(reusing retained capacity; plain allocators would leak it on a fresh
+`alloc`). Two regression tests: two consecutive fragmented messages
+(pre-fix "HelloWorld") and fragment/single/fragment interleaving.
+`zig build test` 106/106.
+
+Next: T2 (handshake validation, S2).
+
+
 ## Session 1 — planning (no code)
 
 Reviewed the `websocket` branch (commit `bde8dc4`) against RFC 6455:

@@ -247,13 +247,18 @@ pub const WebSocket = struct {
                     const message_opcode = self.frag_opcode.?;
                     self.frag_opcode = null;
                     try self.appendFrag(f.payload);
+                    const msg_len = self.frag_len;
+                    // Reset the length, not the buffer: the returned
+                    // slice points into it, and the next sequence
+                    // reuses its capacity.
+                    self.frag_len = 0;
                     if (message_opcode == .text) {
-                        if (!std.unicode.utf8ValidateSlice(self.frag[0..self.frag_len])) {
+                        if (!std.unicode.utf8ValidateSlice(self.frag[0..msg_len])) {
                             return self.failProtocol(.invalid_payload, "");
                         }
-                        return .{ .text = self.frag[0..self.frag_len] };
+                        return .{ .text = self.frag[0..msg_len] };
                     }
-                    return .{ .binary = self.frag[0..self.frag_len] };
+                    return .{ .binary = self.frag[0..msg_len] };
                 },
             }
         }
@@ -383,8 +388,10 @@ pub const WebSocket = struct {
     }
 
     fn appendFrag(self: *@This(), chunk: []const u8) !void {
-        if (self.frag.len == 0) {
-            self.frag = try self.allocator.alloc(u8, chunk.len);
+        if (self.frag_len == 0) {
+            // realloc rather than alloc: a finished message keeps the
+            // buffer for reuse, and plain allocators would leak it.
+            self.frag = try self.allocator.realloc(self.frag, chunk.len);
             @memcpy(self.frag, chunk);
             self.frag_len = chunk.len;
         } else {
@@ -523,6 +530,73 @@ test "next reassembles a fragmented text message (RFC A.1)" {
 
     const msg = try ws.next();
     try testing.expectEqualStrings("Hello", msg.text);
+}
+
+test "next reassembles two consecutive fragmented text messages" {
+    // Regression: the finished first message left `frag_len` set, so
+    // the second message came back prefixed with the first's payload
+    // ("HelloWorld").
+    const p1 = frame(false, 0x1, true, "Hel");
+    defer testing.allocator.free(p1);
+    const p2 = frame(true, 0x0, true, "lo");
+    defer testing.allocator.free(p2);
+    const p3 = frame(false, 0x1, true, "Wor");
+    defer testing.allocator.free(p3);
+    const p4 = frame(true, 0x0, true, "ld");
+    defer testing.allocator.free(p4);
+    const parts = [_][]const u8{ p1, p2, p3, p4 };
+    var all: [128]u8 = undefined;
+    var p: usize = 0;
+    for (parts) |part| {
+        @memcpy(all[p .. p + part.len], part);
+        p += part.len;
+    }
+    var out: [64]u8 = undefined;
+    var reader = std.Io.Reader.fixed(all[0..p]);
+    var writer = std.Io.Writer.fixed(&out);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var ws = WebSocket{ .reader = &reader, .writer = &writer, .allocator = arena.allocator() };
+
+    const m1 = try ws.next();
+    try testing.expectEqualStrings("Hello", m1.text);
+    const m2 = try ws.next();
+    try testing.expectEqualStrings("World", m2.text);
+}
+
+test "next interleaves single-frame and fragmented messages" {
+    // Fragment "ab", single "c", fragment "de": the accumulator must
+    // survive the single-frame message untouched.
+    const p1 = frame(false, 0x1, true, "a");
+    defer testing.allocator.free(p1);
+    const p2 = frame(true, 0x0, true, "b");
+    defer testing.allocator.free(p2);
+    const p3 = frame(true, 0x1, true, "c");
+    defer testing.allocator.free(p3);
+    const p4 = frame(false, 0x2, true, "d");
+    defer testing.allocator.free(p4);
+    const p5 = frame(true, 0x0, true, "e");
+    defer testing.allocator.free(p5);
+    const parts = [_][]const u8{ p1, p2, p3, p4, p5 };
+    var all: [160]u8 = undefined;
+    var p: usize = 0;
+    for (parts) |part| {
+        @memcpy(all[p .. p + part.len], part);
+        p += part.len;
+    }
+    var out: [64]u8 = undefined;
+    var reader = std.Io.Reader.fixed(all[0..p]);
+    var writer = std.Io.Writer.fixed(&out);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var ws = WebSocket{ .reader = &reader, .writer = &writer, .allocator = arena.allocator() };
+
+    const m1 = try ws.next();
+    try testing.expectEqualStrings("ab", m1.text);
+    const m2 = try ws.next();
+    try testing.expectEqualStrings("c", m2.text);
+    const m3 = try ws.next();
+    try testing.expectEqualStrings("de", m3.binary);
 }
 
 test "next returns a masked binary frame (RFC A.1)" {

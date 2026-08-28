@@ -101,12 +101,12 @@ the old (wrong or limited) behavior.
 
 ## Work items
 
-- [ ] S1 — F1 fragment reassembly state:
-  - [ ] `next()`: reset `frag_len` after a complete fragmented message
-  - [ ] `appendFrag`: fresh start on `frag_len == 0`
-  - [ ] tests: two consecutive fragmented messages; fragmented then
+- [x] S1 — F1 fragment reassembly state:
+  - [x] `next()`: reset `frag_len` after a complete fragmented message
+  - [x] `appendFrag`: fresh start on `frag_len == 0`
+  - [x] tests: two consecutive fragmented messages; fragmented then
         single-frame then fragmented (the review reproducer)
-  - [ ] verify: `zig build test`
+  - [x] verify: `zig build test`
 - [ ] S2 — F2/F3/F4/F10 handshake validation and rejection framing:
   - [ ] `upgrade()`: `upgrade.len == 0` check first (F4)
   - [ ] `upgrade()`: reject on `content_length > 0` or
