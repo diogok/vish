@@ -1,92 +1,80 @@
 # Handover — WebSocket review fixes
 
-**State: T4 (S4, F5) landed.** Inbound payloads are capped at
-`max_payload` (private field, default 16 MiB) — enforced before the
-allocation in `readFrame` and cumulatively in `appendFrag` — and
-over-size input fails with close 1009. Next session starts at **T5**.
+**State: T5 (S5, F6) landed. All code fixes (F1–F10) are in.**
+Subprotocols are negotiated: the 101 echoes the first non-empty
+offered subprotocol. Only **T6 — the wrap-up (S6)** remains: full
+re-verify, docs consistency pass, close the plan.
 
-Last commit this card describes: the T4 commit "ws-fixes: max payload
-cap with close 1009 (plan T4)".
+Last commit this card describes: the T5 commit "ws-fixes: subprotocol
+negotiation (plan T5)".
 
-## Next: T5 — S5 subprotocol negotiation (F6)
+## Next: T6 — S6 wrap-up — full re-verify, docs pass, close the plan
 
-- **Plan (read):** `plans/ws-fixes/plan.md` F6 design line and card
-  T5; `src/http/websocket.zig` `upgrade()` header tail (156-181 — the
-  `accept_b64` + `extra` construction); `src/http/response.zig`
-  `ExtraHeader` (100-103) and the extra-header send loop (287);
-  `src/http/request.zig:192` (`sec_websocket_protocol`);
-  docs/usage.md WebSocket section (304-330); docs/architecture.md
-  (81-90); notes.md "RFC 6455" (the §4.1 subprotocol MUSTs).
+- **Plan (read):** `plans/ws-fixes/plan.md` card T6 and "Open risks";
+  notes.md "Measured behavior (post-S2)" + "Environment recipes"
+  (probe recipe); the WebSocket sections of docs/usage.md (304-330)
+  and docs/architecture.md (81-90).
 - **Do:**
-  - `selectSubprotocol(value: []const u8) ?[]const u8` top-level
-    private helper: split on commas, take the first non-empty token
-    (OWS-trimmed); null when every token is empty. Returns a subslice
-    of `value` — no allocation.
-  - In `upgrade()`, when `req.headers.sec_websocket_protocol.len > 0`
-    and a token is selected, grow the `extra` array (currently
-    1-entry, stack-local) to 2 entries so the 101 carries
-    `Sec-WebSocket-Protocol: <token>` alongside
-    `Sec-WebSocket-Accept`. No token selected → no header (plan
-    decision: a malformed list proceeds without one).
-  - Unit tests for `selectSubprotocol`: first of several tokens, OWS
-    around tokens, single token, empty string / all-empty list → null.
-    Plus one `upgradeOutcome`-style test: handshake with
-    `sec_websocket_protocol = "chat, superchat"` → `.ok` and the wire
-    buffer contains `Sec-WebSocket-Protocol: chat`.
-  - Integration test (model on the one at ~1306): handshake request
-    carrying `Sec-WebSocket-Protocol: chat, superchat` → the 101
-    carries `Sec-WebSocket-Protocol: chat`.
-  - Docs: architecture.md line 90 ("does not negotiate subprotocols or
-    extensions" → subprotocols are echoed, extensions still not);
-    usage.md (one sentence in the WebSocket section: the 101 echoes
-    the first offered subprotocol).
-- **Verify:** `zig build test` and `zig build` green; demo2 probe:
-  handshake with `Sec-WebSocket-Protocol: chat, superchat` → 101
-  carries `Sec-WebSocket-Protocol: chat` (extend /tmp/ws_t2_probe.py
-  or a new case; the probe script recipe is in notes.md).
-- **Stop-when:** commit "ws-fixes: subprotocol negotiation (plan T5)"
-  with plan.md S5 crossed, progress.md entry, this file rewritten.
+  - `zig build test` (122 tests) and `zig build` green.
+  - Fresh demo2 (background task) + full probe:
+    `python3 /tmp/ws_t2_probe.py` — 6 cases: 400 framing + prompt
+    close, body-bearing GET → 400, POST-without-Upgrade → 404, valid
+    101/accept/text-echo, subprotocol echo, binary echo. If the script
+    is gone, regenerate from the notes.md recipes. Optionally extend
+    with a ping→pong and a close-handshake case (the live-loop
+    integration test in websocket.zig already covers both in
+    `zig build test`).
+  - Docs sweep (pre-checked this session — nothing stale remains;
+    confirm, don't hunt): usage.md error list (328) matches
+    `NotWebSocket`/`HandshakeRejected`/`UpgradeFailed`; architecture.md
+    (85-90) covers subprotocol echo + the 1009 cap. One judgment call
+    to make: add a sentence to usage.md's WebSocket section that
+    inbound payloads over `max_payload` (default 16 MiB) fail with
+    close 1009 — it is user-visible behavior. If added, record it in
+    the progress entry.
+  - Cross S6 in plan.md; final progress entry ("S6 done; plan closed;
+    branch state: T1–T6 committed"); rewrite this file to mark the
+    task complete (no next task).
+- **Verify:** `zig build test`, `zig build`, full probe green; all
+  plan boxes (S1–S6) checked; working tree clean after the final
+  commit.
+- **Stop-when:** commit "ws-fixes: full re-verify, docs pass, close
+  plan (plan T6)". That is the last commit of the plan.
 
 ## Baseline
 
 ```sh
-zig build test   # 118 tests after T4
+zig build test   # 122 tests after T5
 zig build        # adds the demos
 ```
 
 Live check: background-task `./zig-out/bin/demo2` (rebuild first with
-`zig build`), then `python3 /tmp/ws_t2_probe.py` (regenerate from
-notes.md "Measured behavior (post-S2)" if gone).
+`zig build`), then `python3 /tmp/ws_t2_probe.py` (6 cases, all
+expected to pass).
 
 ## Facts this task needs
 
-- The `extra` array is a stack-local `[_]response.ExtraHeader`
-  assigned to `res.headers.extra` and consumed by `res.send()` inside
-  `upgrade()` — a 2-entry local is equally safe; the header values
-  point at the request's header strings (alive for the request) and
-  the stack `accept_b64`, all valid until `send()` returns.
-- `selectSubprotocol` must be a top-level private fn (not a method):
-  it is the unit-testable unit per the plan, and it needs no state.
-- The RFC §4.1 obligation (notes.md): the server MUST echo the header
-  when the client sent it, and clients that requested subprotocols and
-  got none treat the handshake as failed — that is why the echo is a
-  fix, not a nicety.
-- The existing `upgradeOutcome` helper (websocket.zig ~540s) returns
-  an enum — a new subprotocol test asserts on `writer.end`'s buffer,
-  not on the enum, so no helper change is needed.
-- The integration test at ~1377 ("an invalid upgrade request gets a
-  400") already sends realistic headers; the new subprotocol
-  integration test can copy its setup and add the one header.
-- Close-code bytes on the wire: 1002 = `0x03 0xea`, 1009 = `0x03
-  0xf1` (a previous plan card got 1009 wrong — compute, don't copy).
+- The probe cases and their expected wire behavior are recorded in
+  notes.md "Measured behavior (post-S2)"; the 6-case probe layout
+  (A bad-key 400/close, B body-GET 400, C POST 404, D valid
+  handshake + text echo, E subprotocol echo, F binary echo) is in
+  progress.md's Session 3 entry.
+- The two live-loop integration tests (websocket.zig ~1360s:
+  handshake/echo/ping/close, invalid-400; ~1470: subprotocol) already
+  exercise ping/pong and the close handshake end-to-end inside
+  `zig build test` — the probe extension for those is optional, not
+  required.
+- Close-code bytes if any new assertion is written: 1000 = `0x03
+  0xe8`, 1002 = `0x03 0xea`, 1009 = `0x03 0xf1`.
+- `git log --oneline` on the branch should end with one commit per
+  stage: planning, T1, T2, T3, T4, T5, T6. The working tree must be
+  clean when T6 finishes.
 
-## Open risks / out of scope
+## Open risks / out of scope (final)
 
-- The 16 MiB default cap (T4) is a judgment call; revisit only if a
-  real workload needs more (plan.md "Open risks").
-- First-token selection is not full negotiation (the server cannot
-  reject a subprotocol) — sanctioned in plan.md "Open risks".
+- The 16 MiB default cap and first-token subprotocol selection are
+  sanctioned judgment calls (plan.md "Open risks") — no action in T6.
 - The `error reading body: EndOfStream` warning from demo2's
-  `POST /hello` formdata path is pre-existing — out of scope.
-- T6 (S6) remains after T5: full re-verify, docs consistency pass
-  (usage.md error list, architecture.md), close the plan.
+  `POST /hello` formdata path is pre-existing — out of scope, stays.
+- Merging the branch back to main is a user decision, not part of the
+  plan.

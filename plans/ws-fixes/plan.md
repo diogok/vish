@@ -139,19 +139,19 @@ the old (wrong or limited) behavior.
   - [x] `readFrame`: enforce before `readAlloc` → 1009
   - [x] `appendFrag`: cumulative check → 1009
   - [x] tests: single frame over cap → ProtocolError + close 1009
-        (0x03e9); fragments summing over cap → ProtocolError
+        (0x03f1); fragments summing over cap → ProtocolError
   - [x] docs: architecture.md size-limit line
   - [x] verify: `zig build test`, `zig build`
-- [ ] S5 — F6 subprotocol negotiation:
-  - [ ] `selectSubprotocol(value) ?[]const u8` helper
-  - [ ] `upgrade()`: echo the selected subprotocol in the 101 when the
+- [x] S5 — F6 subprotocol negotiation:
+  - [x] `selectSubprotocol(value) ?[]const u8` helper
+  - [x] `upgrade()`: echo the selected subprotocol in the 101 when the
         request carried the header
-  - [ ] unit tests for `selectSubprotocol` (first token, OWS trim,
+  - [x] unit tests for `selectSubprotocol` (first token, OWS trim,
         empty list → null)
-  - [ ] integration test: handshake with `Sec-WebSocket-Protocol:
+  - [x] integration test: handshake with `Sec-WebSocket-Protocol:
         chat, superchat` → 101 carries `Sec-WebSocket-Protocol: chat`
-  - [ ] docs: architecture.md subprotocol line, usage.md note
-  - [ ] verify: `zig build test`, `zig build`, demo probe
+  - [x] docs: architecture.md subprotocol line, usage.md note
+  - [x] verify: `zig build test`, `zig build`, demo probe
 - [ ] S6 — wrap-up:
   - [ ] full re-verify: `zig build test`, `zig build`, complete demo
         probe (handshake/echo/ping/close + every new behavior: 400

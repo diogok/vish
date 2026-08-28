@@ -1,9 +1,10 @@
 # Progress — WebSocket review fixes
 
-## Session 3 — T2 (S2) + T3 (S3) + T4 (S4)
+## Session 3 — T2 (S2) + T3 (S3) + T4 (S4) + T5 (S5)
 
-Landed F2/F3/F4/F10 (T2, commit `c05d22f`), F7/F8/F9 (T3), and
-F5 (T4, this commit).
+Landed F2/F3/F4/F10 (T2, commit `c05d22f`), F7/F8/F9 (T3), F5 (T4,
+commit `20f986b`), and F6 (T5, this commit). All code fixes are in;
+only S6 (full re-verify + docs consistency pass) remains.
 
 T2: `upgrade()` now checks `upgrade.len == 0 → NotWebSocket` first (a
 non-GET without an Upgrade header routes through instead of 400ing),
@@ -29,18 +30,27 @@ with close 1009. `CloseCode.message_too_big` is no longer dead code.
 architecture.md size-limit line rewritten. Three new unit tests
 (over-cap frame, fragments summing over cap, exactly-at-cap accepted).
 
-Live probe after T2 (demo2 + /tmp/ws_t2_probe.py): rejected upgrade →
-400 + `Connection: close`, EOF 1.1 ms (was the 1.00 s idle window);
-body-bearing GET → 400; `POST /ws` without Upgrade → 404; valid
-handshake + echo unchanged. `zig build test` 118/118, `zig build`
-green.
+T5: `selectSubprotocol` (top-level private helper; first non-empty
+OWS-trimmed comma token, no allocation) and the 101 now carries
+`Sec-WebSocket-Protocol: <first offered>` when the client offered a
+list — the RFC §4.1 MUST that browsers and Node `ws` enforce on the
+client side. Two helper unit tests, one `upgradeOutcome` wire test,
+one live-loop integration test; architecture.md + usage.md updated.
+
+Live probe after T2/T5 (demo2 + /tmp/ws_t2_probe.py, now 6 cases):
+rejected upgrade → 400 + `Connection: close`, EOF 0.0 ms (was the
+1.00 s idle window); body-bearing GET → 400; `POST /ws` without
+Upgrade → 404; valid handshake + text echo unchanged; subprotocol
+echo `Sec-WebSocket-Protocol: chat` on the 101; binary echo.
+`zig build test` 122/122, `zig build` green.
 
 Mistakes to remember: the Zig 0.16 error-value pitfalls hit in T2
 (cross-error-set equality, `try anyerror`, `switch |payload|`) are in
 notes.md; the 1009 close-code bytes are `0x03 0xf1` — the plan card
 said `0x03 0xe9` (that is 1001), corrected in plan.md.
 
-Next: T5 (subprotocol negotiation, S5).
+Next: T6 (wrap-up, S6) — full re-verify, docs consistency pass,
+close the plan.
 
 ## Session 2 — T1: fragment reassembly (S1)
 

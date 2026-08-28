@@ -165,10 +165,20 @@ pub const WebSocket = struct {
         res.status = .Switching_Protocols;
         res.headers.upgrade = "websocket";
         if (res.headers.connection == null) res.headers.connection = .upgrade;
-        const extra = [_]response.ExtraHeader{
-            .{ .name = "Sec-WebSocket-Accept", .value = accept_b64 },
-        };
-        res.headers.extra = &extra;
+        // §4.1: when the client offered subprotocols, the 101 MUST
+        // name the one selected — here, the first non-empty token.
+        if (selectSubprotocol(req.headers.sec_websocket_protocol)) |sub| {
+            const extra = [_]response.ExtraHeader{
+                .{ .name = "Sec-WebSocket-Accept", .value = accept_b64 },
+                .{ .name = "Sec-WebSocket-Protocol", .value = sub },
+            };
+            res.headers.extra = &extra;
+        } else {
+            const extra = [_]response.ExtraHeader{
+                .{ .name = "Sec-WebSocket-Accept", .value = accept_b64 },
+            };
+            res.headers.extra = &extra;
+        }
         res.send();
         if (res.failed) return error.UpgradeFailed;
         // The client waits for the 101 before speaking WebSocket: the
@@ -505,6 +515,39 @@ pub const WebSocket = struct {
     }
 };
 
+/// The subprotocol a server echoes back from a
+/// `Sec-WebSocket-Protocol` list (RFC 6455 §4.1): the first
+/// non-empty token, OWS-trimmed. Returns a subslice of `value`; null
+/// when the list carries no non-empty token.
+fn selectSubprotocol(value: []const u8) ?[]const u8 {
+    var rest = value;
+    while (rest.len > 0) {
+        const comma = std.mem.indexOfScalar(u8, rest, ',') orelse break;
+        const token = std.mem.trim(u8, rest[0..comma], " \t");
+        if (token.len > 0) return token;
+        rest = rest[comma + 1 ..];
+    }
+    // The last token, after the final comma — or the whole value when
+    // it has no comma at all.
+    const token = std.mem.trim(u8, rest, " \t");
+    return if (token.len > 0) token else null;
+}
+
+test "selectSubprotocol picks the first non-empty token" {
+    try testing.expectEqualStrings("chat", selectSubprotocol("chat, superchat").?);
+    try testing.expectEqualStrings("chat", selectSubprotocol("  chat ,\tsuperchat").?);
+    try testing.expectEqualStrings("solo", selectSubprotocol("solo").?);
+    try testing.expectEqualStrings("second", selectSubprotocol(" , second ").?);
+    try testing.expectEqualStrings("a", selectSubprotocol("a, tail").?);
+    try testing.expectEqualStrings("tail", selectSubprotocol(" , tail").?);
+}
+
+test "selectSubprotocol returns null for a list without tokens" {
+    try testing.expect(selectSubprotocol("") == null);
+    try testing.expect(selectSubprotocol(" , ,") == null);
+    try testing.expect(selectSubprotocol(" \t ") == null);
+}
+
 /// Assemble a wire frame for tests (heap-allocated; the caller frees
 /// it): `mask` applies a fixed key to the payload, since client frames
 /// must be masked (RFC 6455 §5.1).
@@ -646,6 +689,20 @@ test "upgrade: a key that is not 24 base64 characters is rejected" {
     const wire = buf[0..writer.end];
     try testing.expect(std.mem.indexOf(u8, wire, "400 Bad Request") != null);
     try testing.expect(std.mem.indexOf(u8, wire, "Connection: close") != null);
+}
+
+test "upgrade: a valid handshake echoes the first offered subprotocol" {
+    var headers = handshakeHeaders();
+    headers.sec_websocket_protocol = "chat, superchat";
+    var buf: [512]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    const outcome = upgradeOutcome(.GET, headers, &writer);
+    try testing.expectEqual(UpgradeOutcome.ok, outcome);
+    const wire = buf[0..writer.end];
+    try testing.expect(std.mem.indexOf(u8, wire, "101 Switching Protocols") != null);
+    try testing.expect(std.mem.indexOf(u8, wire, "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=") != null);
+    // RFC 6455 §4.1: the offered subprotocol must be echoed.
+    try testing.expect(std.mem.indexOf(u8, wire, "Sec-WebSocket-Protocol: chat") != null);
 }
 
 test "next returns a masked unfragmented text frame (RFC A.1)" {
@@ -1408,6 +1465,42 @@ test "integration: an invalid upgrade request gets a 400" {
     defer allocator.free(resp);
     try testing.expect(std.mem.indexOf(u8, resp, "400 Bad Request") != null);
     try testing.expect(std.mem.indexOf(u8, resp, "Connection: close") != null);
+}
+
+test "integration: the 101 echoes the first offered subprotocol" {
+    const io = testing.io;
+    const allocator = testing.allocator;
+
+    var ts: WsTestServer = undefined;
+    try ts.start(io, allocator);
+    defer ts.stop();
+
+    var stream = try std.Io.net.IpAddress.connect(&ts.boundAddress(), io, .{ .mode = .stream });
+    defer stream.close(io);
+
+    var wbuf: [1024]u8 = undefined;
+    var w = stream.writer(io, &wbuf);
+    try w.interface.writeAll(
+        "GET /ws HTTP/1.1\r\n" ++
+            "Host: localhost\r\n" ++
+            "Upgrade: websocket\r\n" ++
+            "Connection: Upgrade\r\n" ++
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+            "Sec-WebSocket-Version: 13\r\n" ++
+            "Sec-WebSocket-Protocol: chat, superchat\r\n" ++
+            "\r\n",
+    );
+    try w.interface.flush();
+
+    var rbuf: [4096]u8 = undefined;
+    var r = stream.reader(io, &rbuf);
+    var hs_buf: [8192]u8 = undefined;
+    const hs = try readHandshake(&r.interface, &hs_buf);
+    try testing.expect(std.mem.indexOf(u8, hs, "101 Switching Protocols") != null);
+    // RFC 6455 §4.1: the server MUST echo the header when the client
+    // sent it — clients that requested subprotocols and got none treat
+    // the handshake as failed.
+    try testing.expect(std.mem.indexOf(u8, hs, "Sec-WebSocket-Protocol: chat") != null);
 }
 
 const std = @import("std");
