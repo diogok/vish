@@ -1,5 +1,30 @@
 # Progress — WebSocket review fixes
 
+## Session 3 — T2: handshake validation and rejection framing (S2)
+
+Landed F2/F3/F4/F10. `upgrade()` now checks `upgrade.len == 0 →
+NotWebSocket` first (a non-GET without an Upgrade header routes through
+instead of 400ing), rejects body-bearing handshakes (`content_length >
+0` or `transfer_encoding` set → 400), and `reject()` forces
+`Connection: close` so the body-less 400 frames itself and the loop
+closes the connection immediately. Five new `upgrade()` unit tests
+(bad key, missing Connection, body-bearing GET, chunked GET, non-GET
+without Upgrade) via an `UpgradeOutcome` helper; the rejected-400
+integration test now uses a realistic request and asserts the close
+header (F10).
+
+Live probe (demo2 + /tmp/ws_t2_probe.py): rejected upgrade → 400 +
+`Connection: close`, EOF 1.1 ms (was the 1.00 s idle window);
+body-bearing GET → 400; `POST /ws` without Upgrade → 404; valid
+handshake + echo unchanged. `zig build test` 111/111, `zig build`
+green.
+
+The Zig 0.16 error-value pitfalls hit along the way (cross-error-set
+equality, `try anyerror`, `switch |payload|`) are recorded in
+notes.md — the enum-flattening pattern in the helper is the fix.
+
+Next: T3 (close-handshake strictness, S3).
+
 ## Session 2 — T1: fragment reassembly (S1)
 
 Landed the F1 fix: `next()` now zeroes `frag_len` after a complete

@@ -87,17 +87,19 @@ pub const WebSocket = struct {
     /// returns `.handled`. `UpgradeFailed`: the 101 could not be
     /// delivered (the client is already gone).
     pub fn upgrade(req: Request, res: *Response) !@This() {
-        // An upgrade request with a body would leave body bytes in the
-        // buffer to corrupt the first frame, so only body-less GET is
-        // admissible.
-        if (req.method != .GET) {
-            reject(res, &.{});
-            return error.HandshakeRejected;
-        }
+        // No Upgrade header: not an upgrade attempt, whatever the
+        // method — return without sending so routing can continue.
         if (req.headers.upgrade.len == 0) return error.NotWebSocket;
         if (!std.ascii.eqlIgnoreCase(req.headers.upgrade, "websocket") or
             req.headers.connection != .upgrade)
         {
+            reject(res, &.{});
+            return error.HandshakeRejected;
+        }
+        // An upgrade request with a body would leave body bytes in the
+        // buffer to corrupt the first frame, so only body-less GET is
+        // admissible.
+        if (req.method != .GET) {
             reject(res, &.{});
             return error.HandshakeRejected;
         }
@@ -136,6 +138,12 @@ pub const WebSocket = struct {
             reject(res, &.{});
             return error.HandshakeRejected;
         };
+        // RFC 6455 §4.1: the handshake carries no body. A body left in
+        // the buffer would desync the first frame read.
+        if (req.headers.content_length > 0 or req.headers.transfer_encoding != null) {
+            reject(res, &.{});
+            return error.HandshakeRejected;
+        }
 
         // Sec-WebSocket-Accept = base64(SHA1(key ++ magic)).
         var input: [key_b64_len + magic.len]u8 = undefined;
@@ -451,7 +459,11 @@ pub const WebSocket = struct {
     /// Send a 400 for a failed handshake. `extra` carries the
     /// `Sec-WebSocket-Version: 13` hint on a version mismatch.
     fn reject(res: *Response, extra: []const response.ExtraHeader) void {
+        // Body-less, so `Connection: close` is what frames the
+        // message; the Connection value copied from the request
+        // (usually `Upgrade`) must not ride along on a 400.
         res.status = .Bad_Request;
+        res.headers.connection = .close;
         res.headers.extra = extra;
         res.send();
     }
@@ -495,6 +507,109 @@ fn frame(fin: bool, opcode: u8, mask: bool, payload: []const u8) []u8 {
         b[i + j] = if (mask) byte ^ key[j % 4] else byte;
     }
     return b;
+}
+
+/// A valid handshake header set for `upgrade()` unit tests. Header
+/// values are comptime literals: any `Request` built from them must
+/// NOT be `deinit()`ed (freeing a literal panics under the debug
+/// allocator).
+fn handshakeHeaders() request.Headers {
+    return .{
+        .upgrade = "websocket",
+        .connection = .upgrade,
+        .sec_websocket_key = "dGhlIHNhbXBsZSBub25jZQ==",
+        .sec_websocket_version = "13",
+    };
+}
+
+/// The outcome of `upgrade()` for unit tests. Error values do not
+/// compare across error sets, so the result is flattened to an enum.
+const UpgradeOutcome = enum { ok, not_websocket, handshake_rejected, upgrade_failed };
+
+/// Run `upgrade()` against a fixed writer and report its outcome. The
+/// caller asserts on the writer's contents.
+fn upgradeOutcome(
+    method: request.Method,
+    headers: request.Headers,
+    writer: *std.Io.Writer,
+) UpgradeOutcome {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var reader = std.Io.Reader.fixed("");
+    const req = Request{
+        .method = method,
+        .uri = .{ .path = "/ws" },
+        .version = .HTTP_1_1,
+        .headers = headers,
+        .reader = &reader,
+        .writer = writer,
+        .allocator = arena.allocator(),
+    };
+    var res = Response.fromRequest(req);
+    const result = WebSocket.upgrade(req, &res);
+    return if (result) |_| {
+        return .ok;
+    } else |err| switch (err) {
+        error.NotWebSocket => .not_websocket,
+        error.HandshakeRejected => .handshake_rejected,
+        error.UpgradeFailed => .upgrade_failed,
+    };
+}
+
+test "upgrade: a non-GET without an Upgrade header is NotWebSocket" {
+    var buf: [64]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    const outcome = upgradeOutcome(.POST, .{}, &writer);
+    try testing.expectEqual(UpgradeOutcome.not_websocket, outcome);
+    // Nothing was sent: routing continues untouched.
+    try testing.expectEqual(@as(usize, 0), writer.end);
+}
+
+test "upgrade: a missing Connection: Upgrade is rejected with a close 400" {
+    var headers = handshakeHeaders();
+    headers.connection = null;
+    var buf: [256]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    const outcome = upgradeOutcome(.GET, headers, &writer);
+    try testing.expectEqual(UpgradeOutcome.handshake_rejected, outcome);
+    const wire = buf[0..writer.end];
+    try testing.expect(std.mem.indexOf(u8, wire, "400 Bad Request") != null);
+    try testing.expect(std.mem.indexOf(u8, wire, "Connection: close") != null);
+}
+
+test "upgrade: a body-bearing GET is rejected" {
+    var headers = handshakeHeaders();
+    headers.content_length = 5;
+    var buf: [256]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    const outcome = upgradeOutcome(.GET, headers, &writer);
+    try testing.expectEqual(UpgradeOutcome.handshake_rejected, outcome);
+    const wire = buf[0..writer.end];
+    try testing.expect(std.mem.indexOf(u8, wire, "400 Bad Request") != null);
+    try testing.expect(std.mem.indexOf(u8, wire, "Connection: close") != null);
+}
+
+test "upgrade: a chunked GET is rejected" {
+    var headers = handshakeHeaders();
+    headers.transfer_encoding = .chunked;
+    var buf: [256]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    const outcome = upgradeOutcome(.GET, headers, &writer);
+    try testing.expectEqual(UpgradeOutcome.handshake_rejected, outcome);
+    const wire = buf[0..writer.end];
+    try testing.expect(std.mem.indexOf(u8, wire, "400 Bad Request") != null);
+}
+
+test "upgrade: a key that is not 24 base64 characters is rejected" {
+    var headers = handshakeHeaders();
+    headers.sec_websocket_key = "not-base64!!!";
+    var buf: [256]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    const outcome = upgradeOutcome(.GET, headers, &writer);
+    try testing.expectEqual(UpgradeOutcome.handshake_rejected, outcome);
+    const wire = buf[0..writer.end];
+    try testing.expect(std.mem.indexOf(u8, wire, "400 Bad Request") != null);
+    try testing.expect(std.mem.indexOf(u8, wire, "Connection: close") != null);
 }
 
 test "next returns a masked unfragmented text frame (RFC A.1)" {
@@ -1104,11 +1219,14 @@ test "integration: an invalid upgrade request gets a 400" {
 
     var wbuf: [1024]u8 = undefined;
     var w = stream.writer(io, &wbuf);
-    // An upgrade request with a key that is not 24 base64 characters.
+    // A well-formed upgrade request whose key is not 24 base64
+    // characters. The 400 must carry `Connection: close` (it has no
+    // body): that frames the message and drops the connection
+    // immediately instead of waiting out the idle deadline.
     try w.interface.writeAll(
         "GET /ws HTTP/1.1\r\n" ++
             "Host: x\r\n" ++
-            "Connection: close\r\n" ++
+            "Connection: Upgrade\r\n" ++
             "Upgrade: websocket\r\n" ++
             "Sec-WebSocket-Key: not-base64!!!\r\n" ++
             "Sec-WebSocket-Version: 13\r\n" ++
@@ -1121,6 +1239,7 @@ test "integration: an invalid upgrade request gets a 400" {
     const resp = try r.interface.allocRemaining(allocator, .unlimited);
     defer allocator.free(resp);
     try testing.expect(std.mem.indexOf(u8, resp, "400 Bad Request") != null);
+    try testing.expect(std.mem.indexOf(u8, resp, "Connection: close") != null);
 }
 
 const std = @import("std");
@@ -1131,6 +1250,7 @@ const http = @import("server.zig");
 const Loop = @import("../loop/loop.zig").Loop;
 const Handler = @import("../loop/handler.zig").Handler;
 
-const Request = @import("request.zig").Request;
+const request = @import("request.zig");
+const Request = request.Request;
 const Response = @import("response.zig").Response;
 const response = @import("response.zig");

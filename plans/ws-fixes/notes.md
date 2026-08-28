@@ -51,11 +51,13 @@ re-derive them.
   only when the body is non-empty or the field was set; the 400/101
   bodies are empty, so neither carries a Content-Length. The 101 is
   fine (no body is expected); the 400 is not (F2).
-- `WebSocket.upgrade()` check order today (websocket.zig:89-171):
-  method → `upgrade.len` → upgrade value + connection → version → key.
-- No unit tests exist for `upgrade()` itself; the handshake is only
-  covered by the two live-loop integration tests (websocket.zig:949-
-  1050). S2 adds the first direct unit tests.
+- `WebSocket.upgrade()` check order after S2 (websocket.zig:89-179):
+  `upgrade.len` (NotWebSocket) → upgrade value + connection → method →
+  version → key → body-less. `reject()` forces `Connection: close`.
+- `upgrade()` now has direct unit tests (the `UpgradeOutcome` helper +
+  5 tests, websocket.zig ~512-615) alongside the live-loop integration
+  tests; the rejected-handshake integration test uses a realistic
+  request (good `Connection: Upgrade`, bad key) per F10.
 - `Headers.free` (request.zig:204-218) frees **every** `[]const u8`
   field, including comptime string literals. A hand-constructed
   `Request` in a unit test must therefore never call `req.deinit()`
@@ -111,6 +113,18 @@ re-derive them.
   EndOfStream` from the **pre-existing** `POST /hello` formdata path
   (demo2.zig:132) — not part of this branch's work, out of scope.
 
+## Measured behavior (post-S2 fix, probe /tmp/ws_t2_probe.py)
+
+- Rejected handshake (bad key, `Connection: Upgrade` request) → 400 with
+  `Connection: close`, EOF **1.1 ms** after the response (was the full
+  1.00 s idle window). No body is sent on the 400 — the close frames it.
+- Body-bearing GET (`Content-Length: 5` + 5 bytes) → 400 + close.
+- `POST /ws` without Upgrade header → 404 (routing continues; the demo's
+  `WsEchoHandler` maps NotWebSocket → Skipped).
+- Valid upgrade unchanged: 101 + correct accept; "hi" echo arrives as a
+  4-byte wire frame (0x81 0x02 'h' 'i') — probes must wait for 4 bytes,
+  not 6.
+
 ## F1 reproducer (the data-corruption test)
 
 Two masked fragmented text messages back to back — "Hel"+"lo" then
@@ -129,6 +143,29 @@ reassembled message; `appendFrag` (385-396) only starts fresh when
 `frag_len + chunk.len` and copies the new chunk **after** the stale
 payload; `next()` then returns `self.frag[0..frag_len]` including the
 stale prefix.
+
+## Zig 0.16 error-value pitfalls (learned in T2)
+
+- **Error values do not compare across error sets.** `error.NotWebSocket`
+  written in a test body is a member of the *test's* error set; the value
+  returned by `upgrade()` carries a code from *upgrade's* set. Same name,
+  different integer: `testing.expectEqual` fails with the baffling
+  "expected error.NotWebSocket, found error.NotWebSocket". Never compare
+  `anyerror` values across functions — flatten to a local enum in the
+  helper (that's what `UpgradeOutcome` in the S2 tests does).
+- **`try` on a bare `anyerror` is illegal**: "expected error union type,
+  found 'anyerror'". A function returning `anyerror` cannot be `try`'d.
+- **`switch` on an error union has no `|payload|` prong** in this build
+  ("expected '}', found '|'"). The working shape:
+  `const r = f(); return if (r) |_| { return .ok; } else |err| switch (err) {...};`
+  (`|_|` wildcard capture is valid; a block arm must end in a statement,
+  not a bare expression).
+- A `switch` on an error set is exhaustive over its members: `upgrade()`'s
+  set is exactly `{NotWebSocket, HandshakeRejected, UpgradeFailed}` (all
+  other call-site errors are caught internally), so an `else` prong is an
+  "unreachable else prong" compile error.
+- A hand-built `Request` literal needs `.version` (request.zig:305) —
+  there is no default.
 
 ## Test pitfalls (must not rediscover)
 

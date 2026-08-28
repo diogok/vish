@@ -92,8 +92,12 @@ the old (wrong or limited) behavior.
   NOT send frames after its Close). A peer Close answering our own
   server-initiated `close()` still surfaces once, as today.
 - **F8:** the close-payload check becomes
-  `len == 1 or code < 1000 or code > 4999 or code == 1005 or
-  code == 1006` (the `code != 0 and` carve-out goes).
+  `len == 1 or (len >= 2 and (code < 1000 or code > 4999 or
+  code == 1005 or code == 1006))` — the `code != 0` carve-out goes
+  (a 2-byte `0x0000` now fails), but a 0-byte payload stays legal
+  ("no status present", RFC 6455 §5.5.1): without the `len >= 2`
+  guard, the empty case would hit `code < 1000` (code defaults to 0)
+  and regress.
 - **F9:** in `next()`, a failed pong or close-echo write latches
   `failed` (via `writeFrame`) and returns `error.ReadFailed`. `next()`
   doc gains the transport-failure line.
@@ -107,19 +111,19 @@ the old (wrong or limited) behavior.
   - [x] tests: two consecutive fragmented messages; fragmented then
         single-frame then fragmented (the review reproducer)
   - [x] verify: `zig build test`
-- [ ] S2 — F2/F3/F4/F10 handshake validation and rejection framing:
-  - [ ] `upgrade()`: `upgrade.len == 0` check first (F4)
-  - [ ] `upgrade()`: reject on `content_length > 0` or
+- [x] S2 — F2/F3/F4/F10 handshake validation and rejection framing:
+  - [x] `upgrade()`: `upgrade.len == 0` check first (F4)
+  - [x] `upgrade()`: reject on `content_length > 0` or
         `transfer_encoding != null` (F3)
-  - [ ] `reject()`: force `Connection: close` (F2)
-  - [ ] unit tests for all `upgrade()` reject paths (first direct unit
+  - [x] `reject()`: force `Connection: close` (F2)
+  - [x] unit tests for all `upgrade()` reject paths (first direct unit
         tests of `upgrade`): non-GET without Upgrade → NotWebSocket +
         nothing written; body-bearing GET → 400 + `Connection: close`;
         chunked GET → 400; bad key → 400
-  - [ ] integration test: realistic rejected request (`Connection:
+  - [x] integration test: realistic rejected request (`Connection:
         Upgrade` + bad key) → 400 + `Connection: close`, comment fixed
         (F10)
-  - [ ] verify: `zig build test`, `zig build`, demo probe (400 closes
+  - [x] verify: `zig build test`, `zig build`, demo probe (400 closes
         promptly; body-bearing GET → 400; non-GET without Upgrade →
         routes through)
 - [ ] S3 — F7/F8/F9 close-handshake strictness:
