@@ -14,6 +14,8 @@ src/
 │   ├── request.zig  — Method, URI, Version, Headers, Request, BodyReader
 │   ├── response.zig — Status, Headers, Response (status/headers/body, chunked,
 │   │                  SSE, gzip/deflate)
+│   ├── websocket.zig — WebSocket (RFC 6455): upgrade handshake, frame
+│   │                   codec, protocol validation
 │   └── socket.zig   — TCP keep-alive / no-delay socket option setters
 ├── loop/
 │   ├── loop.zig     — multi-task accept + worker loop, idle timeout
@@ -75,6 +77,17 @@ Built on the Zig `std.Io` rework. There is no thread pool managed by this librar
    - The connection continues unless either side sent `Connection: close`.
 
 `Response.send()` is for one-shot bodies. For streaming, use `writeChunk` + `end` (chunked transfer-encoding) or `writeSSE` / `writeEvent` / `writeSSEComment` (Server-Sent Events).
+
+## WebSocket
+
+RFC 6455, in `http/websocket.zig`. The session lives inside the handler's `handle()` — the same pattern as SSE streaming — and the worker task blocks for the session's lifetime:
+
+1. `WebSocket.upgrade(req, res)` validates the request. A valid upgrade sends `101 Switching Protocols` (with the computed `Sec-WebSocket-Accept`), flushes it, and sets `res.upgraded`. An upgrade request that is invalid sends `400` and returns `error.HandshakeRejected`. A request that is not an upgrade attempt sends nothing and returns `error.NotWebSocket` — the handler returns `error.Skipped` so routing continues.
+2. With `res.upgraded`, the loop closes the TCP connection as soon as the handler returns — no keep-alive, no arena reset between requests.
+3. The handler then loops on `ws.next()`: text/binary messages are returned as `Message`, pings are answered with pongs internally, and a received Close is echoed back and surfaced once as `.close`. `next()` returns `error.EndOfStream` when the peer closes the connection and `error.ProtocolError` after a violation (Close already sent with the appropriate code).
+4. Outbound frames go through `sendText` / `sendBinary` / `ping` / `pong` / `close`; each flushes. Inbound frames are validated per the RFC: client frames must be masked, RSV bits and reserved opcodes are rejected with 1002, text must be valid UTF-8 (1007), and close payloads carry a valid status code.
+
+The server never masks its frames, does not negotiate subprotocols or extensions, and has no message-size limit (an oversized frame is an allocation failure, which fails the session).
 
 ## Memory model
 

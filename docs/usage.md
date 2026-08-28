@@ -1,6 +1,6 @@
 # Usage
 
-Walk-through from "hello world" up to routing, static assets, middleware, form data, streaming, and SSE.
+Walk-through from "hello world" up to routing, static assets, middleware, form data, streaming, SSE, and WebSocket.
 
 Every snippet here matches the current `std.Io`-based API; runnable versions live in `src/demo.zig` (minimal) and `src/demo2.zig` (routing + assets + logging).
 
@@ -300,6 +300,34 @@ res.flush();
 ```
 
 The first SSE call sets `Content-Type: text/event-stream` and `Cache-Control: no-cache` if not already set. SSE is incompatible with `Content-Encoding` (asserts in debug).
+
+### WebSocket
+
+A WebSocket route is a regular handler that calls `WebSocket.upgrade` and then serves the session with a `next()` loop. The worker blocks for the session's lifetime; the connection closes when the handler returns.
+
+```zig
+pub const WsEchoHandler = struct {
+    pub fn handle(_: @This(), req: Request, res: *Response) !void {
+        if (!std.mem.eql(u8, req.uri.path, "/ws")) return error.Skipped;
+        var ws = WebSocket.upgrade(req, res) catch |err| switch (err) {
+            error.NotWebSocket => return error.Skipped, // not an upgrade request
+            else => return, // 400 already sent (or the client went away)
+        };
+        while (true) {
+            const msg = ws.next() catch break; // peer closed or protocol error
+            switch (msg) {
+                .text => |t| ws.sendText(t),
+                .binary => |b| ws.sendBinary(b),
+                .close => break, // Close echoed back; session is over
+            }
+        }
+    }
+};
+```
+
+`upgrade` errors: `NotWebSocket` (the request is not an upgrade — return `error.Skipped` so routing continues), `HandshakeRejected` (an invalid upgrade request; the 400 is already on the wire — return and let it stand), and `UpgradeFailed` (the 101 could not be delivered).
+
+Pings are answered automatically; you rarely need `ping`/`pong`/`flush` yourself. `close(code, reason)` initiates the close handshake. Payloads returned by `next()` are arena-owned and valid until the next `next()` call. See `src/demo2.zig` for a live `/ws` echo route.
 
 ### Compression
 

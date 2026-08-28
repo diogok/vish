@@ -209,6 +209,9 @@ pub const Loop = struct {
             return .close;
         };
         if (res.failed) return .close;
+        // The connection speaks another protocol now (WebSocket): no
+        // keep-alive, no next HTTP request.
+        if (res.upgraded) return .close;
 
         const req_conn = req.headers.connection orelse .close;
         const res_conn = res.headers.connection orelse .close;

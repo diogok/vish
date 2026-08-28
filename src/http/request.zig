@@ -116,9 +116,12 @@ pub const Version = enum {
     }
 };
 
-pub const Connection = enum(u1) {
+pub const Connection = enum(u2) {
     keep_alive = 0,
     close = 1,
+    /// `Connection: Upgrade` — an HTTP extension negotiation request
+    /// (in practice, always a WebSocket handshake).
+    upgrade = 2,
 
     pub fn parse(bytes: []const u8) ?Connection {
         return parseHeaderEnum(Connection, bytes);
@@ -183,6 +186,10 @@ pub const Headers = struct {
     host: []const u8 = "",
     user_agent: []const u8 = "",
     idempotency_key: []const u8 = "",
+    upgrade: []const u8 = "",
+    sec_websocket_key: []const u8 = "",
+    sec_websocket_version: []const u8 = "",
+    sec_websocket_protocol: []const u8 = "",
 
     /// Arbitrary headers not matched by the typed fields above. Only
     /// populated when `ListenOptions.parse_extra_headers = true`. Keys

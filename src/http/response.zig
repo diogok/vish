@@ -8,6 +8,7 @@
 /// (`Not_Found` → `404 Not Found`), so renaming a tag changes the
 /// status line on the wire.
 pub const Status = enum(u16) {
+    Switching_Protocols = 101,
     OK = 200,
     Moved_Permanently = 301,
     Found = 302,
@@ -43,14 +44,16 @@ pub const Status = enum(u16) {
 /// `request.Connection` — same tags, same order, same values — because
 /// `Response.fromRequest` converts between the two with
 /// `@enumFromInt(@intFromEnum(...))`.
-pub const Connection = enum(u1) {
+pub const Connection = enum(u2) {
     keep_alive = 0,
     close = 1,
+    upgrade = 2,
 
     pub fn getValue(self: @This()) []const u8 {
         return switch (self) {
             .keep_alive => "keep-alive",
             .close => "close",
+            .upgrade => "Upgrade",
         };
     }
 };
@@ -108,6 +111,7 @@ pub const Headers = struct {
     connection: ?Connection = null,
     location: []const u8 = "",
     set_cookie: []const u8 = "",
+    upgrade: []const u8 = "",
 
     extra: []const ExtraHeader = &.{},
 };
@@ -134,6 +138,12 @@ pub const Response = struct {
     /// check it to stop producing output; the loop closes the
     /// connection when it is set.
     failed: bool = false,
+
+    /// Set when the response switched the connection to another
+    /// protocol (a WebSocket `101`): the connection no longer speaks
+    /// HTTP, so the keep-alive loop must close it once the handler
+    /// returns.
+    upgraded: bool = false,
 
     writer: *std.Io.Writer,
 

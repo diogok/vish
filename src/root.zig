@@ -6,6 +6,7 @@ const request = @import("http/request.zig");
 const response = @import("http/response.zig");
 const server = @import("http/server.zig");
 const socket = @import("http/socket.zig");
+const websocket = @import("http/websocket.zig");
 
 const handler = @import("loop/handler.zig");
 const loop = @import("loop/loop.zig");
@@ -20,6 +21,7 @@ pub const SSEMessage = response.SSEMessage;
 pub const Server = server.Server;
 pub const Connection = server.Connection;
 pub const ListenOptions = server.ListenOptions;
+pub const WebSocket = websocket.WebSocket;
 
 pub const Handler = handler.Handler;
 pub const HandleError = handler.Error;
@@ -39,6 +41,7 @@ test {
     _ = response;
     _ = server;
     _ = socket;
+    _ = websocket;
 
     _ = signal;
     _ = handler;

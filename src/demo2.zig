@@ -18,9 +18,12 @@ fn run(init: std.process.Init) !void {
     defer server.deinit();
     try server.listen();
 
+    var ws_state = WsEchoHandler{};
+    var ws_handler = vish.Handler.wrap(WsEchoHandler).init(&ws_state);
     var struct_handler = vish.utils.router.StructRouter(MyHandler).init(.{});
     var static_handler = vish.utils.router.StaticRouter(assets).init(io);
     var combined_handlers = vish.utils.router.CombinedRouter.init(&.{
+        ws_handler.interface(),
         struct_handler.interface(),
         static_handler.interface(),
     });
@@ -33,6 +36,26 @@ fn run(init: std.process.Init) !void {
 
     vish.waitInterrupt(io);
 }
+
+/// WebSocket echo on `/ws`: answers text and binary messages
+/// verbatim. Non-WebSocket requests skip to the next handler.
+pub const WsEchoHandler = struct {
+    pub fn handle(_: @This(), req: vish.Request, res: *vish.Response) !void {
+        if (!std.mem.eql(u8, req.uri.path, "/ws")) return error.Skipped;
+        var ws = vish.WebSocket.upgrade(req, res) catch |err| switch (err) {
+            error.NotWebSocket => return error.Skipped,
+            else => return,
+        };
+        while (true) {
+            const msg = ws.next() catch break;
+            switch (msg) {
+                .text => |t| ws.sendText(t),
+                .binary => |b| ws.sendBinary(b),
+                .close => break,
+            }
+        }
+    }
+};
 
 pub const MyHandler = struct {
     pub fn @"GET /"(

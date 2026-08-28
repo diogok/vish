@@ -51,6 +51,8 @@ CombinedRouter: Chains multiple handlers together, attempting each in order unti
 
 - Chunked transfer encoding via `writeChunk` / `end`
 - Server-Sent Events via `writeSSE` / `writeEvent` / `writeSSEComment`
+- WebSocket (RFC 6455) via `WebSocket.upgrade` — handshake, text/binary
+  frames, ping/pong, and close over the upgraded connection
 
 ### Compression
 
