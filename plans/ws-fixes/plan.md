@@ -126,22 +126,22 @@ the old (wrong or limited) behavior.
   - [x] verify: `zig build test`, `zig build`, demo probe (400 closes
         promptly; body-bearing GET → 400; non-GET without Upgrade →
         routes through)
-- [ ] S3 — F7/F8/F9 close-handshake strictness:
-  - [ ] `close_surfaced` flag; second Close → `ProtocolError` (F7)
-  - [ ] close-code range: 0–999 rejected incl. `0x0000` (F8)
-  - [ ] failed pong/close-echo write → latch + `ReadFailed` (F9)
-  - [ ] `next()` doc: transport-failure line
-  - [ ] tests: second Close frame → ProtocolError; `0x0000` close →
+- [x] S3 — F7/F8/F9 close-handshake strictness:
+  - [x] `close_surfaced` flag; second Close → `ProtocolError` (F7)
+  - [x] close-code range: 0–999 rejected incl. `0x0000` (F8)
+  - [x] failed pong/close-echo write → latch + `ReadFailed` (F9)
+  - [x] `next()` doc: transport-failure line
+  - [x] tests: second Close frame → ProtocolError; `0x0000` close →
         close 1002; ping with failing writer → ReadFailed + latch
-  - [ ] verify: `zig build test`
-- [ ] S4 — F5 max payload:
-  - [ ] `max_payload` field + `max_payload_default` (16 MiB)
-  - [ ] `readFrame`: enforce before `readAlloc` → 1009
-  - [ ] `appendFrag`: cumulative check → 1009
-  - [ ] tests: single frame over cap → ProtocolError + close 1009
+  - [x] verify: `zig build test`
+- [x] S4 — F5 max payload:
+  - [x] `max_payload` field + `max_payload_default` (16 MiB)
+  - [x] `readFrame`: enforce before `readAlloc` → 1009
+  - [x] `appendFrag`: cumulative check → 1009
+  - [x] tests: single frame over cap → ProtocolError + close 1009
         (0x03e9); fragments summing over cap → ProtocolError
-  - [ ] docs: architecture.md size-limit line
-  - [ ] verify: `zig build test`, `zig build`
+  - [x] docs: architecture.md size-limit line
+  - [x] verify: `zig build test`, `zig build`
 - [ ] S5 — F6 subprotocol negotiation:
   - [ ] `selectSubprotocol(value) ?[]const u8` helper
   - [ ] `upgrade()`: echo the selected subprotocol in the 101 when the
@@ -225,7 +225,7 @@ the old (wrong or limited) behavior.
   cap (set the private field in same-file tests). Update the
   architecture.md size line.
 - **Verify:** `zig build test` green (new 1009 tests assert close
-  bytes 0x03 0xe9); `zig build` green.
+  bytes 0x03 0xf1); `zig build` green.
 - **Stop-when:** verify green; commit "ws-fixes: max payload cap with
   close 1009 (plan T4)" with S4 crossed, progress, handover.
 

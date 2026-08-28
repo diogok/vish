@@ -66,9 +66,15 @@ pub const WebSocket = struct {
     /// Set once a Close frame has been sent or received: the session
     /// is tearing down.
     closed: bool = false,
+    /// Set once a received Close was surfaced as `.close`: a second
+    /// Close from the peer is a protocol violation.
+    close_surfaced: bool = false,
     /// Sticky transport-failure flag: every later write is a no-op and
     /// `next()` fails.
     failed: bool = false,
+    /// Maximum inbound payload, per frame and per reassembled message;
+    /// over-size input fails the connection with 1009.
+    max_payload: usize = max_payload_default,
 
     /// `Sec-WebSocket-Key` is base64 of exactly 16 bytes (RFC 6455
     /// §4.1); in the standard alphabet with padding that is 24 chars.
@@ -78,6 +84,8 @@ pub const WebSocket = struct {
     /// The magic GUID concatenated with the key before the SHA-1
     /// (RFC 6455 §4.1).
     const magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    /// The default for `max_payload`.
+    const max_payload_default = 16 * 1024 * 1024;
 
     /// Errors from `upgrade`. `NotWebSocket`: the request is not a
     /// WebSocket upgrade request and nothing was sent — the caller
@@ -181,18 +189,24 @@ pub const WebSocket = struct {
     /// Read the next complete message. Control frames are consumed
     /// internally: pings are answered with pong, pongs are discarded.
     /// A received Close frame is answered and surfaced as `.close`
-    /// exactly once; afterwards — and whenever the peer closes the TCP
+    /// exactly once; a second Close frame from the peer is a protocol
+    /// violation. Afterwards — and whenever the peer closes the TCP
     /// connection — the session is over and `next()` returns
     /// `error.EndOfStream`. A protocol violation returns
-    /// `error.ProtocolError` after the appropriate Close frame has been
-    /// sent.
+    /// `error.ProtocolError` after the appropriate Close frame has
+    /// been sent. A failed write of an automatic pong or close echo
+    /// returns `error.ReadFailed` and latches the session failed.
     pub fn next(self: *@This()) !Message {
         if (self.failed) return error.ReadFailed;
         while (true) {
             const f = try self.readFrame();
             switch (f.opcode) {
                 .ping => {
-                    try self.writeFrame(true, .pong, &[_][]const u8{f.payload});
+                    self.writeFrame(true, .pong, &[_][]const u8{f.payload}) catch {
+                        // writeFrame latched `failed`; the transport
+                        // is gone, do not leak the raw write error.
+                        return error.ReadFailed;
+                    };
                     continue;
                 },
                 .pong => continue,
@@ -203,22 +217,33 @@ pub const WebSocket = struct {
                         code = (@as(u16, f.payload[0]) << 8) | @as(u16, f.payload[1]);
                         reason = f.payload[2..];
                     }
-                    // Exactly one payload byte, the no-status 1005, the
-                    // on-the-wire 1006, or an out-of-range code are all
-                    // protocol errors (RFC 6455 §7.1.5, §7.4).
-                    if (f.payload.len == 1 or code == 1005 or code == 1006 or
-                        (code != 0 and (code < 1000 or code > 4999)))
+                    // Exactly one payload byte, a 0-999 code (an
+                    // explicit `0x0000` included), the local-only
+                    // 1005/1006 on the wire, or an out-of-range code
+                    // are protocol errors (RFC 6455 §7.1.5, §7.4). A
+                    // 0-byte payload is the legal "no status" and
+                    // stays admissible.
+                    if (f.payload.len == 1 or (f.payload.len >= 2 and
+                        (code < 1000 or code > 4999 or code == 1005 or code == 1006)))
                     {
                         return self.failProtocol(.protocol_error, "");
                     }
                     if (!std.unicode.utf8ValidateSlice(reason)) {
                         return self.failProtocol(.invalid_payload, "");
                     }
+                    // A peer MUST NOT send frames after its Close
+                    // (RFC 6455 §5.5.1): a second one fails. A Close
+                    // answering our own close() is still the first
+                    // we surface.
+                    if (self.close_surfaced) return self.failProtocol(.protocol_error, "");
+                    self.close_surfaced = true;
                     if (!self.closed) {
                         self.closed = true;
                         // Echo the peer's payload back: the spec allows
                         // it to carry a code, so keep whatever it had.
-                        try self.writeFrame(true, .close, &[_][]const u8{f.payload});
+                        self.writeFrame(true, .close, &[_][]const u8{f.payload}) catch {
+                            return error.ReadFailed;
+                        };
                     }
                     return .{ .close = .{ .code = code, .reason = reason } };
                 },
@@ -361,6 +386,12 @@ pub const WebSocket = struct {
         // "A server MUST close the connection upon receiving a frame
         // that does not have the MASK bit set" (RFC 6455 §5.1).
         if (!masked) return self.failProtocol(.protocol_error, "");
+        // The payload length is attacker-supplied and unbounded on
+        // the wire; cap it before readAlloc sizes the buffer (RFC
+        // 6455 sets no limit).
+        if (len > self.max_payload) {
+            return self.failProtocol(.message_too_big, "");
+        }
 
         const mask = try self.reader.take(4);
         var payload: []const u8 = &.{};
@@ -396,6 +427,11 @@ pub const WebSocket = struct {
     }
 
     fn appendFrag(self: *@This(), chunk: []const u8) !void {
+        // Single frames are capped in readFrame; this bounds the sum
+        // across a fragment sequence.
+        if (self.frag_len + chunk.len > self.max_payload) {
+            return self.failProtocol(.message_too_big, "");
+        }
         if (self.frag_len == 0) {
             // realloc rather than alloc: a finished message keeps the
             // buffer for reuse, and plain allocators would leak it.
@@ -865,6 +901,60 @@ test "next fails the connection with 1002 on an oversized control frame" {
     try testing.expectError(error.ProtocolError, ws.next());
 }
 
+test "next fails the connection with 1009 on a frame over max_payload" {
+    const payload = [_]u8{0xAA} ** 50;
+    const bytes = frame(true, 0x2, true, &payload);
+    defer testing.allocator.free(bytes);
+    var out: [64]u8 = undefined;
+    var reader = std.Io.Reader.fixed(bytes);
+    var writer = std.Io.Writer.fixed(&out);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var ws = WebSocket{ .reader = &reader, .writer = &writer, .allocator = arena.allocator(), .max_payload = 40 };
+
+    try testing.expectError(error.ProtocolError, ws.next());
+    // Close 1009: 0x88, len 2, 0x03 0xf1.
+    try testing.expectEqual(@as(u8, 0x88), out[0]);
+    try testing.expectEqual(@as(u8, 2), out[1]);
+    try testing.expectEqual(@as(u8, 0x03), out[2]);
+    try testing.expectEqual(@as(u8, 0xf1), out[3]);
+}
+
+test "next fails the connection with 1009 when fragments sum over max_payload" {
+    const first = frame(false, 0x2, true, "0123456789");
+    defer testing.allocator.free(first);
+    const second = frame(true, 0x0, true, "0123456789");
+    defer testing.allocator.free(second);
+    var all: [32]u8 = undefined;
+    @memcpy(all[0..first.len], first);
+    @memcpy(all[first.len..][0..second.len], second);
+    var out: [64]u8 = undefined;
+    var reader = std.Io.Reader.fixed(&all);
+    var writer = std.Io.Writer.fixed(&out);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var ws = WebSocket{ .reader = &reader, .writer = &writer, .allocator = arena.allocator(), .max_payload = 15 };
+
+    try testing.expectError(error.ProtocolError, ws.next());
+    try testing.expectEqual(@as(u8, 0x03), out[2]);
+    try testing.expectEqual(@as(u8, 0xf1), out[3]);
+}
+
+test "next accepts a frame exactly at max_payload" {
+    const payload = [_]u8{0xAA} ** 10;
+    const bytes = frame(true, 0x2, true, &payload);
+    defer testing.allocator.free(bytes);
+    var out: [64]u8 = undefined;
+    var reader = std.Io.Reader.fixed(bytes);
+    var writer = std.Io.Writer.fixed(&out);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var ws = WebSocket{ .reader = &reader, .writer = &writer, .allocator = arena.allocator(), .max_payload = 10 };
+
+    const msg = try ws.next();
+    try testing.expectEqualSlices(u8, &payload, msg.binary);
+}
+
 test "next fails the connection with 1002 on a stray continuation frame" {
     const bytes = frame(true, 0x0, true, "x");
     defer testing.allocator.free(bytes);
@@ -931,6 +1021,84 @@ test "next fails the connection with 1002 on a malformed close payload" {
         try testing.expectEqual(@as(u8, 0x03), out[2]);
         try testing.expectEqual(@as(u8, 0xea), out[3]);
     }
+}
+
+test "next fails the connection with 1002 on a second close frame" {
+    const code = [2]u8{ 0x03, 0xe8 }; // 1000
+    const first = frame(true, 0x8, true, &code);
+    defer testing.allocator.free(first);
+    const second = frame(true, 0x8, true, &code);
+    defer testing.allocator.free(second);
+    var all: [16]u8 = undefined;
+    @memcpy(all[0..first.len], first);
+    @memcpy(all[first.len..][0..second.len], second);
+    var out: [64]u8 = undefined;
+    var reader = std.Io.Reader.fixed(&all);
+    var writer = std.Io.Writer.fixed(&out);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var ws = WebSocket{ .reader = &reader, .writer = &writer, .allocator = arena.allocator() };
+
+    const msg = try ws.next();
+    try testing.expectEqual(@as(u16, 1000), msg.close.code);
+    try testing.expectError(error.ProtocolError, ws.next());
+    // The echo went out once; the violation adds no further frame.
+    try testing.expectEqual(@as(usize, 4), writer.end);
+    // The reader is exhausted: the session is over.
+    try testing.expectError(error.EndOfStream, ws.next());
+}
+
+test "next fails the connection with 1002 on an explicit zero close code" {
+    const payload = [2]u8{ 0x00, 0x00 };
+    const bytes = frame(true, 0x8, true, &payload);
+    defer testing.allocator.free(bytes);
+    var out: [64]u8 = undefined;
+    var reader = std.Io.Reader.fixed(bytes);
+    var writer = std.Io.Writer.fixed(&out);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var ws = WebSocket{ .reader = &reader, .writer = &writer, .allocator = arena.allocator() };
+
+    try testing.expectError(error.ProtocolError, ws.next());
+    // Close 1002: 0x88, len 2, 0x03 0xea.
+    try testing.expectEqual(@as(u8, 0x88), out[0]);
+    try testing.expectEqual(@as(u8, 2), out[1]);
+    try testing.expectEqual(@as(u8, 0x03), out[2]);
+    try testing.expectEqual(@as(u8, 0xea), out[3]);
+}
+
+test "next accepts a close frame with no status code" {
+    const bytes = frame(true, 0x8, true, &[_]u8{});
+    defer testing.allocator.free(bytes);
+    var out: [64]u8 = undefined;
+    var reader = std.Io.Reader.fixed(bytes);
+    var writer = std.Io.Writer.fixed(&out);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var ws = WebSocket{ .reader = &reader, .writer = &writer, .allocator = arena.allocator() };
+
+    const msg = try ws.next();
+    try testing.expectEqual(@as(u16, 0), msg.close.code);
+    try testing.expectEqualStrings("", msg.close.reason);
+    // Echoed close: 0x88, len 0.
+    try testing.expectEqual(@as(u8, 0x88), out[0]);
+    try testing.expectEqual(@as(u8, 0), out[1]);
+}
+
+test "next returns ReadFailed when the automatic pong write fails" {
+    var bytes: [6]u8 = .{ 0x89, 0x80, 0x00, 0x00, 0x00, 0x00 }; // masked ping, no payload
+    var reader = std.Io.Reader.fixed(&bytes);
+    var failing = std.Io.Writer.failing;
+    var ws = WebSocket{
+        .reader = &reader,
+        .writer = &failing,
+        .allocator = testing.allocator,
+    };
+
+    try testing.expectError(error.ReadFailed, ws.next());
+    // The latch is set: a later next() fails without reading.
+    try testing.expect(ws.failed);
+    try testing.expectError(error.ReadFailed, ws.next());
 }
 
 test "next returns a 16-bit extended-length binary message" {

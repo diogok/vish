@@ -87,7 +87,7 @@ RFC 6455, in `http/websocket.zig`. The session lives inside the handler's `handl
 3. The handler then loops on `ws.next()`: text/binary messages are returned as `Message`, pings are answered with pongs internally, and a received Close is echoed back and surfaced once as `.close`. `next()` returns `error.EndOfStream` when the peer closes the connection and `error.ProtocolError` after a violation (Close already sent with the appropriate code).
 4. Outbound frames go through `sendText` / `sendBinary` / `ping` / `pong` / `close`; each flushes. Inbound frames are validated per the RFC: client frames must be masked, RSV bits and reserved opcodes are rejected with 1002, text must be valid UTF-8 (1007), and close payloads carry a valid status code.
 
-The server never masks its frames, does not negotiate subprotocols or extensions, and has no message-size limit (an oversized frame is an allocation failure, which fails the session).
+The server never masks its frames, does not negotiate subprotocols or extensions, and caps inbound payloads: a frame or reassembled message over `max_payload` (default 16 MiB, private field) fails the connection with close 1009.
 
 ## Memory model
 
