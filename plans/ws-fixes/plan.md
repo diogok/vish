@@ -152,14 +152,14 @@ the old (wrong or limited) behavior.
         chat, superchat` → 101 carries `Sec-WebSocket-Protocol: chat`
   - [x] docs: architecture.md subprotocol line, usage.md note
   - [x] verify: `zig build test`, `zig build`, demo probe
-- [ ] S6 — wrap-up:
-  - [ ] full re-verify: `zig build test`, `zig build`, complete demo
+- [x] S6 — wrap-up:
+  - [x] full re-verify: `zig build test`, `zig build`, complete demo
         probe (handshake/echo/ping/close + every new behavior: 400
         framing, body-bearing GET, subprotocol echo, POST-without-Upgrade
         routing)
-  - [ ] docs consistency pass (usage.md error list, architecture.md
+  - [x] docs consistency pass (usage.md error list, architecture.md
         WebSocket section)
-  - [ ] verify: everything green, plan items all crossed, final
+  - [x] verify: everything green, plan items all crossed, final
         progress entry
 
 ## Task cards

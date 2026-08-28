@@ -327,7 +327,7 @@ pub const WsEchoHandler = struct {
 
 `upgrade` errors: `NotWebSocket` (the request is not an upgrade — return `error.Skipped` so routing continues), `HandshakeRejected` (an invalid upgrade request; the 400 is already on the wire — return and let it stand), and `UpgradeFailed` (the 101 could not be delivered).
 
-Pings are answered automatically; you rarely need `ping`/`pong`/`flush` yourself. `close(code, reason)` initiates the close handshake. Payloads returned by `next()` are arena-owned and valid until the next `next()` call. When the client sends `Sec-WebSocket-Protocol`, the 101 echoes the first offered subprotocol. See `src/demo2.zig` for a live `/ws` echo route.
+Pings are answered automatically; you rarely need `ping`/`pong`/`flush` yourself. `close(code, reason)` initiates the close handshake. Payloads returned by `next()` are arena-owned and valid until the next `next()` call. When the client sends `Sec-WebSocket-Protocol`, the 101 echoes the first offered subprotocol. Inbound messages over the payload cap (default 16 MiB) fail the session with close 1009. See `src/demo2.zig` for a live `/ws` echo route.
 
 ### Compression
 

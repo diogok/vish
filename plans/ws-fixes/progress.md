@@ -1,5 +1,28 @@
 # Progress — WebSocket review fixes
 
+## Session 4 — T6: wrap-up (S6), plan closed
+
+Closed the plan. Full re-verify: `zig build test` 122/122,
+`zig build` green, and the live probe extended from 6 to 8 cases
+(+ ping→pong, + close handshake) — all passing against a fresh demo2:
+400 framing with prompt close (EOF 0.1 ms), body-bearing GET → 400,
+`POST /ws` without Upgrade → 404, 101/accept/text echo, subprotocol
+echo, binary echo, ping→pong, close-echo + EOF.
+
+Docs pass: architecture.md's WebSocket section was already current
+(subprotocol echo, 1009 cap, close-once, code range) and the
+usage.md error list matches the real `upgrade` errors — no stale
+claims. One addition: a usage.md sentence noting that inbound
+messages over the payload cap (default 16 MiB) fail the session with
+close 1009.
+
+S6 done; plan closed; T1–T6 all committed. One bookkeeping note for
+the record: the S3 (F7/F8/F9) code changes landed inside the T4
+commit (`20f986b`, message says T4 but its diff carries both stages)
+— the session ran out of context mid-stage. There is no commit
+labeled "plan T3". All plan work is in; branch `websocket` is ready
+for the user to review and merge.
+
 ## Session 3 — T2 (S2) + T3 (S3) + T4 (S4) + T5 (S5)
 
 Landed F2/F3/F4/F10 (T2, commit `c05d22f`), F7/F8/F9 (T3), F5 (T4,
