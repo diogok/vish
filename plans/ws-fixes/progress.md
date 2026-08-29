@@ -1,5 +1,37 @@
 # Progress — WebSocket review fixes
 
+## Session 5 — post-review fixes (2026-08-29)
+
+A review of the branch found five defects, all fixed (uncommitted at
+the time of writing; `zig build test` 131/131, `zig build` green,
+`zig fmt --check` clean): (1) the unmask key was a slice into the
+reader buffer and got clobbered by the payload read — payload
+corruption, reproduced over TCP; (2) fragment reassembly was
+quadratic in arena memory; (3) every inbound frame was `readAlloc`'d
+from the never-reset arena for the session's lifetime; (4)
+`Connection: keep-alive, Upgrade` (Firefox) was rejected with 400;
+(5) `upgrade()` stored a pointer to a block-scoped `extra` array and
+read it after the block ended. Details in notes.md ("post-review
+fixes"). Four new tests: `Connection.parse` token list, receive-buffer
+reuse (plain allocator, leak-checked), refill-spanning payload over a
+live loop, Firefox-style handshake over a live loop.
+
+Second batch, same session, the remaining review items: (6) a session
+idle deadline — `ws.idle_timeout_in_millis` (default 0) via the new
+`socket.waitReadable`, shared with the loop's keep-alive reaper;
+`Request` gained `stream`/`io` to make the socket reachable. (7) the
+loop's `.linger` close for upgraded connections — `shutdown(.send)`
+then a bounded drain (`ListenOptions.upgrade_linger_in_millis`,
+default 1 s) so a failure Close or a `close()`-and-return is
+delivered instead of reset. (8) after our own Close the peer's
+in-flight frames are discarded until its Close; a protocol failure is
+now sticky (`violated`), so one existing test's final assertion moved
+from EndOfStream to ProtocolError. Five more tests (discard window,
+sticky failure, and three live-loop: 1009 + clean EOF, close-and-
+return drained, idle deadline → 1001). `zig build test` 136/136,
+`zig build` green, `zig fmt --check` clean. Nothing from the review
+is left open.
+
 ## Session 4 — T6: wrap-up (S6), plan closed
 
 Closed the plan. Full re-verify: `zig build test` 122/122,

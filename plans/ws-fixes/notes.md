@@ -38,6 +38,47 @@ re-derive them.
   frees against slice length (allocate exact wire sizes in helpers);
   stream reader/writer APIs reached via `.interface`.
 
+## Verified facts — post-review fixes (2026-08-29)
+
+- A slice from `Reader.take` does NOT survive a following payload read:
+  `readSliceShort` → `readVec` → `writableVector`
+  (`lib/std/Io/Reader.zig:2044-2058`) sets `seek = end = 0` and hands
+  the whole buffer to `recv` as spillover once the buffered bytes are
+  consumed, so the next frame's bytes land at `buffer[0..]` — right
+  where the mask slice pointed. Reproduced over TCP: a 10000-byte frame
+  followed by a second frame in the same write echoed garbage from
+  byte 0. Fix: copy the mask (`takeArray(4).*`); regression test
+  "payload spanning a read-buffer refill".
+- Arena `realloc` only grows in place when the block is the arena's
+  most recent allocation; a `readAlloc` between two `appendFrag`
+  reallocs defeated that, making fragment reassembly quadratic in
+  arena memory (1 MiB in 1 KiB fragments ≈ 512 MiB). Data payloads now
+  read straight into one session `buf` (doubling growth); control
+  payloads into a fixed `control_buf`. Nothing per-frame goes to the
+  arena any more — the buffer-reuse unit test runs on
+  `testing.allocator` so the leak check enforces it.
+- `Connection` is a token list: Firefox's handshake sends
+  `keep-alive, Upgrade`. `Connection.parse` now tokenizes; `upgrade()`
+  sets `res.headers.connection = .upgrade` itself.
+- Threaded Io reports a peer FIN from `receiveManyTimeout` as a
+  successful receive with `data.len == 0` (`Threaded.zig:12913-12928`),
+  not an error — the linger drain in `Loop.lingerClose` stops on that.
+  `Io.Timeout` has a `.deadline` variant (`Timeout.toDeadline(io)`), so
+  the drain is bounded as a whole, not per receive.
+- Closing a socket with unread input makes Linux send RST and drop
+  unsent output. The loop now returns `.linger` for an upgraded
+  connection: `shutdown(.send)` (the server initiates the TCP close, per
+  RFC 6455 §7.1.1) and a drain until the peer's FIN or
+  `ListenOptions.upgrade_linger_in_millis` (default 1 s).
+- `Request` now carries `stream` and `io` (null outside a live
+  connection); `WebSocket.idle_timeout_in_millis` uses them through the
+  shared `socket.waitReadable` (the loop's keep-alive reaper uses the
+  same helper). Only the gap between frames is timed.
+- RFC 6455 close semantics as now implemented: after *our* Close the
+  peer's in-flight data/pings are discarded (§1.4) until its Close
+  arrives; after the *peer's* Close any further frame is 1002 (§5.5.1);
+  a protocol failure is sticky — `next()` never reads again (§7.1.7).
+
 ## Verified facts — current code (before fixes)
 
 - `Response.fromRequest` (response.zig:157-169) copies the request's

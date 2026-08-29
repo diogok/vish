@@ -13,6 +13,13 @@ pub const ListenOptions = struct {
     /// already-arriving request is not interrupted. Set to 0 to disable.
     idle_timeout_in_millis: u32 = 1000,
 
+    /// After a handler switches protocols (a WebSocket session) and
+    /// returns, the loop shuts down the send side and drains the peer's
+    /// remaining input for at most this long before closing the socket,
+    /// so the peer receives the final frames instead of a reset. Set to
+    /// 0 to close immediately.
+    upgrade_linger_in_millis: u32 = 1000,
+
     read_buffer_size: usize = 8 * 1024,
     write_buffer_size: usize = 8 * 1024,
 
@@ -186,6 +193,8 @@ pub const Connection = struct {
             return err;
         };
         request.client_address = self.stream.socket.address;
+        request.stream = self.stream;
+        request.io = self.server.io;
         return request;
     }
 };

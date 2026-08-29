@@ -28,9 +28,8 @@ pub const CloseCode = enum(u16) {
     internal_error = 1011,
 };
 
-/// One complete inbound message. Payloads are owned by the
-/// connection (the per-request arena in production) and stay valid
-/// until the next `next()` call or the session ends.
+/// One complete inbound message. Payloads point into the session's
+/// receive buffer and stay valid until the next `next()` call.
 pub const Message = union(enum) {
     text: []const u8,
     binary: []const u8,
@@ -46,14 +45,32 @@ pub const Message = union(enum) {
 reader: *std.Io.Reader,
 writer: *std.Io.Writer,
 allocator: std.mem.Allocator,
+/// The connection's `Io` and socket, taken from the request; null
+/// outside a live connection (tests), which disables the idle
+/// deadline.
+io: ?std.Io = null,
+stream: ?std.Io.net.Stream = null,
+/// Longest gap between two inbound frames before the session is
+/// closed with 1001 (going away) and `next()` returns
+/// `error.Timeout`. 0, the default, waits forever — a silent peer
+/// then holds its worker task until it disconnects. As with the HTTP
+/// idle deadline, only the wait for a frame's first byte is timed.
+idle_timeout_in_millis: u32 = 0,
 
 /// Opcode of the fragment sequence currently being assembled, null
 /// when none is open.
 frag_opcode: ?OpCode = null,
-/// Accumulated payload of the open fragment sequence.
-frag: []u8 = &.{},
-/// Bytes currently held in `frag`.
+/// Receive buffer for data-frame payloads, reused across messages
+/// and grown geometrically: a single-frame message occupies
+/// `[0..len]`, an open fragment sequence accumulates at
+/// `[0..frag_len]`. The slices `next()` returns point into it.
+buf: []u8 = &.{},
+/// Bytes of the open fragment sequence held in `buf`.
 frag_len: usize = 0,
+/// Payload of the control frame most recently read. Control frames
+/// may interleave with a fragment sequence (RFC 6455 §5.4), so they
+/// must not touch `buf`.
+control_buf: [control_payload_max]u8 = undefined,
 /// Set once a Close frame has been sent or received: the session
 /// is tearing down.
 closed: bool = false,
@@ -63,8 +80,14 @@ close_seen: bool = false,
 /// Sticky transport-failure flag: every later write is a no-op and
 /// `next()` fails.
 failed: bool = false,
-/// Maximum inbound payload, per frame and per reassembled message;
-/// over-size input fails the connection with 1009.
+/// Set once the connection has been failed for a protocol violation
+/// (RFC 6455 §7.1.7): `next()` keeps returning `error.ProtocolError`
+/// without reading further.
+violated: bool = false,
+/// Maximum inbound data payload, per frame and per reassembled
+/// message; over-size input fails the connection with 1009. Control
+/// frames are bounded by the 125-byte rule instead. Handlers may
+/// lower it before the first `next()`.
 max_payload: usize = max_payload_default,
 
 /// `Sec-WebSocket-Key` is base64 of exactly 16 bytes (RFC 6455
@@ -156,21 +179,22 @@ pub fn upgrade(req: Request, res: *Response) !@This() {
     const accept_b64 = b64.Encoder.encode(&accept, &digest);
 
     res.status = .Switching_Protocols;
+    // Set explicitly rather than inherited from the request: the
+    // client may have sent a token list (`keep-alive, Upgrade`),
+    // and the 101 MUST answer with exactly `Upgrade` (§4.2.2).
+    res.headers.connection = .upgrade;
     res.headers.upgrade = "websocket";
+    // Function-scoped: `res.send()` below reads through the slice.
+    var extra: [2]response.ExtraHeader = undefined;
+    extra[0] = .{ .name = "Sec-WebSocket-Accept", .value = accept_b64 };
+    var extra_len: usize = 1;
     // §4.1: when the client offered subprotocols, the 101 MUST
     // name the one selected — here, the first non-empty token.
     if (selectSubprotocol(req.headers.sec_websocket_protocol)) |sub| {
-        const extra = [_]response.ExtraHeader{
-            .{ .name = "Sec-WebSocket-Accept", .value = accept_b64 },
-            .{ .name = "Sec-WebSocket-Protocol", .value = sub },
-        };
-        res.headers.extra = &extra;
-    } else {
-        const extra = [_]response.ExtraHeader{
-            .{ .name = "Sec-WebSocket-Accept", .value = accept_b64 },
-        };
-        res.headers.extra = &extra;
+        extra[1] = .{ .name = "Sec-WebSocket-Protocol", .value = sub };
+        extra_len = 2;
     }
+    res.headers.extra = extra[0..extra_len];
     res.send();
     if (res.failed) return error.UpgradeFailed;
     // The client waits for the 101 before speaking WebSocket: the
@@ -185,32 +209,40 @@ pub fn upgrade(req: Request, res: *Response) !@This() {
         .reader = req.reader,
         .writer = req.writer,
         .allocator = req.allocator,
+        .io = req.io,
+        .stream = req.stream,
     };
 }
 
 /// Read the next complete message. Control frames are consumed
 /// internally: pings are answered with pong, pongs are discarded.
 /// A received Close frame is answered and surfaced as `.close`
-/// exactly once; once the session is closed — by a Close in either
-/// direction or by a violation — any peer frame other than the
-/// closing Close is a protocol violation. When the peer closes the
-/// TCP connection, `next()` returns `error.EndOfStream`. A protocol
-/// violation returns `error.ProtocolError`, the corresponding Close
-/// frame sent best effort. A failed write of an automatic pong or
-/// close echo returns `error.ReadFailed` and latches the session
-/// failed.
+/// exactly once; nothing may follow the peer's Close — a further
+/// frame is a protocol violation. After our own `close()`, frames
+/// the peer sent before it saw ours are legal and discarded until
+/// its Close arrives. When the peer closes the TCP connection,
+/// `next()` returns `error.EndOfStream`. A protocol violation
+/// returns `error.ProtocolError`, the corresponding Close frame sent
+/// best effort, and every later call returns it again without
+/// reading. A failed write of an automatic pong or close echo
+/// returns `error.ReadFailed` and latches the session failed. With
+/// `idle_timeout_in_millis` set, a silent peer is sent Close 1001
+/// and `next()` returns `error.Timeout`.
 pub fn next(self: *@This()) !Message {
     if (self.failed) return error.ReadFailed;
+    if (self.violated) return error.ProtocolError;
     while (true) {
+        try self.waitForFrame();
         const f = try self.readFrame();
-        // The session is tearing down: per RFC 6455 §5.5.1 the peer
-        // may only send the closing Close itself, and only once — a
-        // Close answering our own close() is that one.
-        if (self.closed and (f.opcode != .close or self.close_seen)) {
-            return self.failProtocol(.protocol_error, "");
-        }
+        // Nothing may follow the peer's Close (RFC 6455 §5.5.1), a
+        // second Close included.
+        if (self.close_seen) return self.failProtocol(.protocol_error, "");
         switch (f.opcode) {
             .ping => {
+                // After our own Close no frame goes out (§5.5.1): the
+                // ping is dropped with the rest of the peer's
+                // in-flight frames.
+                if (self.closed) continue;
                 self.writeFrame(true, .pong, &[_][]const u8{f.payload}) catch {
                     // writeFrame latched `failed`; the transport
                     // is gone, do not leak the raw write error.
@@ -254,51 +286,35 @@ pub fn next(self: *@This()) !Message {
                 }
                 return .{ .close = .{ .code = code, .reason = reason } };
             },
-            // Data frames: text, binary, continuation.
+            // Data frames: text, binary, continuation. readFrame has
+            // checked the frame against the fragmentation state and
+            // placed its payload at `buf[frag_len..]`, so a fragment
+            // is appended by bumping the length.
             else => {
-                const op = f.opcode;
-                if (op == .continuation) {
-                    if (self.frag_opcode == null) return self.failProtocol(.protocol_error, "");
-                } else if (self.frag_opcode != null) {
-                    // A new data frame while a sequence is open.
-                    return self.failProtocol(.protocol_error, "");
-                } else if (!f.fin) {
-                    self.frag_opcode = op;
-                }
-
                 if (!f.fin) {
-                    try self.appendFrag(f.payload);
+                    if (self.frag_opcode == null) self.frag_opcode = f.opcode;
+                    self.frag_len += f.payload.len;
                     continue;
                 }
-
-                if (self.frag_opcode == null) {
-                    // A complete single-frame message: hand the
-                    // frame's own buffer back, no copy.
-                    if (op == .text) {
-                        if (!std.unicode.utf8ValidateSlice(f.payload)) {
-                            return self.failProtocol(.invalid_payload, "");
-                        }
-                        return .{ .text = f.payload };
-                    }
-                    return .{ .binary = f.payload };
-                }
-
-                // Final fragment of a sequence.
-                const message_opcode = self.frag_opcode.?;
+                // A complete message: a single frame at `buf[0..]`,
+                // or the final fragment closing the open sequence.
+                const message_opcode = self.frag_opcode orelse f.opcode;
+                const message = self.buf[0 .. self.frag_len + f.payload.len];
+                // Reset the sequence, not the buffer: the returned
+                // slice points into it, and the next message reuses
+                // its capacity.
                 self.frag_opcode = null;
-                try self.appendFrag(f.payload);
-                const msg_len = self.frag_len;
-                // Reset the length, not the buffer: the returned
-                // slice points into it, and the next sequence
-                // reuses its capacity.
                 self.frag_len = 0;
+                // Sent before the peer saw our Close: legal, and
+                // discarded (§1.4) while its Close is awaited.
+                if (self.closed) continue;
                 if (message_opcode == .text) {
-                    if (!std.unicode.utf8ValidateSlice(self.frag[0..msg_len])) {
+                    if (!std.unicode.utf8ValidateSlice(message)) {
                         return self.failProtocol(.invalid_payload, "");
                     }
-                    return .{ .text = self.frag[0..msg_len] };
+                    return .{ .text = message };
                 }
-                return .{ .binary = self.frag[0..msg_len] };
+                return .{ .binary = message };
             },
         }
     }
@@ -336,11 +352,10 @@ pub fn close(self: *@This(), code: CloseCode, reason: []const u8) void {
     self.sendClosePayload(code, reason);
 }
 
-/// Free the fragment accumulator. No-op under the production
-/// arena; call it after the session ends when using a plain
-/// allocator (tests).
+/// Free the receive buffer. No-op under the production arena; call
+/// it after the session ends when using a plain allocator (tests).
 pub fn deinit(self: *@This()) void {
-    if (self.frag.len > 0) self.allocator.free(self.frag);
+    self.allocator.free(self.buf);
 }
 
 fn sendData(self: *@This(), opcode: OpCode, payload: []const u8) void {
@@ -355,9 +370,30 @@ fn sendData(self: *@This(), opcode: OpCode, payload: []const u8) void {
     };
 }
 
+/// Wait for the first byte of the next frame under the idle
+/// deadline. Returns at once when there is no deadline, nothing to
+/// wait on (no socket: tests), or input already buffered; the read
+/// that follows then blocks or reports the transport's state.
+fn waitForFrame(self: *@This()) error{Timeout}!void {
+    if (self.idle_timeout_in_millis == 0 or self.reader.bufferedLen() > 0) return;
+    const io = self.io orelse return;
+    const stream = self.stream orelse return;
+    socket.waitReadable(io, stream.socket, self.idle_timeout_in_millis) catch {
+        // 1001 "going away" (§7.4.1): the peer went quiet. Its reply
+        // is drained by the loop once the handler returns.
+        if (!self.closed) {
+            self.closed = true;
+            self.sendClosePayload(.going_away, "");
+        }
+        return error.Timeout;
+    };
+}
+
 /// Read and validate one frame. Client frames must be masked
-/// (RFC 6455 §5.1); the payload is returned unmasked, owned by the
-/// connection arena.
+/// (RFC 6455 §5.1); the payload is returned unmasked. A control
+/// payload lands in `control_buf`; a data payload lands in `buf`
+/// right after the open fragment sequence, once the frame has been
+/// checked against that sequence.
 fn readFrame(self: *@This()) !Frame {
     const head = try self.reader.take(2);
     const fin = head[0] & 0x80 != 0;
@@ -385,32 +421,54 @@ fn readFrame(self: *@This()) !Frame {
         return self.failProtocol(.protocol_error, "");
     }
     const opcode = @as(OpCode, @enumFromInt(op));
-    if (op >= 8 and (!fin or len > control_payload_max)) {
+    const control = op >= 8;
+    if (control and (!fin or len > control_payload_max)) {
         return self.failProtocol(.protocol_error, "");
     }
     // "A server MUST close the connection upon receiving a frame
     // that does not have the MASK bit set" (RFC 6455 §5.1).
     if (!masked) return self.failProtocol(.protocol_error, "");
-    // The payload length is attacker-supplied and unbounded on
-    // the wire; cap it before readAlloc sizes the buffer (RFC
-    // 6455 sets no limit).
-    if (len > self.max_payload) {
-        return self.failProtocol(.message_too_big, "");
+    if (!control) {
+        // Fragmentation state (§5.4): a continuation needs an open
+        // sequence, a text/binary frame needs none.
+        if ((opcode == .continuation) == (self.frag_opcode == null)) {
+            return self.failProtocol(.protocol_error, "");
+        }
+        // The payload length is attacker-supplied and unbounded on
+        // the wire; cap it — per frame and summed over the open
+        // sequence — before sizing the buffer (RFC 6455 sets no
+        // limit).
+        if (len > self.max_payload or self.frag_len + len > self.max_payload) {
+            return self.failProtocol(.message_too_big, "");
+        }
     }
 
-    const mask = try self.reader.take(4);
-    var payload: []const u8 = &.{};
-    if (len > 0) {
-        const buf = try self.reader.readAlloc(self.allocator, len);
-        for (buf, 0..) |*b, i| b.* ^= mask[i % 4];
-        payload = buf;
-    }
+    // Copied out of the reader: a slice from `take` is invalidated
+    // by the payload read below, which may rebase the reader buffer
+    // and let the following frame's bytes overwrite it.
+    const mask = (try self.reader.takeArray(4)).*;
+    const payload: []u8 = if (control) self.control_buf[0..len] else blk: {
+        try self.ensureCapacity(self.frag_len + len);
+        break :blk self.buf[self.frag_len..][0..len];
+    };
+    if (len > 0) try self.reader.readSliceAll(payload);
+    for (payload, 0..) |*b, i| b.* ^= mask[i % 4];
     return .{ .fin = fin, .opcode = opcode, .payload = payload };
+}
+
+/// Grow `buf` to hold `needed` bytes, doubling so a fragment
+/// sequence costs amortized linear copying rather than a copy per
+/// fragment. realloc keeps the open sequence's bytes in place.
+fn ensureCapacity(self: *@This(), needed: usize) !void {
+    if (self.buf.len >= needed) return;
+    const capacity = @min(self.max_payload, @max(needed, self.buf.len * 2));
+    self.buf = try self.allocator.realloc(self.buf, capacity);
 }
 
 /// Fail the connection: send the Close frame once (best effort)
 /// and report `error.ProtocolError`.
 fn failProtocol(self: *@This(), code: CloseCode, reason: []const u8) error{ProtocolError} {
+    self.violated = true;
     if (!self.closed) {
         self.closed = true;
         self.sendClosePayload(code, reason);
@@ -426,31 +484,11 @@ fn sendClosePayload(self: *@This(), code: CloseCode, reason: []const u8) void {
     if (self.failed) return;
     const code_int = @intFromEnum(code);
     const code_bytes = [_]u8{ @truncate(code_int >> 8), @truncate(code_int) };
-    const capped = reason[0 .. @min(reason.len, control_payload_max - 2)];
+    const capped = reason[0..@min(reason.len, control_payload_max - 2)];
     self.writeFrame(true, .close, &[_][]const u8{ &code_bytes, capped }) catch |err| {
         self.failed = true;
         log.debug("WebSocket write failed: {t}", .{err});
     };
-}
-
-fn appendFrag(self: *@This(), chunk: []const u8) !void {
-    // Single frames are capped in readFrame; this bounds the sum
-    // across a fragment sequence.
-    if (self.frag_len + chunk.len > self.max_payload) {
-        return self.failProtocol(.message_too_big, "");
-    }
-    if (self.frag_len == 0) {
-        // realloc rather than alloc: a finished message keeps the
-        // buffer for reuse, and plain allocators would leak it.
-        self.frag = try self.allocator.realloc(self.frag, chunk.len);
-        @memcpy(self.frag, chunk);
-        self.frag_len = chunk.len;
-    } else {
-        const grown = try self.allocator.realloc(self.frag, self.frag_len + chunk.len);
-        @memcpy(grown[self.frag_len..], chunk);
-        self.frag = grown;
-        self.frag_len += chunk.len;
-    }
 }
 
 /// Write one frame, unmasked (the server never masks), and flush
@@ -582,6 +620,13 @@ fn frame(fin: bool, opcode: u8, mask: bool, payload: []const u8) []u8 {
         b[i + j] = if (mask) byte ^ key[j % 4] else byte;
     }
     return b;
+}
+
+/// Append one masked wire frame to `wire` (tests).
+fn appendFrame(wire: *std.ArrayList(u8), fin: bool, opcode: u8, payload: []const u8) !void {
+    const bytes = frame(fin, opcode, true, payload);
+    defer testing.allocator.free(bytes);
+    try wire.appendSlice(testing.allocator, bytes);
 }
 
 /// A valid handshake header set for `upgrade()` unit tests. Header
@@ -801,6 +846,45 @@ test "next interleaves single-frame and fragmented messages" {
     try testing.expectEqualStrings("c", m2.text);
     const m3 = try ws.next();
     try testing.expectEqualStrings("de", m3.binary);
+}
+
+test "next reuses one receive buffer across messages and fragments" {
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(testing.allocator);
+    const chunk = [_]u8{0xAB} ** 64;
+    for (0..4) |_| try appendFrame(&wire, true, 0x2, &chunk);
+    // A 100-byte message in 1-byte fragments, with a ping in the
+    // middle: control frames may interleave with a sequence and must
+    // not disturb the accumulator.
+    for (0..100) |i| {
+        if (i == 50) try appendFrame(&wire, true, 0x9, "p");
+        const byte = [_]u8{@intCast(i)};
+        try appendFrame(&wire, i == 99, @as(u8, if (i == 0) 0x2 else 0x0), &byte);
+    }
+    var out: [64]u8 = undefined;
+    var reader = std.Io.Reader.fixed(wire.items);
+    var writer = std.Io.Writer.fixed(&out);
+    // A plain allocator, not an arena: the leak check proves that no
+    // frame is allocated individually.
+    var ws = @This(){ .reader = &reader, .writer = &writer, .allocator = testing.allocator };
+    defer ws.deinit();
+
+    for (0..4) |_| {
+        const msg = try ws.next();
+        try testing.expectEqualSlices(u8, &chunk, msg.binary);
+    }
+    // Exact fit for the first message; no growth for the same size.
+    try testing.expectEqual(@as(usize, 64), ws.buf.len);
+
+    const msg = try ws.next();
+    try testing.expectEqual(@as(usize, 100), msg.binary.len);
+    for (msg.binary, 0..) |b, i| try testing.expectEqual(@as(u8, @intCast(i)), b);
+    // Doubled once (64 -> 128) rather than reallocated per fragment.
+    try testing.expectEqual(@as(usize, 128), ws.buf.len);
+    // The interleaved ping was answered: 0x8a, len 1, "p".
+    try testing.expectEqual(@as(u8, 0x8a), out[0]);
+    try testing.expectEqual(@as(u8, 1), out[1]);
+    try testing.expectEqual(@as(u8, 'p'), out[2]);
 }
 
 test "next returns a masked binary frame (RFC A.1)" {
@@ -1135,6 +1219,59 @@ test "next fails the connection with 1002 on a ping after close" {
     try testing.expectEqual(@as(usize, 4), writer.end);
 }
 
+test "next discards frames the peer sent before seeing our close, then surfaces its Close" {
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(testing.allocator);
+    // In flight when our Close went out: a text message, a fragmented
+    // binary one, a ping — all legal, all dropped (RFC 6455 §1.4).
+    try appendFrame(&wire, true, 0x1, "late");
+    try appendFrame(&wire, false, 0x2, "a");
+    try appendFrame(&wire, true, 0x0, "b");
+    try appendFrame(&wire, true, 0x9, "p");
+    try appendFrame(&wire, true, 0x8, &[_]u8{ 0x03, 0xe8 });
+    // After the peer's own Close: a violation.
+    try appendFrame(&wire, true, 0x1, "x");
+    var out: [64]u8 = undefined;
+    var reader = std.Io.Reader.fixed(wire.items);
+    var writer = std.Io.Writer.fixed(&out);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var ws = @This(){ .reader = &reader, .writer = &writer, .allocator = arena.allocator() };
+
+    ws.close(.going_away, "");
+    // Close 1001: 0x88, len 2, 0x03 0xe9.
+    try testing.expectEqual(@as(usize, 4), writer.end);
+
+    const msg = try ws.next();
+    try testing.expectEqual(@as(u16, 1000), msg.close.code);
+    // No pong, no echo, no 1002: ours stays the only frame sent.
+    try testing.expectEqual(@as(usize, 4), writer.end);
+    try testing.expectError(error.ProtocolError, ws.next());
+    try testing.expectEqual(@as(usize, 4), writer.end);
+}
+
+test "next keeps failing after a protocol violation without reading further" {
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(testing.allocator);
+    // A continuation with no sequence open, then a valid message.
+    try appendFrame(&wire, true, 0x0, "stray");
+    try appendFrame(&wire, true, 0x1, "valid");
+    var out: [64]u8 = undefined;
+    var reader = std.Io.Reader.fixed(wire.items);
+    var writer = std.Io.Writer.fixed(&out);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var ws = @This(){ .reader = &reader, .writer = &writer, .allocator = arena.allocator() };
+
+    try testing.expectError(error.ProtocolError, ws.next());
+    const consumed = reader.seek;
+    // RFC 6455 §7.1.7: no further input is processed, and the 1002
+    // went out once.
+    try testing.expectError(error.ProtocolError, ws.next());
+    try testing.expectEqual(consumed, reader.seek);
+    try testing.expectEqual(@as(usize, 4), writer.end);
+}
+
 test "next fails the connection with 1002 on a second close after a malformed close" {
     const bad = [2]u8{ 0x03, 0xee }; // 1006: local-only, never on the wire
     const first = frame(true, 0x8, true, &bad);
@@ -1225,8 +1362,8 @@ test "next fails the connection with 1002 on a second close frame" {
     try testing.expectError(error.ProtocolError, ws.next());
     // The echo went out once; the violation adds no further frame.
     try testing.expectEqual(@as(usize, 4), writer.end);
-    // The reader is exhausted: the session is over.
-    try testing.expectError(error.EndOfStream, ws.next());
+    // The violation is sticky (RFC 6455 §7.1.7): no further read.
+    try testing.expectError(error.ProtocolError, ws.next());
 }
 
 test "next fails the connection with 1002 on an explicit zero close code" {
@@ -1397,11 +1534,23 @@ test "a failed write latches failed and stops next() from reading" {
 // (hand-assembled, masked) WebSocket client.
 
 const WsEchoHandler = struct {
-    pub fn handle(_: @This(), req: Request, res: *Response) !void {
+    max_payload: usize = max_payload_default,
+    idle_timeout_in_millis: u32 = 0,
+    /// Close right after the handshake and return without reading the
+    /// peer's reply.
+    close_on_open: bool = false,
+
+    pub fn handle(self: @This(), req: Request, res: *Response) !void {
         var ws = upgrade(req, res) catch |err| switch (err) {
             error.NotWebSocket => return error.Skipped,
             else => return,
         };
+        ws.max_payload = self.max_payload;
+        ws.idle_timeout_in_millis = self.idle_timeout_in_millis;
+        if (self.close_on_open) {
+            ws.close(.going_away, "bye");
+            return;
+        }
         while (true) {
             const msg = ws.next() catch return;
             switch (msg) {
@@ -1419,8 +1568,8 @@ const WsTestServer = struct {
     state: WsEchoHandler,
     wrap: Handler.wrap(WsEchoHandler),
 
-    fn start(self: *@This(), io: std.Io, allocator: std.mem.Allocator) !void {
-        self.state = .{};
+    fn start(self: *@This(), io: std.Io, allocator: std.mem.Allocator, state: WsEchoHandler) !void {
+        self.state = state;
         self.wrap = Handler.wrap(WsEchoHandler).init(&self.state);
 
         const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
@@ -1489,7 +1638,7 @@ test "integration: handshake, text echo, ping/pong, close over a live loop" {
     const allocator = testing.allocator;
 
     var ts: WsTestServer = undefined;
-    try ts.start(io, allocator);
+    try ts.start(io, allocator, .{});
     defer ts.stop();
 
     var stream = try std.Io.net.IpAddress.connect(&ts.boundAddress(), io, .{ .mode = .stream });
@@ -1560,7 +1709,7 @@ test "integration: an invalid upgrade request gets a 400" {
     const allocator = testing.allocator;
 
     var ts: WsTestServer = undefined;
-    try ts.start(io, allocator);
+    try ts.start(io, allocator, .{});
     defer ts.stop();
 
     var stream = try std.Io.net.IpAddress.connect(&ts.boundAddress(), io, .{ .mode = .stream });
@@ -1596,7 +1745,7 @@ test "integration: the 101 echoes the first offered subprotocol" {
     const allocator = testing.allocator;
 
     var ts: WsTestServer = undefined;
-    try ts.start(io, allocator);
+    try ts.start(io, allocator, .{});
     defer ts.stop();
 
     var stream = try std.Io.net.IpAddress.connect(&ts.boundAddress(), io, .{ .mode = .stream });
@@ -1627,11 +1776,222 @@ test "integration: the 101 echoes the first offered subprotocol" {
     try testing.expect(std.mem.indexOf(u8, hs, "Sec-WebSocket-Protocol: chat") != null);
 }
 
+test "integration: a payload spanning a read-buffer refill is unmasked intact" {
+    // Regression: `readFrame` kept the mask as a slice into the reader
+    // buffer across the payload read. Once the payload ran past the
+    // buffered bytes, the refill rebased the buffer and the following
+    // frame's bytes overwrote the mask, corrupting the whole payload.
+    // Frame A is bigger than the 8 KiB connection read buffer; frame B
+    // rides in the same write so it is in the socket at refill time.
+    const io = testing.io;
+    const allocator = testing.allocator;
+
+    var ts: WsTestServer = undefined;
+    try ts.start(io, allocator, .{});
+    defer ts.stop();
+
+    var stream = try std.Io.net.IpAddress.connect(&ts.boundAddress(), io, .{ .mode = .stream });
+    defer stream.close(io);
+
+    var wbuf: [1024]u8 = undefined;
+    var w = stream.writer(io, &wbuf);
+    var rbuf: [4096]u8 = undefined;
+    var r = stream.reader(io, &rbuf);
+
+    try w.interface.writeAll(
+        "GET /ws HTTP/1.1\r\n" ++
+            "Host: localhost\r\n" ++
+            "Upgrade: websocket\r\n" ++
+            "Connection: Upgrade\r\n" ++
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+            "Sec-WebSocket-Version: 13\r\n" ++
+            "\r\n",
+    );
+    try w.interface.flush();
+    var hs_buf: [8192]u8 = undefined;
+    _ = try readHandshake(&r.interface, &hs_buf);
+
+    const big = try allocator.alloc(u8, 10000);
+    defer allocator.free(big);
+    for (big, 0..) |*b, i| b.* = @truncate(i * 7);
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(allocator);
+    try appendFrame(&wire, true, 0x2, big);
+    try appendFrame(&wire, true, 0x1, "tail");
+    try w.interface.writeAll(wire.items);
+    try w.interface.flush();
+
+    const echo_a = try readUnmaskedFrame(&r.interface, allocator);
+    defer allocator.free(echo_a.payload);
+    try testing.expectEqual(@as(u8, 0x2), echo_a.opcode);
+    try testing.expectEqualSlices(u8, big, echo_a.payload);
+    const echo_b = try readUnmaskedFrame(&r.interface, allocator);
+    defer allocator.free(echo_b.payload);
+    try testing.expectEqual(@as(u8, 0x1), echo_b.opcode);
+    try testing.expectEqualStrings("tail", echo_b.payload);
+}
+
+test "integration: a Connection token list upgrades and the 101 answers Connection: Upgrade" {
+    // Firefox sends `Connection: keep-alive, Upgrade`; RFC 6455 §4.2.1
+    // only requires the list to include the Upgrade token, and §4.2.2
+    // requires the 101 to answer with exactly `Upgrade`.
+    const io = testing.io;
+    const allocator = testing.allocator;
+
+    var ts: WsTestServer = undefined;
+    try ts.start(io, allocator, .{});
+    defer ts.stop();
+
+    var stream = try std.Io.net.IpAddress.connect(&ts.boundAddress(), io, .{ .mode = .stream });
+    defer stream.close(io);
+
+    var wbuf: [1024]u8 = undefined;
+    var w = stream.writer(io, &wbuf);
+    var rbuf: [4096]u8 = undefined;
+    var r = stream.reader(io, &rbuf);
+
+    try w.interface.writeAll(
+        "GET /ws HTTP/1.1\r\n" ++
+            "Host: localhost\r\n" ++
+            "Upgrade: websocket\r\n" ++
+            "Connection: keep-alive, Upgrade\r\n" ++
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+            "Sec-WebSocket-Version: 13\r\n" ++
+            "\r\n",
+    );
+    try w.interface.flush();
+    var hs_buf: [8192]u8 = undefined;
+    const hs = try readHandshake(&r.interface, &hs_buf);
+    try testing.expect(std.mem.indexOf(u8, hs, "101 Switching Protocols") != null);
+    try testing.expect(std.mem.indexOf(u8, hs, "Connection: Upgrade\r\n") != null);
+
+    // The session is live: a text frame is echoed.
+    const hello = frame(true, 0x1, true, "hi");
+    defer allocator.free(hello);
+    try w.interface.writeAll(hello);
+    try w.interface.flush();
+    const echo = try readUnmaskedFrame(&r.interface, allocator);
+    defer allocator.free(echo.payload);
+    try testing.expectEqualStrings("hi", echo.payload);
+}
+
+/// Connect to `ts` and complete a valid handshake; returns the client
+/// stream (the caller closes it) with its reader and writer set up.
+const WsClient = struct {
+    stream: std.Io.net.Stream,
+    wbuf: [1024]u8 = undefined,
+    rbuf: [4096]u8 = undefined,
+    writer: std.Io.net.Stream.Writer = undefined,
+    reader: std.Io.net.Stream.Reader = undefined,
+
+    fn open(self: *@This(), io: std.Io, ts: *WsTestServer) !void {
+        self.stream = try std.Io.net.IpAddress.connect(&ts.boundAddress(), io, .{ .mode = .stream });
+        errdefer self.stream.close(io);
+        self.writer = self.stream.writer(io, &self.wbuf);
+        self.reader = self.stream.reader(io, &self.rbuf);
+        try self.writer.interface.writeAll(
+            "GET /ws HTTP/1.1\r\n" ++
+                "Host: localhost\r\n" ++
+                "Upgrade: websocket\r\n" ++
+                "Connection: Upgrade\r\n" ++
+                "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+                "Sec-WebSocket-Version: 13\r\n" ++
+                "\r\n",
+        );
+        try self.writer.interface.flush();
+        var hs_buf: [8192]u8 = undefined;
+        const hs = try readHandshake(&self.reader.interface, &hs_buf);
+        try testing.expect(std.mem.indexOf(u8, hs, "101 Switching Protocols") != null);
+    }
+};
+
+test "integration: an over-cap frame gets Close 1009 and a clean EOF, not a reset" {
+    const io = testing.io;
+    const allocator = testing.allocator;
+
+    var ts: WsTestServer = undefined;
+    try ts.start(io, allocator, .{ .max_payload = 16 });
+    defer ts.stop();
+    var client: WsClient = .{ .stream = undefined };
+    try client.open(io, &ts);
+    defer client.stream.close(io);
+
+    // The server rejects this frame from its header and never reads
+    // the payload; closing on those unread bytes would have made the
+    // kernel answer with a reset instead of delivering the Close.
+    const big = [_]u8{0x55} ** 100;
+    const bytes = frame(true, 0x2, true, &big);
+    defer allocator.free(bytes);
+    try client.writer.interface.writeAll(bytes);
+    try client.writer.interface.flush();
+
+    const close_frame = try readUnmaskedFrame(&client.reader.interface, allocator);
+    defer allocator.free(close_frame.payload);
+    try testing.expectEqual(@as(u8, 0x8), close_frame.opcode);
+    try testing.expectEqual(@as(u16, 1009), std.mem.readInt(u16, close_frame.payload[0..2], .big));
+    // The send side was shut down and our frame drained: a clean EOF.
+    try testing.expectError(error.EndOfStream, client.reader.interface.take(1));
+}
+
+test "integration: a handler that closes and returns has the peer's reply drained" {
+    const io = testing.io;
+    const allocator = testing.allocator;
+
+    var ts: WsTestServer = undefined;
+    try ts.start(io, allocator, .{ .close_on_open = true });
+    defer ts.stop();
+    var client: WsClient = .{ .stream = undefined };
+    try client.open(io, &ts);
+    defer client.stream.close(io);
+
+    const close_frame = try readUnmaskedFrame(&client.reader.interface, allocator);
+    defer allocator.free(close_frame.payload);
+    try testing.expectEqual(@as(u8, 0x8), close_frame.opcode);
+    try testing.expectEqual(@as(u16, 1001), std.mem.readInt(u16, close_frame.payload[0..2], .big));
+    try testing.expectEqualStrings("bye", close_frame.payload[2..]);
+
+    // Our Close reply lands after the handler returned; the loop's
+    // drain consumes it rather than the socket closing on it.
+    const reply = frame(true, 0x8, true, &[_]u8{ 0x03, 0xe9 });
+    defer allocator.free(reply);
+    try client.writer.interface.writeAll(reply);
+    try client.writer.interface.flush();
+    try testing.expectError(error.EndOfStream, client.reader.interface.take(1));
+}
+
+test "integration: a silent peer is closed with 1001 after the idle deadline" {
+    const io = testing.io;
+    const allocator = testing.allocator;
+
+    var ts: WsTestServer = undefined;
+    try ts.start(io, allocator, .{ .idle_timeout_in_millis = 100 });
+    defer ts.stop();
+    var client: WsClient = .{ .stream = undefined };
+    try client.open(io, &ts);
+    defer client.stream.close(io);
+
+    // Traffic keeps the session alive: an echo, then silence.
+    const hello = frame(true, 0x1, true, "hi");
+    defer allocator.free(hello);
+    try client.writer.interface.writeAll(hello);
+    try client.writer.interface.flush();
+    const echo = try readUnmaskedFrame(&client.reader.interface, allocator);
+    defer allocator.free(echo.payload);
+    try testing.expectEqualStrings("hi", echo.payload);
+
+    const close_frame = try readUnmaskedFrame(&client.reader.interface, allocator);
+    defer allocator.free(close_frame.payload);
+    try testing.expectEqual(@as(u8, 0x8), close_frame.opcode);
+    try testing.expectEqual(@as(u16, 1001), std.mem.readInt(u16, close_frame.payload[0..2], .big));
+    try testing.expectError(error.EndOfStream, client.reader.interface.take(1));
+}
+
 const std = @import("std");
 const testing = std.testing;
 const log = std.log.scoped(.vish);
 
 const http = @import("server.zig");
+const socket = @import("socket.zig");
 const Loop = @import("../loop/loop.zig").Loop;
 const Handler = @import("../loop/handler.zig").Handler;
 
@@ -1639,4 +1999,3 @@ const request = @import("request.zig");
 const Request = request.Request;
 const Response = @import("response.zig").Response;
 const response = @import("response.zig");
-

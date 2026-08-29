@@ -129,8 +129,43 @@ pub const Loop = struct {
             const req = request orelse return;
             switch (self.onRequest(handler, req)) {
                 .close => return,
+                .linger => {
+                    self.lingerClose(&conn);
+                    return;
+                },
                 .keep => {},
             }
+        }
+    }
+
+    /// Close an upgraded connection the way RFC 6455 §7.1.1 has the
+    /// server do it: shut down the send side first, so the server is
+    /// the one initiating the TCP close, then read and discard what
+    /// the peer still has in flight — its Close reply, or frames sent
+    /// before it saw ours — until it closes its side or the linger
+    /// deadline passes. Closing with unread input makes the kernel
+    /// answer with a reset, which can discard the final frames before
+    /// the peer reads them.
+    fn lingerClose(self: *@This(), conn: *http.Connection) void {
+        const linger_ms = conn.server.options.upgrade_linger_in_millis;
+        if (linger_ms == 0) return;
+        conn.stream.shutdown(self.io, .send) catch return;
+        const timeout: std.Io.Timeout = .{
+            .duration = .{ .raw = .fromMilliseconds(linger_ms), .clock = .awake },
+        };
+        const deadline = timeout.toDeadline(self.io);
+        var drain: [4096]u8 = undefined;
+        var messages: [1]std.Io.net.IncomingMessage = .{.init};
+        while (true) {
+            const maybe_err, const count = conn.stream.socket.receiveManyTimeout(
+                self.io,
+                &messages,
+                &drain,
+                .{},
+                deadline,
+            );
+            // Deadline, failure, or the peer closed (a 0-byte receive).
+            if (maybe_err != null or count == 0 or messages[0].data.len == 0) return;
         }
     }
 
@@ -146,28 +181,9 @@ pub const Loop = struct {
         if (reader.bufferedLen() > 0) return true;
 
         if (idle_ms != 0) {
-            // Wait for the first byte under the idle deadline, peeking so
-            // the byte stays in the socket for the parser to consume.
-            var peek_buf: [1]u8 = undefined;
-            var messages: [1]std.Io.net.IncomingMessage = .{.init};
-            const maybe_err, _ = conn.stream.socket.receiveManyTimeout(
-                self.io,
-                &messages,
-                &peek_buf,
-                .{ .peek = true },
-                .{ .duration = .{ .raw = .fromMilliseconds(idle_ms), .clock = .awake } },
-            );
-            if (maybe_err) |err| switch (err) {
-                // Idle deadline elapsed with no next request: reap.
-                error.Timeout => return false,
-                // The Io implementation can't wait with a timeout; fall
-                // through to a blocking wait without a deadline.
-                error.ConcurrencyUnavailable => {
-                    log.warn("idle deadline unavailable for this cycle", .{});
-                },
-                // Reset, canceled, or otherwise dead: close.
-                else => return false,
-            };
+            // Idle deadline elapsed with no next request: reap. A dead
+            // socket surfaces from the fill below.
+            socket.waitReadable(self.io, conn.stream.socket, idle_ms) catch return false;
         }
 
         reader.fill(1) catch return false;
@@ -178,12 +194,14 @@ pub const Loop = struct {
     /// Guarantees every request gets a response: a `.skipped` outcome
     /// becomes 404, and a response the handler built but never sent is
     /// sent here. Returns `.close` when either side sent
-    /// `Connection: close` or the transport failed, `.keep` otherwise.
+    /// `Connection: close` or the transport failed, `.linger` when the
+    /// handler switched protocols (closed after a drain, see
+    /// `lingerClose`), `.keep` otherwise.
     fn onRequest(
         _: *@This(),
         handler: Handler,
         req: http.Request,
-    ) enum { close, keep } {
+    ) enum { close, keep, linger } {
         // Log the request line only: `{any}` on the full struct would
         // dump headers (Authorization, Cookie) and buffered body bytes.
         // The path is client-controlled, so cap and escape it.
@@ -211,7 +229,7 @@ pub const Loop = struct {
         if (res.failed) return .close;
         // The connection speaks another protocol now (WebSocket): no
         // keep-alive, no next HTTP request.
-        if (res.upgraded) return .close;
+        if (res.upgraded) return .linger;
 
         const req_conn = req.headers.connection orelse .close;
         const res_conn = res.headers.connection orelse .close;
@@ -550,6 +568,7 @@ const std = @import("std");
 const testing = std.testing;
 
 const http = @import("../http/server.zig");
+const socket = @import("../http/socket.zig");
 const truncateForLog = @import("../http/request.zig").truncateForLog;
 
 const Handler = @import("handler.zig").Handler;

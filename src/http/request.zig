@@ -123,8 +123,23 @@ pub const Connection = enum(u2) {
     /// (in practice, always a WebSocket handshake).
     upgrade = 2,
 
+    /// Parse a `Connection` value, which is a comma-separated token
+    /// list (RFC 7230 §6.1): Firefox's WebSocket handshake sends
+    /// `keep-alive, Upgrade`. `close` wins over every other token and
+    /// `Upgrade` over `keep-alive`; unknown tokens are ignored, and a
+    /// list with no known token is null.
     pub fn parse(bytes: []const u8) ?Connection {
-        return parseHeaderEnum(Connection, bytes);
+        var result: ?Connection = null;
+        var tokens = std.mem.splitScalar(u8, bytes, ',');
+        while (tokens.next()) |raw| {
+            const token = std.mem.trim(u8, raw, " \t");
+            switch (parseHeaderEnum(Connection, token) orelse continue) {
+                .close => return .close,
+                .upgrade => result = .upgrade,
+                .keep_alive => result = result orelse .keep_alive,
+            }
+        }
+        return result;
     }
 };
 
@@ -308,6 +323,12 @@ pub const Request = struct {
     /// Peer address of the connection this request arrived on. Null for
     /// requests parsed outside a live connection (tests, examples).
     client_address: ?std.Io.net.IpAddress = null,
+
+    /// The connection's socket and its `Io`, for handlers that need the
+    /// socket itself — a WebSocket session's idle deadline. Null outside
+    /// a live connection (tests, examples).
+    stream: ?std.Io.net.Stream = null,
+    io: ?std.Io = null,
 
     /// Application data attached by routing middleware on the way in and
     /// read by handlers downstream — a resolved tenant, say. Middleware
@@ -533,6 +554,16 @@ pub const BodyReader = struct {
 pub fn truncateForLog(bytes: []const u8) []const u8 {
     const max_log_bytes = 32;
     return bytes[0..@min(bytes.len, max_log_bytes)];
+}
+
+test "Connection.parse accepts a token list" {
+    try testing.expectEqual(Connection.upgrade, Connection.parse("keep-alive, Upgrade").?);
+    try testing.expectEqual(Connection.upgrade, Connection.parse("Upgrade").?);
+    try testing.expectEqual(Connection.keep_alive, Connection.parse("Keep-Alive").?);
+    try testing.expectEqual(Connection.close, Connection.parse("Upgrade, close").?);
+    try testing.expectEqual(Connection.upgrade, Connection.parse("x-unknown,\tUpgrade").?);
+    try testing.expect(Connection.parse("x-unknown") == null);
+    try testing.expect(Connection.parse("") == null);
 }
 
 test "Method.parse accepts every method tag" {

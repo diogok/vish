@@ -327,7 +327,7 @@ pub const WsEchoHandler = struct {
 
 `upgrade` errors: `NotWebSocket` (the request is not an upgrade — return `error.Skipped` so routing continues), `HandshakeRejected` (an invalid upgrade request; the 400 is already on the wire — return and let it stand), and `UpgradeFailed` (the 101 could not be delivered).
 
-Pings are answered automatically; you rarely need `ping` or `pong` yourself. `close(code, reason)` initiates the close handshake. Payloads returned by `next()` are arena-owned and valid until the next `next()` call. When the client sends `Sec-WebSocket-Protocol`, the 101 echoes the first offered subprotocol. Inbound messages over the payload cap (default 16 MiB) fail the session with close 1009. See `src/demo2.zig` for a live `/ws` echo route.
+Pings are answered automatically; you rarely need `ping` or `pong` yourself. `close(code, reason)` initiates the close handshake; returning right after it is fine — the loop drains the peer's reply before closing the socket (`ListenOptions.upgrade_linger_in_millis`). A silent peer holds its worker forever by default; set `ws.idle_timeout_in_millis` to close it with 1001 (`next()` returns `error.Timeout`), or ping from a timer. Payloads returned by `next()` point into the session's receive buffer and are valid until the next `next()` call — copy them if they must outlive that. When the client sends `Sec-WebSocket-Protocol`, the 101 echoes the first offered subprotocol. Inbound messages over the payload cap (`ws.max_payload`, default 16 MiB; lower it before the first `next()`) fail the session with close 1009. See `src/demo2.zig` for a live `/ws` echo route.
 
 ### Compression
 
@@ -376,13 +376,14 @@ vish.Server.init(io, allocator, address, .{
     .tcp_keep_alive = true,
     .tcp_no_delay = false,
     .idle_timeout_in_millis = 1000,   // 0 disables
+    .upgrade_linger_in_millis = 1000, // 0 closes at once
     .read_buffer_size = 8 * 1024,
     .write_buffer_size = 8 * 1024,
     .parse_extra_headers = false,
 });
 ```
 
-`idle_timeout_in_millis` only times the wait-for-next-request gap on a keep-alive connection; once data starts arriving the deadline no longer applies and a slow request is allowed to complete.
+`idle_timeout_in_millis` only times the wait-for-next-request gap on a keep-alive connection; once data starts arriving the deadline no longer applies and a slow request is allowed to complete. `upgrade_linger_in_millis` bounds how long the loop drains a WebSocket peer's remaining input after the handler returns before closing the socket, so the final frames reach the peer rather than a reset.
 
 ## Shutdown
 
