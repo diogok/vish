@@ -74,7 +74,7 @@ Built on the Zig `std.Io` rework. There is no thread pool managed by this librar
    - `Response.fromRequest(req)` constructs a fresh response sharing the request's writer and arena allocator.
    - `handler.handle(req, &res)` runs. A top-level `.skipped` outcome (what `error.Skipped` from a concrete handler becomes at the boundary) causes the loop to send `404 Not Found`.
    - `req.writer.flush()` writes buffered bytes to the socket.
-   - The connection continues unless either side sent `Connection: close`.
+   - The connection continues unless either side sent `Connection: close`, the request was HTTP/1.0 without `Connection: keep-alive` (RFC 7230 §6.3: only HTTP/1.1 is persistent by default), or the response has neither `Content-Length` nor chunked framing (an SSE stream) and so is delimited by closing.
 
 `Response.send()` is for one-shot bodies. For streaming, use `writeChunk` + `end` (chunked transfer-encoding) or `writeSSE` / `writeEvent` / `writeSSEComment` (Server-Sent Events).
 

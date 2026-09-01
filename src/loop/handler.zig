@@ -174,7 +174,7 @@ test "wrap converts mapped errors into status responses" {
     try testing.expectEqual(.handled, wrapped.interface().handle(req, &res));
 
     const content = buffer[0..writer.end];
-    try testing.expectEqualStrings("HTTP/1.1 401 Unauthorized\r\n\r\n", content);
+    try testing.expectEqualStrings("HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n", content);
 }
 
 test "wrap converts unknown errors into 500" {
@@ -196,7 +196,7 @@ test "wrap converts unknown errors into 500" {
     try testing.expectEqual(.handled, wrapped.interface().handle(req, &res));
 
     const content = buffer[0..writer.end];
-    try testing.expectEqualStrings("HTTP/1.1 500 Internal Server Error\r\n\r\n", content);
+    try testing.expectEqualStrings("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n", content);
 }
 
 test "wrap supports infallible void handlers" {

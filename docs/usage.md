@@ -267,7 +267,7 @@ res.body = "{\"ok\":true}";
 res.send();
 ```
 
-`Content-Length` is filled in automatically from `body.len` if not set.
+`Content-Length` is filled in automatically from `body.len` if not set — `0` for an empty body, so a keep-alive client knows the response ended. Statuses that carry no content (1xx, 204, 304) get no `Content-Length`. Connections are persistent by default for HTTP/1.1 and closed after the response for HTTP/1.0; set `res.headers.connection = .close` to close after a response regardless.
 
 ### Chunked streaming
 
@@ -299,7 +299,7 @@ res.writeSSE(.{ .data = "multi\nline" });   // splits on \n into multiple data: 
 res.flush();
 ```
 
-The first SSE call sets `Content-Type: text/event-stream` and `Cache-Control: no-cache` if not already set. SSE is incompatible with `Content-Encoding` (asserts in debug).
+The first SSE call sets `Content-Type: text/event-stream` and `Cache-Control: no-cache` if not already set. SSE is incompatible with `Content-Encoding` (asserts in debug). An event stream has no length, so the loop closes the connection when the handler returns — that close is how the client sees the end of the stream.
 
 ### WebSocket
 

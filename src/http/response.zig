@@ -38,6 +38,14 @@ pub const Status = enum(u16) {
     pub fn int(self: @This()) u16 {
         return @intFromEnum(self);
     }
+
+    /// Whether a response with this status can carry content. 1xx, 204
+    /// and 304 never do (RFC 7230 §3.3.3), so they go out without a
+    /// `Content-Length` and need no framing.
+    pub fn allowsBody(self: @This()) bool {
+        const code = self.int();
+        return code >= 200 and code != 204 and code != 304;
+    }
 };
 
 /// Response-side `Connection` header value. Kept in lockstep with
@@ -105,9 +113,16 @@ pub const ExtraHeader = struct {
 pub const Headers = struct {
     transfer_encoding: ?TransferEncoding = null,
     content_encoding: ?ContentEncoding = null,
+    /// Filled from `body.len` by `send()` when unset — `0` for an empty
+    /// body, so a keep-alive client knows where the response ends.
+    /// The streaming paths (`writeChunk`, `writeSSE`) leave it unset.
     content_length: ?usize = null,
     content_type: []const u8 = "",
     cache_control: []const u8 = "",
+    /// Null (the default) sends no `Connection` header and leaves the
+    /// decision to the HTTP version: persistent for HTTP/1.1, closed
+    /// after the response for HTTP/1.0. Set `.close` to end the
+    /// connection after this response regardless.
     connection: ?Connection = null,
     location: []const u8 = "",
     set_cookie: []const u8 = "",
@@ -199,6 +214,15 @@ pub const Response = struct {
                 self.headers.content_encoding = null;
             };
         }
+        // A one-shot response frames itself with `Content-Length`, `0`
+        // included: without it a keep-alive client would wait for a
+        // body until the connection closed. Statuses that carry no
+        // content (1xx, 204, 304) get no header for an empty body.
+        if (self.headers.content_length == null and self.headers.transfer_encoding == null) {
+            if (self.body.len > 0 or self.status.allowsBody()) {
+                self.headers.content_length = self.body.len;
+            }
+        }
         try self.sendStatus();
         try self.sendHeaders();
         try self.sendNewline();
@@ -257,9 +281,6 @@ pub const Response = struct {
     fn sendHeaders(
         self: *@This(),
     ) !void {
-        if (self.headers.content_length == null and self.body.len > 0) {
-            self.headers.content_length = self.body.len;
-        }
         inline for (std.meta.fields(Headers)) |field| {
             const header_name = comptime capitalize(field.name);
             if (field.type == []const u8) {
@@ -750,11 +771,11 @@ test "multiple writeSSE and writeSSEComment calls send headers once" {
 
 test "new status codes render correct status line" {
     const cases = [_]struct { status: Status, expected: []const u8 }{
-        .{ .status = .Gone, .expected = "HTTP/1.1 410 Gone\r\n\r\n" },
-        .{ .status = .Precondition_Failed, .expected = "HTTP/1.1 412 Precondition Failed\r\n\r\n" },
-        .{ .status = .Payload_Too_Large, .expected = "HTTP/1.1 413 Payload Too Large\r\n\r\n" },
-        .{ .status = .Precondition_Required, .expected = "HTTP/1.1 428 Precondition Required\r\n\r\n" },
-        .{ .status = .Service_Unavailable, .expected = "HTTP/1.1 503 Service Unavailable\r\n\r\n" },
+        .{ .status = .Gone, .expected = "HTTP/1.1 410 Gone\r\nContent-Length: 0\r\n\r\n" },
+        .{ .status = .Precondition_Failed, .expected = "HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\n\r\n" },
+        .{ .status = .Payload_Too_Large, .expected = "HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n\r\n" },
+        .{ .status = .Precondition_Required, .expected = "HTTP/1.1 428 Precondition Required\r\nContent-Length: 0\r\n\r\n" },
+        .{ .status = .Service_Unavailable, .expected = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n" },
     };
 
     for (cases) |case| {
@@ -791,8 +812,40 @@ test "empty body response" {
     res.send();
 
     const content = buffer[0..writer.end];
-    // 304 responses typically have no body, but blank line is always required
+    // 304 carries no content, so no Content-Length either; the blank
+    // line is always required.
     try testing.expectEqualStrings("HTTP/1.1 304 Not Modified\r\n\r\n", content);
+}
+
+test "empty body sends Content-Length: 0 unless the status carries no content" {
+    const cases = [_]struct { status: Status, expected: []const u8 }{
+        .{ .status = .OK, .expected = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n" },
+        .{ .status = .Created, .expected = "HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n" },
+        .{ .status = .Not_Found, .expected = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n" },
+        .{ .status = .Switching_Protocols, .expected = "HTTP/1.1 101 Switching Protocols\r\n\r\n" },
+        .{ .status = .No_Content, .expected = "HTTP/1.1 204 No Content\r\n\r\n" },
+        .{ .status = .Not_Modified, .expected = "HTTP/1.1 304 Not Modified\r\n\r\n" },
+    };
+
+    for (cases) |case| {
+        var buffer: [256]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buffer);
+        var res = Response{ .status = case.status, .writer = &writer };
+        res.send();
+        try testing.expectEqualStrings(case.expected, buffer[0..writer.end]);
+    }
+}
+
+test "an explicit Content-Length is kept for an empty body" {
+    var buffer: [256]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+
+    // A HEAD handler answering with the GET body's length.
+    var res = Response{ .writer = &writer };
+    res.setContentLength(42);
+    res.send();
+
+    try testing.expectEqualStrings("HTTP/1.1 200 OK\r\nContent-Length: 42\r\n\r\n", buffer[0..writer.end]);
 }
 
 test "write failure latches failed and later writes are no-ops" {
@@ -826,7 +879,7 @@ test "sendError before status line replaces the in-progress response" {
     res.sendError(.Internal_Server_Error);
 
     const content = buffer[0..writer.end];
-    try testing.expectEqualStrings("HTTP/1.1 500 Internal Server Error\r\nConnection: keep-alive\r\n\r\n", content);
+    try testing.expectEqualStrings("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n", content);
 }
 
 test "sendError after status line marks connection for close" {

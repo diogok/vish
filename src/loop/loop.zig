@@ -231,13 +231,20 @@ pub const Loop = struct {
         // keep-alive, no next HTTP request.
         if (res.upgraded) return .linger;
 
-        const req_conn = req.headers.connection orelse .close;
-        const res_conn = res.headers.connection orelse .close;
-        if (req_conn == .close or res_conn == .close) {
+        // A response with neither Content-Length nor chunked framing
+        // (an SSE stream) is delimited by connection close (RFC 7230
+        // §3.3.3): the client learns it ended when the socket does.
+        if (res.status.allowsBody() and res.headers.content_length == null and res.headers.transfer_encoding == null) {
             return .close;
-        } else {
-            return .keep;
         }
+        // `Connection: close` from either side ends the connection.
+        // Neither side saying anything means the version default:
+        // persistent for HTTP/1.1, close for 1.0 (RFC 7230 §6.3).
+        if (req.headers.connection == .close) return .close;
+        if (res.headers.connection) |conn| {
+            return if (conn == .close) .close else .keep;
+        }
+        return if (req.version.defaultConnection() == .close) .close else .keep;
     }
 };
 
@@ -346,6 +353,94 @@ test "loop handles keep-alive (multiple requests on one connection)" {
         idx = found + "200 OK".len;
     }
     try testing.expectEqual(@as(usize, 4), count);
+}
+
+test "loop keeps an HTTP/1.1 connection that names no Connection header" {
+    const io = testing.io;
+    const allocator = testing.allocator;
+
+    var ts: TestServer = undefined;
+    try ts.start(io, allocator);
+    defer ts.stop();
+
+    var stream = try std.Io.net.IpAddress.connect(&ts.boundAddress(), io, .{ .mode = .stream });
+    defer stream.close(io);
+
+    var wbuf: [1024]u8 = undefined;
+    var w = stream.writer(io, &wbuf);
+    // curl's default request shape: HTTP/1.1, no Connection header.
+    inline for (0..2) |_| {
+        try w.interface.writeAll("GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    }
+    try w.interface.writeAll("GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    try w.interface.flush();
+
+    var rbuf: [4096]u8 = undefined;
+    var r = stream.reader(io, &rbuf);
+    const response = try r.interface.allocRemaining(allocator, .unlimited);
+    defer allocator.free(response);
+
+    try testing.expectEqual(@as(usize, 3), std.mem.count(u8, response, "200 OK"));
+    // The version default is silent: only the reply to the explicit
+    // `Connection: close` carries a Connection header.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, response, "Connection:"));
+}
+
+test "loop closes an HTTP/1.0 connection that names no Connection header" {
+    const io = testing.io;
+    const allocator = testing.allocator;
+
+    var ts: TestServer = undefined;
+    // Idle reaping off: only the version default may end the connection.
+    try ts.startWithOptions(io, allocator, .{ .idle_timeout_in_millis = 0 });
+    defer ts.stop();
+
+    // `sendRequest` reads to EOF, so it returns only once the server
+    // closed the connection after the single response.
+    const response = try sendRequest(
+        io,
+        allocator,
+        ts.boundAddress(),
+        "GET / HTTP/1.0\r\nHost: x\r\n\r\n",
+    );
+    defer allocator.free(response);
+
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, response, "200 OK"));
+}
+
+test "loop closes after a response without Content-Length or chunked framing" {
+    const io = testing.io;
+    const allocator = testing.allocator;
+
+    const Streamer = struct {
+        pub fn handle(_: @This(), _: http.Request, res: *http.Response) void {
+            res.writeSSE(.{ .data = "only" });
+        }
+    };
+
+    var state = Streamer{};
+    const wrapped = Handler.wrap(Streamer).init(&state);
+
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = http.Server.init(io, allocator, address, .{ .idle_timeout_in_millis = 0 });
+    defer server.deinit();
+    try server.listen();
+
+    var loop = try Loop.init(io, &server, wrapped.interface());
+    defer loop.deinit();
+    try loop.start();
+
+    // The client asks for keep-alive, but the stream has no length: the
+    // loop must close so the client sees the end of the event stream.
+    const response = try sendRequest(
+        io,
+        allocator,
+        server.getAddress().?,
+        "GET /events HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n",
+    );
+    defer allocator.free(response);
+
+    try testing.expect(std.mem.endsWith(u8, response, "data: only\n\n"));
 }
 
 test "loop handles concurrent connections" {

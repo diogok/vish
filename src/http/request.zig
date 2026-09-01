@@ -114,6 +114,16 @@ pub const Version = enum {
             },
         }
     }
+
+    /// What a request without a `Connection` header asks for: HTTP/1.1
+    /// connections are persistent unless closed explicitly (RFC 7230
+    /// §6.3); HTTP/1.0 and 0.9 close after the response.
+    pub fn defaultConnection(self: @This()) Connection {
+        return switch (self) {
+            .HTTP_1_1 => .keep_alive,
+            .HTTP_1_0, .HTTP_0_9 => .close,
+        };
+    }
 };
 
 pub const Connection = enum(u2) {
@@ -564,6 +574,12 @@ test "Connection.parse accepts a token list" {
     try testing.expectEqual(Connection.upgrade, Connection.parse("x-unknown,\tUpgrade").?);
     try testing.expect(Connection.parse("x-unknown") == null);
     try testing.expect(Connection.parse("") == null);
+}
+
+test "Version.defaultConnection is persistent only for HTTP/1.1" {
+    try testing.expectEqual(Connection.keep_alive, Version.HTTP_1_1.defaultConnection());
+    try testing.expectEqual(Connection.close, Version.HTTP_1_0.defaultConnection());
+    try testing.expectEqual(Connection.close, Version.HTTP_0_9.defaultConnection());
 }
 
 test "Method.parse accepts every method tag" {

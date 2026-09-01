@@ -43,7 +43,6 @@ pub fn StructRouter(comptime HandlerType: type) type {
                 const fn_path = comptime decl.name[sep.? + 1 ..];
 
                 const has_matching = comptime std.mem.indexOf(u8, fn_path, "?") != null;
-
                 if (has_matching) {
                     const maybe_matches = checkMatch(fn_path, path);
                     if (maybe_matches) |matches| {
@@ -175,7 +174,7 @@ test "struct router maps route errors to responses" {
     try testing.expectEqual(.handled, router.interface().handle(req, &res));
 
     const content = buffer[0..writer.end];
-    try testing.expectEqualStrings("HTTP/1.1 400 Bad Request\r\n\r\n", content);
+    try testing.expectEqualStrings("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n", content);
 }
 
 /// Routes to a handler if the URI prefix matches.
@@ -267,7 +266,9 @@ pub const CombinedRouter = struct {
 
     pub fn route(self: @This(), req: Request, res: *Response) Outcome {
         for (self.routers) |router| {
-            if (router.handle(req, res) == .handled) return .handled;
+            if (router.handle(req, res) == .handled) {
+                return .handled;
+            }
         }
         return .skipped;
     }
