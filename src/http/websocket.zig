@@ -1,34 +1,19 @@
-//! WebSocket server support (RFC 6455). The session lives inside the
-//! handler: `upgrade()` opens the handshake, `next()` blocks for the
-//! next complete message, and the loop closes the connection when the
-//! handler returns. Frame writes are serialized by a mutex, so any
-//! number of tasks may send while one task blocks in `next()`; the
-//! payloads `next()` returns belong to that one task.
+//! WebSocket session (RFC 6455) for either end of a connection. On
+//! the server it lives inside the handler: `upgrade()` opens the
+//! handshake, `next()` blocks for the next complete message, and the
+//! loop closes the connection when the handler returns. The client
+//! in `websocket/client.zig` embeds the same session in the client
+//! role. Frame writes are serialized by a mutex, so any number of
+//! tasks may send while one task blocks in `next()`; the payloads
+//! `next()` returns belong to that one task.
 
-/// Frame opcode (RFC 6455 §5.5). Tags 3-7 and 11-15 are reserved
-/// and never named: receiving one fails the connection.
-pub const OpCode = enum(u4) {
-    continuation = 0,
-    text = 1,
-    binary = 2,
-    close = 8,
-    ping = 9,
-    pong = 10,
-};
+pub const OpCode = frame.OpCode;
+pub const CloseCode = frame.CloseCode;
 
-/// RFC 6455 §7.4 close status codes an endpoint may put on the
-/// wire. 1005 (no status) and 1006 (abnormal closure) are local
-/// markers that MUST NOT appear in a frame, so they are absent.
-pub const CloseCode = enum(u16) {
-    normal_closure = 1000,
-    going_away = 1001,
-    protocol_error = 1002,
-    unsupported_data = 1003,
-    invalid_payload = 1007,
-    policy_violation = 1008,
-    message_too_big = 1009,
-    internal_error = 1011,
-};
+/// Which end of the connection a session is: client frames are
+/// masked and server frames are not (RFC 6455 §5.1), so the role
+/// decides the masking applied on send and required on receive.
+pub const Role = enum { server, client };
 
 /// One complete inbound message. Payloads point into the session's
 /// receive buffer and stay valid until the next `next()` call.
@@ -47,6 +32,7 @@ pub const Message = union(enum) {
 reader: *std.Io.Reader,
 writer: *std.Io.Writer,
 allocator: std.mem.Allocator,
+role: Role = .server,
 /// The connection's `Io`: backs the write mutex and the idle
 /// deadline.
 io: std.Io,
@@ -97,18 +83,13 @@ max_payload: usize = max_payload_default,
 /// state checks that gate a write run under the same hold.
 write_mutex: std.Io.Mutex = .init,
 
-/// `Sec-WebSocket-Key` is base64 of exactly 16 bytes (RFC 6455
-/// §4.1); in the standard alphabet with padding that is 24 chars.
-const key_b64_len = 24;
-/// The 16 bytes a valid key decodes to.
-const key_raw_len = 16;
-/// The magic GUID concatenated with the key before the SHA-1
-/// (RFC 6455 §4.1).
-const magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+const key_b64_len = frame.key_b64_len;
+const key_raw_len = frame.key_raw_len;
+const control_payload_max = frame.control_payload_max;
 /// The default for `max_payload`.
-const max_payload_default = 16 * 1024 * 1024;
-/// Maximum payload of a control frame (RFC 6455 §5.5).
-const control_payload_max = 125;
+pub const max_payload_default = 16 * 1024 * 1024;
+/// Outbound payloads are masked through a stack chunk of this size.
+const mask_chunk_len = 4 * 1024;
 
 /// Errors from `upgrade`. `NotWebSocket`: the request is not a
 /// WebSocket upgrade request and nothing was sent — the caller
@@ -178,14 +159,7 @@ pub fn upgrade(req: Request, res: *Response) !@This() {
         return error.HandshakeRejected;
     }
 
-    // Sec-WebSocket-Accept = base64(SHA1(key ++ magic)).
-    var input: [key_b64_len + magic.len]u8 = undefined;
-    @memcpy(input[0..key_b64_len], key);
-    @memcpy(input[key_b64_len..], magic);
-    var digest: [std.crypto.hash.Sha1.digest_length]u8 = undefined;
-    std.crypto.hash.Sha1.hash(&input, &digest, .{});
-    var accept: [@divTrunc(std.crypto.hash.Sha1.digest_length + 2, 3) * 4]u8 = undefined;
-    const accept_b64 = b64.Encoder.encode(&accept, &digest);
+    const accept = frame.acceptKey(key[0..key_b64_len]);
 
     res.status = .Switching_Protocols;
     // Set explicitly rather than inherited from the request: the
@@ -195,7 +169,7 @@ pub fn upgrade(req: Request, res: *Response) !@This() {
     res.headers.upgrade = "websocket";
     // Function-scoped: `res.send()` below reads through the slice.
     var extra: [2]response.ExtraHeader = undefined;
-    extra[0] = .{ .name = "Sec-WebSocket-Accept", .value = accept_b64 };
+    extra[0] = .{ .name = "Sec-WebSocket-Accept", .value = &accept };
     var extra_len: usize = 1;
     // §4.1: when the client offered subprotocols, the 101 MUST
     // name the one selected — here, the first non-empty token.
@@ -399,71 +373,41 @@ fn waitForFrame(self: *@This()) error{Timeout}!void {
     };
 }
 
-/// Read and validate one frame. Client frames must be masked
-/// (RFC 6455 §5.1); the payload is returned unmasked. A control
-/// payload lands in `control_buf`; a data payload lands in `buf`
-/// right after the open fragment sequence, once the frame has been
-/// checked against that sequence.
+/// Read and validate one frame. Frames from a client must be masked
+/// and frames from a server must not be (RFC 6455 §5.1); the payload
+/// is returned unmasked. A control payload lands in `control_buf`; a
+/// data payload lands in `buf` right after the open fragment
+/// sequence, once the frame has been checked against that sequence.
 fn readFrame(self: *@This()) !Frame {
-    const head = try self.reader.take(2);
-    const fin = head[0] & 0x80 != 0;
-    const rsv = (head[0] >> 4) & 0x07;
-    const op = head[0] & 0x0F;
-    const masked = head[1] & 0x80 != 0;
-    var len: usize = head[1] & 0x7F;
-    if (len == 126) {
-        const ext = try self.reader.take(2);
-        len = @as(usize, ext[0]) * 256 + ext[1];
-    } else if (len == 127) {
-        const ext = try self.reader.take(8);
-        var len64: u64 = 0;
-        for (ext) |b| len64 = (len64 << 8) | b;
-        if (len64 > @as(u64, std.math.maxInt(usize))) {
-            return self.failProtocol(.protocol_error, "");
-        }
-        len = @intCast(len64);
-    }
-
-    // No extensions were negotiated, so any RSV bit is a protocol
-    // error (RFC 6455 §5.2); opcodes 3-7 and 11-15 are reserved
-    // and rejected before the enum conversion.
-    if (rsv != 0 or (op >= 3 and op <= 7) or op >= 11) {
-        return self.failProtocol(.protocol_error, "");
-    }
-    const opcode = @as(OpCode, @enumFromInt(op));
-    const control = op >= 8;
-    if (control and (!fin or len > control_payload_max)) {
-        return self.failProtocol(.protocol_error, "");
-    }
-    // "A server MUST close the connection upon receiving a frame
-    // that does not have the MASK bit set" (RFC 6455 §5.1).
-    if (!masked) return self.failProtocol(.protocol_error, "");
+    const head = frame.readHeader(self.reader) catch |err| switch (err) {
+        error.ProtocolViolation => return self.failProtocol(.protocol_error, ""),
+        else => |other| return other,
+    };
+    if (head.masked != (self.role == .server)) return self.failProtocol(.protocol_error, "");
+    const control = head.opcode.control();
     if (!control) {
         // Fragmentation state (§5.4): a continuation needs an open
         // sequence, a text/binary frame needs none.
-        if ((opcode == .continuation) == (self.frag_opcode == null)) {
+        if ((head.opcode == .continuation) == (self.frag_opcode == null)) {
             return self.failProtocol(.protocol_error, "");
         }
         // The payload length is attacker-supplied and unbounded on
         // the wire; cap it — per frame and summed over the open
         // sequence — before sizing the buffer (RFC 6455 sets no
         // limit).
-        if (len > self.max_payload or self.frag_len + len > self.max_payload) {
+        if (head.len > self.max_payload or self.frag_len + head.len > self.max_payload) {
             return self.failProtocol(.message_too_big, "");
         }
     }
 
-    // Copied out of the reader: a slice from `take` is invalidated
-    // by the payload read below, which may rebase the reader buffer
-    // and let the following frame's bytes overwrite it.
-    const mask = (try self.reader.takeArray(4)).*;
-    const payload: []u8 = if (control) self.control_buf[0..len] else blk: {
-        try self.ensureCapacity(self.frag_len + len);
-        break :blk self.buf[self.frag_len..][0..len];
+    const key: ?[4]u8 = if (head.masked) try frame.readMaskKey(self.reader) else null;
+    const payload: []u8 = if (control) self.control_buf[0..head.len] else blk: {
+        try self.ensureCapacity(self.frag_len + head.len);
+        break :blk self.buf[self.frag_len..][0..head.len];
     };
-    if (len > 0) try self.reader.readSliceAll(payload);
-    for (payload, 0..) |*b, i| b.* ^= mask[i % 4];
-    return .{ .fin = fin, .opcode = opcode, .payload = payload };
+    if (head.len > 0) try self.reader.readSliceAll(payload);
+    if (key) |mask_key| frame.mask(payload, mask_key, 0);
+    return .{ .fin = head.fin, .opcode = head.opcode, .payload = payload };
 }
 
 /// Grow `buf` to hold `needed` bytes, doubling so a fragment
@@ -499,10 +443,10 @@ fn sendCloseOnce(self: *@This(), code: CloseCode, reason: []const u8) void {
     self.writeFrame(true, .close, &[_][]const u8{ &code_bytes, capped }) catch {};
 }
 
-/// Write one frame, unmasked (the server never masks), and flush it
-/// to the peer; the payload is written as the given parts, in order.
-/// The caller holds `write_mutex`. A transport failure latches
-/// `failed` and is returned.
+/// Write one frame — masked in the client role — and flush it to the
+/// peer; the payload is written as the given parts, in order. The
+/// caller holds `write_mutex`. A transport failure latches `failed`
+/// and is returned.
 fn writeFrame(self: *@This(), fin: bool, opcode: OpCode, parts: []const []const u8) !void {
     self.writeFrameParts(fin, opcode, parts) catch |err| {
         self.failed = true;
@@ -511,29 +455,38 @@ fn writeFrame(self: *@This(), fin: bool, opcode: OpCode, parts: []const []const 
     };
 }
 
+/// Encode and push one frame. A client masks every frame with a
+/// fresh key (RFC 6455 §5.3); a server never masks (§5.1).
 fn writeFrameParts(self: *@This(), fin: bool, opcode: OpCode, parts: []const []const u8) !void {
     var len: usize = 0;
-    for (parts) |p| len += p.len;
-    var header: [14]u8 = undefined;
-    var hdr_len: usize = 0;
-    header[hdr_len] = (@as(u8, @intFromBool(fin)) << 7) | @intFromEnum(opcode);
-    hdr_len += 1;
-    if (len < 126) {
-        header[hdr_len] = @intCast(len);
-        hdr_len += 1;
-    } else if (len <= std.math.maxInt(u16)) {
-        header[hdr_len] = 126;
-        hdr_len += 1;
-        std.mem.writeInt(u16, header[hdr_len..][0..2], @intCast(len), .big);
-        hdr_len += 2;
-    } else {
-        header[hdr_len] = 127;
-        hdr_len += 1;
-        std.mem.writeInt(u64, header[hdr_len..][0..8], len, .big);
-        hdr_len += 8;
+    for (parts) |part| len += part.len;
+    var key: ?[4]u8 = null;
+    if (self.role == .client) {
+        var fresh: [4]u8 = undefined;
+        self.io.random(&fresh);
+        key = fresh;
     }
-    try self.writer.writeAll(header[0..hdr_len]);
-    for (parts) |part| try self.writer.writeAll(part);
+    var header: [frame.header_max]u8 = undefined;
+    try self.writer.writeAll(frame.encodeHeader(&header, fin, opcode, len, key));
+    if (key) |mask_key| {
+        // The parts are read-only, so they are masked through a
+        // stack chunk; the key cycle runs across all of them.
+        var chunk: [mask_chunk_len]u8 = undefined;
+        var offset: usize = 0;
+        for (parts) |part| {
+            var rest = part;
+            while (rest.len > 0) {
+                const n = @min(rest.len, chunk.len);
+                @memcpy(chunk[0..n], rest[0..n]);
+                frame.mask(chunk[0..n], mask_key, offset);
+                try self.writer.writeAll(chunk[0..n]);
+                offset += n;
+                rest = rest[n..];
+            }
+        }
+    } else {
+        for (parts) |part| try self.writer.writeAll(part);
+    }
     try self.writer.flush();
 }
 
@@ -591,7 +544,7 @@ test "selectSubprotocol returns null for a list without tokens" {
 /// Assemble a wire frame for tests (heap-allocated; the caller frees
 /// it): `mask` applies a fixed key to the payload, since client frames
 /// must be masked (RFC 6455 §5.1).
-fn frame(fin: bool, opcode: u8, mask: bool, payload: []const u8) []u8 {
+fn rawFrame(fin: bool, opcode: u8, mask: bool, payload: []const u8) []u8 {
     const key = [4]u8{ 0x37, 0xfa, 0x21, 0x3d };
     const len = payload.len;
     // Allocate exactly the wire size: the debug allocator validates
@@ -630,7 +583,7 @@ fn frame(fin: bool, opcode: u8, mask: bool, payload: []const u8) []u8 {
 
 /// Append one masked wire frame to `wire` (tests).
 fn appendFrame(wire: *std.ArrayList(u8), fin: bool, opcode: u8, payload: []const u8) !void {
-    const bytes = frame(fin, opcode, true, payload);
+    const bytes = rawFrame(fin, opcode, true, payload);
     defer testing.allocator.free(bytes);
     try wire.appendSlice(testing.allocator, bytes);
 }
@@ -754,7 +707,7 @@ test "upgrade: a valid handshake echoes the first offered subprotocol" {
 }
 
 test "next returns a masked unfragmented text frame (RFC A.1)" {
-    const bytes = frame(true, 0x1, true, "Hello");
+    const bytes = rawFrame(true, 0x1, true, "Hello");
     defer testing.allocator.free(bytes);
     var out: [64]u8 = undefined;
     var reader = std.Io.Reader.fixed(bytes);
@@ -769,9 +722,9 @@ test "next returns a masked unfragmented text frame (RFC A.1)" {
 }
 
 test "next reassembles a fragmented text message (RFC A.1)" {
-    const first = frame(false, 0x1, true, "Hel");
+    const first = rawFrame(false, 0x1, true, "Hel");
     defer testing.allocator.free(first);
-    const second = frame(true, 0x0, true, "lo");
+    const second = rawFrame(true, 0x0, true, "lo");
     defer testing.allocator.free(second);
     const all = try testing.allocator.alloc(u8, first.len + second.len);
     defer testing.allocator.free(all);
@@ -792,13 +745,13 @@ test "next reassembles two consecutive fragmented text messages" {
     // Regression: the finished first message left `frag_len` set, so
     // the second message came back prefixed with the first's payload
     // ("HelloWorld").
-    const p1 = frame(false, 0x1, true, "Hel");
+    const p1 = rawFrame(false, 0x1, true, "Hel");
     defer testing.allocator.free(p1);
-    const p2 = frame(true, 0x0, true, "lo");
+    const p2 = rawFrame(true, 0x0, true, "lo");
     defer testing.allocator.free(p2);
-    const p3 = frame(false, 0x1, true, "Wor");
+    const p3 = rawFrame(false, 0x1, true, "Wor");
     defer testing.allocator.free(p3);
-    const p4 = frame(true, 0x0, true, "ld");
+    const p4 = rawFrame(true, 0x0, true, "ld");
     defer testing.allocator.free(p4);
     const parts = [_][]const u8{ p1, p2, p3, p4 };
     var all: [128]u8 = undefined;
@@ -823,15 +776,15 @@ test "next reassembles two consecutive fragmented text messages" {
 test "next interleaves single-frame and fragmented messages" {
     // Fragment "ab", single "c", fragment "de": the accumulator must
     // survive the single-frame message untouched.
-    const p1 = frame(false, 0x1, true, "a");
+    const p1 = rawFrame(false, 0x1, true, "a");
     defer testing.allocator.free(p1);
-    const p2 = frame(true, 0x0, true, "b");
+    const p2 = rawFrame(true, 0x0, true, "b");
     defer testing.allocator.free(p2);
-    const p3 = frame(true, 0x1, true, "c");
+    const p3 = rawFrame(true, 0x1, true, "c");
     defer testing.allocator.free(p3);
-    const p4 = frame(false, 0x2, true, "d");
+    const p4 = rawFrame(false, 0x2, true, "d");
     defer testing.allocator.free(p4);
-    const p5 = frame(true, 0x0, true, "e");
+    const p5 = rawFrame(true, 0x0, true, "e");
     defer testing.allocator.free(p5);
     const parts = [_][]const u8{ p1, p2, p3, p4, p5 };
     var all: [160]u8 = undefined;
@@ -895,7 +848,7 @@ test "next reuses one receive buffer across messages and fragments" {
 }
 
 test "next returns a masked binary frame (RFC A.1)" {
-    const bytes = frame(true, 0x2, true, "Hello World");
+    const bytes = rawFrame(true, 0x2, true, "Hello World");
     defer testing.allocator.free(bytes);
     var out: [64]u8 = undefined;
     var reader = std.Io.Reader.fixed(bytes);
@@ -909,7 +862,7 @@ test "next returns a masked binary frame (RFC A.1)" {
 }
 
 test "next returns an empty text frame (RFC A.1)" {
-    const bytes = frame(true, 0x1, true, "");
+    const bytes = rawFrame(true, 0x1, true, "");
     defer testing.allocator.free(bytes);
     var out: [64]u8 = undefined;
     var reader = std.Io.Reader.fixed(bytes);
@@ -923,9 +876,9 @@ test "next returns an empty text frame (RFC A.1)" {
 }
 
 test "next answers a ping with a pong carrying the same payload" {
-    const ping_frame = frame(true, 0x9, true, "hi");
+    const ping_frame = rawFrame(true, 0x9, true, "hi");
     defer testing.allocator.free(ping_frame);
-    const text = frame(true, 0x1, true, "x");
+    const text = rawFrame(true, 0x1, true, "x");
     defer testing.allocator.free(text);
     const all = try testing.allocator.alloc(u8, ping_frame.len + text.len);
     defer testing.allocator.free(all);
@@ -948,7 +901,7 @@ test "next answers a ping with a pong carrying the same payload" {
 
 test "next surfaces a close frame and echoes it back" {
     const code = [2]u8{ 0x03, 0xe8 }; // 1000
-    const bytes = frame(true, 0x8, true, &code);
+    const bytes = rawFrame(true, 0x8, true, &code);
     defer testing.allocator.free(bytes);
     var out: [64]u8 = undefined;
     var reader = std.Io.Reader.fixed(bytes);
@@ -971,7 +924,7 @@ test "next surfaces a close frame and echoes it back" {
 }
 
 test "next fails the connection with 1002 on an unmasked client frame" {
-    const bytes = frame(true, 0x1, false, "Hello");
+    const bytes = rawFrame(true, 0x1, false, "Hello");
     defer testing.allocator.free(bytes);
     var out: [64]u8 = undefined;
     var reader = std.Io.Reader.fixed(bytes);
@@ -989,7 +942,7 @@ test "next fails the connection with 1002 on an unmasked client frame" {
 }
 
 test "next fails the connection with 1002 on a set RSV bit" {
-    var bytes = frame(true, 0x1, true, "Hello");
+    var bytes = rawFrame(true, 0x1, true, "Hello");
     defer testing.allocator.free(bytes);
     bytes[0] |= 0x10; // RSV1.
     var out: [64]u8 = undefined;
@@ -1005,7 +958,7 @@ test "next fails the connection with 1002 on a set RSV bit" {
 }
 
 test "next fails the connection with 1002 on a reserved opcode" {
-    const bytes = frame(true, 0x3, true, "x");
+    const bytes = rawFrame(true, 0x3, true, "x");
     defer testing.allocator.free(bytes);
     var out: [64]u8 = undefined;
     var reader = std.Io.Reader.fixed(bytes);
@@ -1019,7 +972,7 @@ test "next fails the connection with 1002 on a reserved opcode" {
 
 test "next fails the connection with 1002 on an unfragmented control frame" {
     // FIN=0 on a ping.
-    const bytes = frame(false, 0x9, true, "x");
+    const bytes = rawFrame(false, 0x9, true, "x");
     defer testing.allocator.free(bytes);
     var out: [64]u8 = undefined;
     var reader = std.Io.Reader.fixed(bytes);
@@ -1033,7 +986,7 @@ test "next fails the connection with 1002 on an unfragmented control frame" {
 
 test "next fails the connection with 1002 on an oversized control frame" {
     const payload = [_]u8{0} ** 126;
-    const bytes = frame(true, 0x9, true, &payload);
+    const bytes = rawFrame(true, 0x9, true, &payload);
     defer testing.allocator.free(bytes);
     var out: [64]u8 = undefined;
     var reader = std.Io.Reader.fixed(bytes);
@@ -1047,7 +1000,7 @@ test "next fails the connection with 1002 on an oversized control frame" {
 
 test "next fails the connection with 1009 on a frame over max_payload" {
     const payload = [_]u8{0xAA} ** 50;
-    const bytes = frame(true, 0x2, true, &payload);
+    const bytes = rawFrame(true, 0x2, true, &payload);
     defer testing.allocator.free(bytes);
     var out: [64]u8 = undefined;
     var reader = std.Io.Reader.fixed(bytes);
@@ -1065,9 +1018,9 @@ test "next fails the connection with 1009 on a frame over max_payload" {
 }
 
 test "next fails the connection with 1009 when fragments sum over max_payload" {
-    const first = frame(false, 0x2, true, "0123456789");
+    const first = rawFrame(false, 0x2, true, "0123456789");
     defer testing.allocator.free(first);
-    const second = frame(true, 0x0, true, "0123456789");
+    const second = rawFrame(true, 0x0, true, "0123456789");
     defer testing.allocator.free(second);
     var all: [32]u8 = undefined;
     @memcpy(all[0..first.len], first);
@@ -1086,7 +1039,7 @@ test "next fails the connection with 1009 when fragments sum over max_payload" {
 
 test "next accepts a frame exactly at max_payload" {
     const payload = [_]u8{0xAA} ** 10;
-    const bytes = frame(true, 0x2, true, &payload);
+    const bytes = rawFrame(true, 0x2, true, &payload);
     defer testing.allocator.free(bytes);
     var out: [64]u8 = undefined;
     var reader = std.Io.Reader.fixed(bytes);
@@ -1100,7 +1053,7 @@ test "next accepts a frame exactly at max_payload" {
 }
 
 test "next fails the connection with 1002 on a stray continuation frame" {
-    const bytes = frame(true, 0x0, true, "x");
+    const bytes = rawFrame(true, 0x0, true, "x");
     defer testing.allocator.free(bytes);
     var out: [64]u8 = undefined;
     var reader = std.Io.Reader.fixed(bytes);
@@ -1113,9 +1066,9 @@ test "next fails the connection with 1002 on a stray continuation frame" {
 }
 
 test "next fails the connection with 1002 on a data frame while a sequence is open" {
-    const first = frame(false, 0x1, true, "a");
+    const first = rawFrame(false, 0x1, true, "a");
     defer testing.allocator.free(first);
-    const second = frame(true, 0x1, true, "b");
+    const second = rawFrame(true, 0x1, true, "b");
     defer testing.allocator.free(second);
     const all = try testing.allocator.alloc(u8, first.len + second.len);
     defer testing.allocator.free(all);
@@ -1177,9 +1130,9 @@ test "close clips the reason to the 125-byte frame limit" {
 
 test "next fails the connection with 1002 on a data frame after close" {
     const code = [2]u8{ 0x03, 0xe8 }; // 1000
-    const close_frame = frame(true, 0x8, true, &code);
+    const close_frame = rawFrame(true, 0x8, true, &code);
     defer testing.allocator.free(close_frame);
-    const text = frame(true, 0x1, true, "late");
+    const text = rawFrame(true, 0x1, true, "late");
     defer testing.allocator.free(text);
     const all = try testing.allocator.alloc(u8, close_frame.len + text.len);
     defer testing.allocator.free(all);
@@ -1202,9 +1155,9 @@ test "next fails the connection with 1002 on a data frame after close" {
 
 test "next fails the connection with 1002 on a ping after close" {
     const code = [2]u8{ 0x03, 0xe8 }; // 1000
-    const close_frame = frame(true, 0x8, true, &code);
+    const close_frame = rawFrame(true, 0x8, true, &code);
     defer testing.allocator.free(close_frame);
-    const ping_frame = frame(true, 0x9, true, "abc");
+    const ping_frame = rawFrame(true, 0x9, true, "abc");
     defer testing.allocator.free(ping_frame);
     const all = try testing.allocator.alloc(u8, close_frame.len + ping_frame.len);
     defer testing.allocator.free(all);
@@ -1281,10 +1234,10 @@ test "next keeps failing after a protocol violation without reading further" {
 
 test "next fails the connection with 1002 on a second close after a malformed close" {
     const bad = [2]u8{ 0x03, 0xee }; // 1006: local-only, never on the wire
-    const first = frame(true, 0x8, true, &bad);
+    const first = rawFrame(true, 0x8, true, &bad);
     defer testing.allocator.free(first);
     const good = [2]u8{ 0x03, 0xe8 }; // 1000
-    const second = frame(true, 0x8, true, &good);
+    const second = rawFrame(true, 0x8, true, &good);
     defer testing.allocator.free(second);
     const all = try testing.allocator.alloc(u8, first.len + second.len);
     defer testing.allocator.free(all);
@@ -1314,7 +1267,7 @@ test "next fails the connection with 1002 on a second close after a malformed cl
 
 test "next fails the connection with 1007 on invalid UTF-8 text" {
     const payload = [2]u8{ 0xff, 0xfe };
-    const bytes = frame(true, 0x1, true, &payload);
+    const bytes = rawFrame(true, 0x1, true, &payload);
     defer testing.allocator.free(bytes);
     var out: [64]u8 = undefined;
     var reader = std.Io.Reader.fixed(bytes);
@@ -1333,7 +1286,7 @@ test "next fails the connection with 1002 on a malformed close payload" {
     const payloads = [_][]const u8{ &[_]u8{0x01}, &[_]u8{ 0x03, 0xe5 } };
     for (payloads) |close_payload| {
         // 1 byte; or 1005 on the wire.
-        const bytes = frame(true, 0x8, true, close_payload);
+        const bytes = rawFrame(true, 0x8, true, close_payload);
         defer testing.allocator.free(bytes);
         var out: [64]u8 = undefined;
         var reader = std.Io.Reader.fixed(bytes);
@@ -1350,9 +1303,9 @@ test "next fails the connection with 1002 on a malformed close payload" {
 
 test "next fails the connection with 1002 on a second close frame" {
     const code = [2]u8{ 0x03, 0xe8 }; // 1000
-    const first = frame(true, 0x8, true, &code);
+    const first = rawFrame(true, 0x8, true, &code);
     defer testing.allocator.free(first);
-    const second = frame(true, 0x8, true, &code);
+    const second = rawFrame(true, 0x8, true, &code);
     defer testing.allocator.free(second);
     var all: [16]u8 = undefined;
     @memcpy(all[0..first.len], first);
@@ -1375,7 +1328,7 @@ test "next fails the connection with 1002 on a second close frame" {
 
 test "next fails the connection with 1002 on an explicit zero close code" {
     const payload = [2]u8{ 0x00, 0x00 };
-    const bytes = frame(true, 0x8, true, &payload);
+    const bytes = rawFrame(true, 0x8, true, &payload);
     defer testing.allocator.free(bytes);
     var out: [64]u8 = undefined;
     var reader = std.Io.Reader.fixed(bytes);
@@ -1393,7 +1346,7 @@ test "next fails the connection with 1002 on an explicit zero close code" {
 }
 
 test "next accepts a close frame with no status code" {
-    const bytes = frame(true, 0x8, true, &[_]u8{});
+    const bytes = rawFrame(true, 0x8, true, &[_]u8{});
     defer testing.allocator.free(bytes);
     var out: [64]u8 = undefined;
     var reader = std.Io.Reader.fixed(bytes);
@@ -1430,7 +1383,7 @@ test "next returns ReadFailed when the automatic pong write fails" {
 test "next returns a 16-bit extended-length binary message" {
     var payload: [200]u8 = undefined;
     for (&payload, 0..) |*b, i| b.* = @truncate(i);
-    const bytes = frame(true, 0x2, true, &payload);
+    const bytes = rawFrame(true, 0x2, true, &payload);
     defer testing.allocator.free(bytes);
     var out: [64]u8 = undefined;
     var reader = std.Io.Reader.fixed(bytes);
@@ -1448,7 +1401,7 @@ test "next returns a 64-bit extended-length binary message" {
     defer arena.deinit();
     const payload = try arena.allocator().alloc(u8, 70000);
     for (payload, 0..) |*b, i| b.* = @truncate(i);
-    const bytes = frame(true, 0x2, true, payload);
+    const bytes = rawFrame(true, 0x2, true, payload);
     defer testing.allocator.free(bytes);
     var out: [64]u8 = undefined;
     var reader = std.Io.Reader.fixed(bytes);
@@ -1539,8 +1492,79 @@ test "a failed write latches failed and stops next() from reading" {
     try testing.expectError(error.ReadFailed, ws.next());
 }
 
-// Integration tests: a live `Loop` over real TCP, with a raw
-// (hand-assembled, masked) WebSocket client.
+test "a client-role session masks every frame it sends" {
+    var out: [64]u8 = undefined;
+    var reader = std.Io.Reader.fixed("");
+    var writer = std.Io.Writer.fixed(&out);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var ws = @This(){ .reader = &reader, .writer = &writer, .allocator = arena.allocator(), .io = testing.io, .role = .client };
+
+    ws.sendText("Hello");
+    // 0x81, mask bit + len 5, a 4-byte key, the masked payload.
+    try testing.expectEqual(@as(usize, 11), writer.end);
+    try testing.expectEqual(@as(u8, 0x81), out[0]);
+    try testing.expectEqual(@as(u8, 0x85), out[1]);
+    var payload = out[6..11].*;
+    frame.mask(&payload, out[2..6].*, 0);
+    try testing.expectEqualStrings("Hello", &payload);
+}
+
+test "a client-role session fails the connection with 1002 on a masked frame" {
+    const bytes = rawFrame(true, 0x1, true, "Hello");
+    defer testing.allocator.free(bytes);
+    var out: [64]u8 = undefined;
+    var reader = std.Io.Reader.fixed(bytes);
+    var writer = std.Io.Writer.fixed(&out);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var ws = @This(){ .reader = &reader, .writer = &writer, .allocator = arena.allocator(), .io = testing.io, .role = .client };
+
+    try testing.expectError(error.ProtocolError, ws.next());
+    // Close 1002, masked: 0x88, mask bit + len 2, key, masked code.
+    try testing.expectEqual(@as(usize, 8), writer.end);
+    try testing.expectEqual(@as(u8, 0x88), out[0]);
+    try testing.expectEqual(@as(u8, 0x82), out[1]);
+    var code = out[6..8].*;
+    frame.mask(&code, out[2..6].*, 0);
+    try testing.expectEqual(@as(u16, 1002), std.mem.readInt(u16, &code, .big));
+}
+
+test "a client-role session reassembles unmasked fragments and answers a ping" {
+    const first = rawFrame(false, 0x1, false, "Hel");
+    defer testing.allocator.free(first);
+    const ping_frame = rawFrame(true, 0x9, false, "p");
+    defer testing.allocator.free(ping_frame);
+    const second = rawFrame(true, 0x0, false, "lo");
+    defer testing.allocator.free(second);
+    var all: [32]u8 = undefined;
+    var end: usize = 0;
+    for ([_][]const u8{ first, ping_frame, second }) |part| {
+        @memcpy(all[end .. end + part.len], part);
+        end += part.len;
+    }
+    var out: [64]u8 = undefined;
+    var reader = std.Io.Reader.fixed(all[0..end]);
+    var writer = std.Io.Writer.fixed(&out);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var ws = @This(){ .reader = &reader, .writer = &writer, .allocator = arena.allocator(), .io = testing.io, .role = .client };
+
+    const msg = try ws.next();
+    try testing.expectEqualStrings("Hello", msg.text);
+    // The pong went out masked: 0x8a, mask bit + len 1, key, one byte.
+    try testing.expectEqual(@as(usize, 7), writer.end);
+    try testing.expectEqual(@as(u8, 0x8a), out[0]);
+    try testing.expectEqual(@as(u8, 0x81), out[1]);
+    try testing.expectEqual(@as(u8, 'p'), out[6] ^ out[2]);
+}
+
+// Integration tests: a live `Loop` over real TCP, driven by the real
+// client (`Client`) or, where a test needs raw or deliberately bad
+// frames, by the hand-assembled `WsClient`.
+
+/// The file's own type, for use inside the nested test types.
+const WebSocket = @This();
 
 const WsEchoHandler = struct {
     /// Set by `WsTestServer.start`; runs the sender task.
@@ -1553,6 +1577,10 @@ const WsEchoHandler = struct {
     /// Binary frames a second task sends while the handler reads; 0
     /// spawns no task.
     storm_frames: usize = 0,
+    /// Echo every message as two fragments with a ping between them.
+    echo_in_fragments: bool = false,
+    /// Ping before every echo.
+    ping_before_echo: bool = false,
 
     pub fn handle(self: @This(), req: Request, res: *Response) !void {
         var ws = upgrade(req, res) catch |err| switch (err) {
@@ -1574,11 +1602,26 @@ const WsEchoHandler = struct {
         while (true) {
             const msg = ws.next() catch return;
             switch (msg) {
-                .text => |t| ws.sendText(t),
-                .binary => |b| ws.sendBinary(b),
+                .text => |t| self.echo(&ws, .text, t),
+                .binary => |b| self.echo(&ws, .binary, b),
                 .close => return,
             }
         }
+    }
+
+    fn echo(self: @This(), ws: *WebSocket, opcode: OpCode, payload: []const u8) void {
+        if (self.ping_before_echo) ws.ping("before");
+        if (!self.echo_in_fragments) {
+            ws.sendData(opcode, payload);
+            return;
+        }
+        const half = payload.len / 2;
+        ws.write_mutex.lockUncancelable(ws.io);
+        defer ws.write_mutex.unlock(ws.io);
+        if (ws.closed or ws.failed) return;
+        ws.writeFrame(false, opcode, &[_][]const u8{payload[0..half]}) catch return;
+        ws.writeFrame(true, .ping, &[_][]const u8{"mid"}) catch return;
+        ws.writeFrame(true, .continuation, &[_][]const u8{payload[half..]}) catch return;
     }
 };
 
@@ -1688,7 +1731,7 @@ test "integration: handshake, text echo, ping/pong, close over a live loop" {
     try testing.expect(std.mem.indexOf(u8, hs, "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=") != null);
 
     // 2. A masked text frame is echoed back verbatim.
-    const hello = frame(true, 0x1, true, "Hello WebSocket");
+    const hello = rawFrame(true, 0x1, true, "Hello WebSocket");
     defer allocator.free(hello);
     try w.interface.writeAll(hello);
     try w.interface.flush();
@@ -1698,7 +1741,7 @@ test "integration: handshake, text echo, ping/pong, close over a live loop" {
     try testing.expectEqualStrings("Hello WebSocket", echo.payload);
 
     // 3. A ping is answered with a pong carrying the same payload.
-    const ping_frame = frame(true, 0x9, true, "ping-payload");
+    const ping_frame = rawFrame(true, 0x9, true, "ping-payload");
     defer allocator.free(ping_frame);
     try w.interface.writeAll(ping_frame);
     try w.interface.flush();
@@ -1710,7 +1753,7 @@ test "integration: handshake, text echo, ping/pong, close over a live loop" {
     // 4. Close handshake: the server echoes the Close frame, then
     // closes the TCP connection.
     const close_code = [_]u8{ 0x03, 0xE8 }; // 1000.
-    const close_frame = frame(true, 0x8, true, &close_code);
+    const close_frame = rawFrame(true, 0x8, true, &close_code);
     defer allocator.free(close_frame);
     try w.interface.writeAll(close_frame);
     try w.interface.flush();
@@ -1759,42 +1802,6 @@ test "integration: an invalid upgrade request gets a 400" {
     defer allocator.free(resp);
     try testing.expect(std.mem.indexOf(u8, resp, "400 Bad Request") != null);
     try testing.expect(std.mem.indexOf(u8, resp, "Connection: close") != null);
-}
-
-test "integration: the 101 echoes the first offered subprotocol" {
-    const io = testing.io;
-    const allocator = testing.allocator;
-
-    var ts: WsTestServer = undefined;
-    try ts.start(io, allocator, .{});
-    defer ts.stop();
-
-    var stream = try std.Io.net.IpAddress.connect(&ts.boundAddress(), io, .{ .mode = .stream });
-    defer stream.close(io);
-
-    var wbuf: [1024]u8 = undefined;
-    var w = stream.writer(io, &wbuf);
-    try w.interface.writeAll(
-        "GET /ws HTTP/1.1\r\n" ++
-            "Host: localhost\r\n" ++
-            "Upgrade: websocket\r\n" ++
-            "Connection: Upgrade\r\n" ++
-            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
-            "Sec-WebSocket-Version: 13\r\n" ++
-            "Sec-WebSocket-Protocol: chat, superchat\r\n" ++
-            "\r\n",
-    );
-    try w.interface.flush();
-
-    var rbuf: [4096]u8 = undefined;
-    var r = stream.reader(io, &rbuf);
-    var hs_buf: [8192]u8 = undefined;
-    const hs = try readHandshake(&r.interface, &hs_buf);
-    try testing.expect(std.mem.indexOf(u8, hs, "101 Switching Protocols") != null);
-    // RFC 6455 §4.1: the server MUST echo the header when the client
-    // sent it — clients that requested subprotocols and got none treat
-    // the handshake as failed.
-    try testing.expect(std.mem.indexOf(u8, hs, "Sec-WebSocket-Protocol: chat") != null);
 }
 
 test "integration: a payload spanning a read-buffer refill is unmasked intact" {
@@ -1887,7 +1894,7 @@ test "integration: a Connection token list upgrades and the 101 answers Connecti
     try testing.expect(std.mem.indexOf(u8, hs, "Connection: Upgrade\r\n") != null);
 
     // The session is live: a text frame is echoed.
-    const hello = frame(true, 0x1, true, "hi");
+    const hello = rawFrame(true, 0x1, true, "hi");
     defer allocator.free(hello);
     try w.interface.writeAll(hello);
     try w.interface.flush();
@@ -1925,87 +1932,6 @@ const WsClient = struct {
         try testing.expect(std.mem.indexOf(u8, hs, "101 Switching Protocols") != null);
     }
 };
-
-test "integration: an over-cap frame gets Close 1009 and a clean EOF, not a reset" {
-    const io = testing.io;
-    const allocator = testing.allocator;
-
-    var ts: WsTestServer = undefined;
-    try ts.start(io, allocator, .{ .max_payload = 16 });
-    defer ts.stop();
-    var client: WsClient = .{ .stream = undefined };
-    try client.open(io, &ts);
-    defer client.stream.close(io);
-
-    // The server rejects this frame from its header and never reads
-    // the payload; closing on those unread bytes would have made the
-    // kernel answer with a reset instead of delivering the Close.
-    const big = [_]u8{0x55} ** 100;
-    const bytes = frame(true, 0x2, true, &big);
-    defer allocator.free(bytes);
-    try client.writer.interface.writeAll(bytes);
-    try client.writer.interface.flush();
-
-    const close_frame = try readUnmaskedFrame(&client.reader.interface, allocator);
-    defer allocator.free(close_frame.payload);
-    try testing.expectEqual(@as(u8, 0x8), close_frame.opcode);
-    try testing.expectEqual(@as(u16, 1009), std.mem.readInt(u16, close_frame.payload[0..2], .big));
-    // The send side was shut down and our frame drained: a clean EOF.
-    try testing.expectError(error.EndOfStream, client.reader.interface.take(1));
-}
-
-test "integration: a handler that closes and returns has the peer's reply drained" {
-    const io = testing.io;
-    const allocator = testing.allocator;
-
-    var ts: WsTestServer = undefined;
-    try ts.start(io, allocator, .{ .close_on_open = true });
-    defer ts.stop();
-    var client: WsClient = .{ .stream = undefined };
-    try client.open(io, &ts);
-    defer client.stream.close(io);
-
-    const close_frame = try readUnmaskedFrame(&client.reader.interface, allocator);
-    defer allocator.free(close_frame.payload);
-    try testing.expectEqual(@as(u8, 0x8), close_frame.opcode);
-    try testing.expectEqual(@as(u16, 1001), std.mem.readInt(u16, close_frame.payload[0..2], .big));
-    try testing.expectEqualStrings("bye", close_frame.payload[2..]);
-
-    // Our Close reply lands after the handler returned; the loop's
-    // drain consumes it rather than the socket closing on it.
-    const reply = frame(true, 0x8, true, &[_]u8{ 0x03, 0xe9 });
-    defer allocator.free(reply);
-    try client.writer.interface.writeAll(reply);
-    try client.writer.interface.flush();
-    try testing.expectError(error.EndOfStream, client.reader.interface.take(1));
-}
-
-test "integration: a silent peer is closed with 1001 after the idle deadline" {
-    const io = testing.io;
-    const allocator = testing.allocator;
-
-    var ts: WsTestServer = undefined;
-    try ts.start(io, allocator, .{ .idle_timeout_in_millis = 100 });
-    defer ts.stop();
-    var client: WsClient = .{ .stream = undefined };
-    try client.open(io, &ts);
-    defer client.stream.close(io);
-
-    // Traffic keeps the session alive: an echo, then silence.
-    const hello = frame(true, 0x1, true, "hi");
-    defer allocator.free(hello);
-    try client.writer.interface.writeAll(hello);
-    try client.writer.interface.flush();
-    const echo = try readUnmaskedFrame(&client.reader.interface, allocator);
-    defer allocator.free(echo.payload);
-    try testing.expectEqualStrings("hi", echo.payload);
-
-    const close_frame = try readUnmaskedFrame(&client.reader.interface, allocator);
-    defer allocator.free(close_frame.payload);
-    try testing.expectEqual(@as(u8, 0x8), close_frame.opcode);
-    try testing.expectEqual(@as(u16, 1001), std.mem.readInt(u16, close_frame.payload[0..2], .big));
-    try testing.expectError(error.EndOfStream, client.reader.interface.take(1));
-}
 
 /// Payload length of the storm test's binary frames: a 4-byte index
 /// followed by an index-derived pattern.
@@ -2047,7 +1973,7 @@ test "integration: a sender task and the reader's pongs share the socket intact"
     for (0..ping_count) |index| {
         var payload: [8]u8 = undefined;
         std.mem.writeInt(u64, &payload, @intCast(index), .big);
-        const bytes = frame(true, 0x9, true, &payload);
+        const bytes = rawFrame(true, 0x9, true, &payload);
         defer allocator.free(bytes);
         try client.writer.interface.writeAll(bytes);
     }
@@ -2074,7 +2000,7 @@ test "integration: a sender task and the reader's pongs share the socket intact"
         }
     }
 
-    const close_frame = frame(true, 0x8, true, &[_]u8{ 0x03, 0xe8 });
+    const close_frame = rawFrame(true, 0x8, true, &[_]u8{ 0x03, 0xe8 });
     defer allocator.free(close_frame);
     try client.writer.interface.writeAll(close_frame);
     try client.writer.interface.flush();
@@ -2082,6 +2008,208 @@ test "integration: a sender task and the reader's pongs share the socket intact"
     defer allocator.free(echoed.payload);
     try testing.expectEqual(@as(u8, 0x8), echoed.opcode);
     try testing.expectError(error.EndOfStream, client.reader.interface.take(1));
+}
+
+/// Connect the real client to `ts`.
+fn connectClient(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    ts: *WsTestServer,
+    subprotocols: []const []const u8,
+) !Client {
+    return Client.connect(io, allocator, .{
+        .host = "127.0.0.1",
+        .port = ts.boundAddress().getPort(),
+        .path = "/ws",
+        .subprotocols = subprotocols,
+    });
+}
+
+test "integration: the client round-trips text and a 100 KB binary message" {
+    const io = testing.io;
+    const allocator = testing.allocator;
+
+    var ts: WsTestServer = undefined;
+    try ts.start(io, allocator, .{});
+    defer ts.stop();
+    var client = try connectClient(io, allocator, &ts, &.{});
+    defer client.deinit();
+
+    client.sendText("Hello WebSocket");
+    const echo = try client.next();
+    try testing.expectEqualStrings("Hello WebSocket", echo.text);
+
+    const big = try allocator.alloc(u8, 100 * 1024);
+    defer allocator.free(big);
+    for (big, 0..) |*byte, i| byte.* = @truncate(i * 31);
+    client.sendBinary(big);
+    const echo_big = try client.next();
+    try testing.expectEqualSlices(u8, big, echo_big.binary);
+}
+
+test "integration: the client reassembles fragments both ways with pings in between" {
+    const io = testing.io;
+    const allocator = testing.allocator;
+
+    var ts: WsTestServer = undefined;
+    try ts.start(io, allocator, .{ .echo_in_fragments = true });
+    defer ts.stop();
+    var client = try connectClient(io, allocator, &ts, &.{});
+    defer client.deinit();
+
+    // A whole message comes back as two fragments with a ping
+    // between them, answered on the way.
+    client.sendText("Hello WebSocket");
+    const echo = try client.next();
+    try testing.expectEqualStrings("Hello WebSocket", echo.text);
+
+    // A message sent in fragments is reassembled by the server.
+    try client.session.writeFrameParts(false, .binary, &[_][]const u8{"frag"});
+    try client.session.writeFrameParts(true, .continuation, &[_][]const u8{"ments"});
+    const echo_frag = try client.next();
+    try testing.expectEqualStrings("fragments", echo_frag.binary);
+}
+
+test "integration: the client completes the close handshake it starts" {
+    const io = testing.io;
+    const allocator = testing.allocator;
+
+    var ts: WsTestServer = undefined;
+    try ts.start(io, allocator, .{});
+    defer ts.stop();
+    var client = try connectClient(io, allocator, &ts, &.{});
+    defer client.deinit();
+
+    client.sendText("hi");
+    try testing.expectEqualStrings("hi", (try client.next()).text);
+    client.close(.normal_closure, "bye");
+    const reply = try client.next();
+    try testing.expectEqual(@as(u16, 1000), reply.close.code);
+    try testing.expectEqualStrings("bye", reply.close.reason);
+    try testing.expectError(error.EndOfStream, client.next());
+}
+
+test "integration: the client answers a server-initiated close and sees a clean EOF" {
+    const io = testing.io;
+    const allocator = testing.allocator;
+
+    var ts: WsTestServer = undefined;
+    try ts.start(io, allocator, .{ .close_on_open = true });
+    defer ts.stop();
+    var client = try connectClient(io, allocator, &ts, &.{});
+    defer client.deinit();
+
+    const closing = try client.next();
+    try testing.expectEqual(@as(u16, 1001), closing.close.code);
+    try testing.expectEqualStrings("bye", closing.close.reason);
+    // Our echo of the Close lands after the handler returned; the
+    // loop's drain consumes it rather than the socket closing on it.
+    try testing.expectError(error.EndOfStream, client.next());
+}
+
+test "integration: the client gets Close 1009 for an over-cap frame, then a clean EOF" {
+    const io = testing.io;
+    const allocator = testing.allocator;
+
+    var ts: WsTestServer = undefined;
+    try ts.start(io, allocator, .{ .max_payload = 16 });
+    defer ts.stop();
+    var client = try connectClient(io, allocator, &ts, &.{});
+    defer client.deinit();
+
+    // The server rejects this frame from its header and never reads
+    // the payload; the send side is shut down and our bytes drained,
+    // so the Close arrives instead of a reset.
+    const big = [_]u8{0x55} ** 100;
+    client.sendBinary(&big);
+    const closing = try client.next();
+    try testing.expectEqual(@as(u16, 1009), closing.close.code);
+    try testing.expectError(error.EndOfStream, client.next());
+}
+
+test "integration: the client is closed with 1001 after the server's idle deadline" {
+    const io = testing.io;
+    const allocator = testing.allocator;
+
+    var ts: WsTestServer = undefined;
+    try ts.start(io, allocator, .{ .idle_timeout_in_millis = 100 });
+    defer ts.stop();
+    var client = try connectClient(io, allocator, &ts, &.{});
+    defer client.deinit();
+
+    // Traffic keeps the session alive: an echo, then silence.
+    client.sendText("hi");
+    try testing.expectEqualStrings("hi", (try client.next()).text);
+    const closing = try client.next();
+    try testing.expectEqual(@as(u16, 1001), closing.close.code);
+    try testing.expectError(error.EndOfStream, client.next());
+}
+
+test "integration: a client payload spanning the server's read-buffer refill is unmasked intact" {
+    // Frame A is bigger than the 8 KiB connection read buffer, so its
+    // payload read refills the buffer with frame B already behind it.
+    const io = testing.io;
+    const allocator = testing.allocator;
+
+    var ts: WsTestServer = undefined;
+    try ts.start(io, allocator, .{});
+    defer ts.stop();
+    var client = try connectClient(io, allocator, &ts, &.{});
+    defer client.deinit();
+
+    const big = try allocator.alloc(u8, 10000);
+    defer allocator.free(big);
+    for (big, 0..) |*byte, i| byte.* = @truncate(i * 7);
+    client.sendBinary(big);
+    client.sendText("tail");
+    try testing.expectEqualSlices(u8, big, (try client.next()).binary);
+    try testing.expectEqualStrings("tail", (try client.next()).text);
+}
+
+test "integration: the client's first offered subprotocol comes back selected" {
+    const io = testing.io;
+    const allocator = testing.allocator;
+
+    var ts: WsTestServer = undefined;
+    try ts.start(io, allocator, .{});
+    defer ts.stop();
+    var client = try connectClient(io, allocator, &ts, &.{ "chat", "superchat" });
+    defer client.deinit();
+
+    try testing.expectEqualStrings("chat", client.subprotocol.?);
+    client.sendText("hi");
+    try testing.expectEqualStrings("hi", (try client.next()).text);
+}
+
+test "integration: a client sender task and the client's pongs share the socket intact" {
+    // Mirror of the server-side storm: the server pings before every
+    // echo, so the client's reader task writes pongs while a second
+    // task sends binary frames.
+    const io = testing.io;
+    const allocator = testing.allocator;
+    const frame_count = 1000;
+
+    var ts: WsTestServer = undefined;
+    try ts.start(io, allocator, .{ .ping_before_echo = true });
+    defer ts.stop();
+    var client = try connectClient(io, allocator, &ts, &.{});
+    defer client.deinit();
+
+    var senders: std.Io.Group = .init;
+    defer senders.await(io) catch {};
+    try senders.concurrent(io, sendStorm, .{ &client.session, frame_count });
+
+    var expected: [storm_frame_len]u8 = undefined;
+    for (0..frame_count) |index| {
+        stormPayload(&expected, index);
+        const echo = try client.next();
+        try testing.expectEqualSlices(u8, &expected, echo.binary);
+    }
+    senders.await(io) catch {};
+
+    client.close(.normal_closure, "");
+    try testing.expectEqual(@as(u16, 1000), (try client.next()).close.code);
+    try testing.expectError(error.EndOfStream, client.next());
 }
 
 const std = @import("std");
@@ -2097,3 +2225,5 @@ const request = @import("request.zig");
 const Request = request.Request;
 const Response = @import("response.zig").Response;
 const response = @import("response.zig");
+const frame = @import("websocket/frame.zig");
+const Client = @import("websocket/client.zig");

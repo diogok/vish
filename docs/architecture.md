@@ -14,8 +14,12 @@ src/
 │   ├── request.zig  — Method, URI, Version, Headers, Request, BodyReader
 │   ├── response.zig — Status, Headers, Response (status/headers/body, chunked,
 │   │                  SSE, gzip/deflate)
-│   ├── websocket.zig — WebSocket (RFC 6455): upgrade handshake, frame
-│   │                   codec, protocol validation
+│   ├── websocket.zig — WebSocket session (RFC 6455): upgrade handshake,
+│   │                   protocol validation, either role
+│   ├── websocket/
+│   │   ├── frame.zig  — frame codec: header encode/decode, masking,
+│   │   │                opcodes, close codes, accept key
+│   │   └── client.zig — WebSocketClient: connect and the client handshake
 │   └── socket.zig   — TCP keep-alive / no-delay socket option setters
 ├── loop/
 │   ├── loop.zig     — multi-task accept + worker loop, idle timeout
@@ -88,6 +92,8 @@ RFC 6455, in `http/websocket.zig`. The session lives inside the handler's `handl
 4. Outbound frames go through `sendText` / `sendBinary` / `ping` / `pong` / `close`; each flushes. Every frame write — the pongs, Close echoes and failure Closes `next()` issues included — holds the session's `std.Io.Mutex`, so other tasks may send on the session while one task blocks in `next()`; the checks that gate a write (`closed`, `failed`) run under the same hold, and two tasks closing at once produce one Close frame. Inbound frames are validated per the RFC: client frames must be masked, RSV bits and reserved opcodes are rejected with 1002, text must be valid UTF-8 (1007), and close payloads carry a valid status code.
 
 The server never masks its frames and does not negotiate extensions. The handshake's `Connection` header is a token list (Firefox sends `keep-alive, Upgrade`); the 101 always answers with exactly `Connection: Upgrade`. When the client offers `Sec-WebSocket-Protocol`, the 101 echoes the first non-empty offered subprotocol.
+
+The client (`http/websocket/client.zig`, exported as `WebSocketClient`) embeds the same session in the client role. `connect(io, allocator, options)` resolves the host (an IP literal or a name), runs the RFC 6455 §4.1 handshake — a random 16-byte key, `Sec-WebSocket-Accept` verified, offered subprotocols that the server must answer with one of, extra headers for `Authorization` — and returns a client that owns the socket and its buffers. Every frame it sends is masked with a fresh key; a masked frame from the server fails the connection with 1002. `next()` and the send methods forward to the session, so the contract above (automatic pongs, reassembly, `max_payload`, the idle deadline, the write mutex) holds on both ends. The codec both sides share — header encode/decode, masking, opcodes, close codes, the accept key — is `http/websocket/frame.zig`.
 
 Inbound data payloads are read into one session-owned receive buffer, grown geometrically and reused across messages, so a long session does not grow the per-request arena (which is never reset while the handler runs); the slices `next()` returns point into it and are valid until the next `next()` call. Control-frame payloads land in a separate 125-byte buffer so a ping mid-sequence cannot disturb a fragmented message. Payloads are capped: a data frame, or a fragment sequence summed, over `max_payload` (default 16 MiB; a handler may lower the field before its first `next()`) fails the connection with close 1009 — checked before any buffer is sized.
 

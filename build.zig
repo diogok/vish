@@ -70,6 +70,29 @@ pub fn build(b: *std.Build) void {
         const run_step = b.step("run2", "Run demo2");
         run_step.dependOn(&run_cmd.step);
     }
+
+    {
+        const exe = b.addExecutable(.{
+            .name = "ws-echo",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/ws_echo.zig"),
+                .target = target,
+                .optimize = optimize,
+                .strip = optimize == .ReleaseSmall,
+            }),
+        });
+        exe.root_module.addImport("vish", vish);
+        b.installArtifact(exe);
+
+        const run_cmd = b.addRunArtifact(exe);
+        run_cmd.step.dependOn(b.getInstallStep());
+        if (b.args) |args| {
+            run_cmd.addArgs(args);
+        }
+
+        const run_step = b.step("ws-echo", "Run the WebSocket client probe (demo2's /ws by default)");
+        run_step.dependOn(&run_cmd.step);
+    }
 }
 
 /// Build a module that exposes the contents of `dir` as a static asset

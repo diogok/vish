@@ -53,6 +53,9 @@ CombinedRouter: Chains multiple handlers together, attempting each in order unti
 - Server-Sent Events via `writeSSE` / `writeEvent` / `writeSSEComment`
 - WebSocket (RFC 6455) via `WebSocket.upgrade` — handshake, text/binary
   frames, ping/pong, and close over the upgraded connection
+- WebSocket client via `WebSocketClient.connect` — the same session
+  contract from the connecting side: masked frames, subprotocols, extra
+  headers such as `Authorization`
 
 ### Compression
 

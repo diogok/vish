@@ -329,6 +329,30 @@ pub const WsEchoHandler = struct {
 
 Pings are answered automatically; you rarely need `ping` or `pong` yourself. `close(code, reason)` initiates the close handshake; returning right after it is fine — the loop drains the peer's reply before closing the socket (`ListenOptions.upgrade_linger_in_millis`). A silent peer holds its worker forever by default; set `ws.idle_timeout_in_millis` to close it with 1001 (`next()` returns `error.Timeout`), or ping from a timer. Payloads returned by `next()` point into the session's receive buffer and are valid until the next `next()` call — copy them if they must outlive that. Sends are serialized by a mutex inside the session: a second task (an `io.async` spawned by the handler) may call `sendText` / `sendBinary` / `ping` / `close` while the handler blocks in `next()`; only that one task may call `next()`. When the client sends `Sec-WebSocket-Protocol`, the 101 echoes the first offered subprotocol. Inbound messages over the payload cap (`ws.max_payload`, default 16 MiB; lower it before the first `next()`) fail the session with close 1009. See `src/demo2.zig` for a live `/ws` echo route.
 
+### WebSocket client
+
+`WebSocketClient.connect` opens the connection and runs the handshake; the returned client owns the socket and follows the same `next()` / send contract as the server session, masking every frame it sends.
+
+```zig
+var client = try vish.WebSocketClient.connect(io, allocator, .{
+    .host = "127.0.0.1",
+    .port = 8080,
+    .path = "/ws",
+    .headers = &.{.{ .name = "Authorization", .value = "Bearer ..." }},
+    .subprotocols = &.{"chat"},
+});
+defer client.deinit();
+
+client.sendText("hello");
+const msg = try client.next(); // .text, .binary or .close
+client.close(.normal_closure, "");
+while (client.next()) |reply| {
+    if (reply == .close) break; // the server's Close ends the session
+} else |_| {}
+```
+
+`connect` errors: `HandshakeRejected` (a status other than 101), `HandshakeInvalid` (a 101 without `Upgrade: websocket`, `Connection: Upgrade` or the right `Sec-WebSocket-Accept`), `SubprotocolMismatch` (subprotocols were offered and the server selected none of them), `EndOfStream` (the peer closed mid-handshake), plus the resolver's and socket's errors. `client.subprotocol` holds the one selected. `max_payload` and `idle_timeout_in_millis` are connect options with the server's meaning. As on the server, a second task may send while one blocks in `next()`. `deinit` closes the socket without a close handshake — `close` and read the reply first when the shutdown should be orderly. `zig build ws-echo` runs `src/ws_echo.zig`, a probe that connects to demo2's `/ws` (or the `ws://` URL given as its first argument), sends `hello` and prints the echo.
+
 ### Compression
 
 ```zig

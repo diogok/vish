@@ -30,7 +30,9 @@ Everything is a `zig build` step, run from the repository root.
 zig build test   # unit tests (the library's modules, via src/root.zig)
 zig build run    # demo (src/demo.zig): minimal server
 zig build run2   # demo2 (src/demo2.zig): routing + static assets + logging
-zig build        # default install step; compiles demo and demo2 too
+zig build ws-echo  # WebSocket client probe (src/ws_echo.zig): connects to
+                   # demo2's /ws (or a ws:// URL argument), echoes "hello"
+zig build        # default install step; compiles the demos and ws-echo too
 ```
 
 Tests live in the modules: each `src/` file carries its own `test` block,

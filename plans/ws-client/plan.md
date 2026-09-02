@@ -64,7 +64,7 @@ TLS. Server behaviour stays unchanged; the existing suite stays green.
 - [x] V1 — write mutex: `io` becomes a required session field;
       `write_mutex` held across every frame write; ping storm +
       concurrent sender test.
-- [ ] V2 — codec split, client session, tests migrated to the real
+- [x] V2 — codec split, client session, tests migrated to the real
       client, in-process round-trip tests, `ws-echo` live probe.
 - [ ] V3 — `tls` connect option over `std.crypto.tls.Client`; live
       probe against a public `wss://` echo if the network allows.

@@ -21,6 +21,8 @@ pub const Server = server.Server;
 pub const Connection = server.Connection;
 pub const ListenOptions = server.ListenOptions;
 pub const WebSocket = @import("http/websocket.zig");
+pub const WebSocketClient = @import("http/websocket/client.zig");
+const websocket_frame = @import("http/websocket/frame.zig");
 
 pub const Handler = handler.Handler;
 pub const HandleError = handler.Error;
@@ -41,6 +43,8 @@ test {
     _ = server;
     _ = socket;
     _ = WebSocket;
+    _ = WebSocketClient;
+    _ = websocket_frame;
 
     _ = signal;
     _ = handler;
