@@ -22,77 +22,58 @@ pub fn build(b: *std.Build) void {
     const run_test_step = b.step("test", "Run tests");
     run_test_step.dependOn(&run_tests.step);
 
-    {
-        const exe = b.addExecutable(.{
-            .name = "demo",
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("src/demo.zig"),
-                .target = target,
-                .optimize = optimize,
-                .strip = optimize == .ReleaseSmall,
-            }),
-        });
-        exe.root_module.addImport("vish", vish);
-        b.installArtifact(exe);
+    _ = addExecutableWithRun(b, target, optimize, vish, "demo", "src/demo.zig", "run", "Run demo");
 
-        const run_cmd = b.addRunArtifact(exe);
-        run_cmd.step.dependOn(b.getInstallStep());
-        if (b.args) |args| {
-            run_cmd.addArgs(args);
-        }
+    const demo2 = addExecutableWithRun(b, target, optimize, vish, "demo2", "src/demo2.zig", "run2", "Run demo2");
+    demo2.root_module.addImport("assets", addStaticAssets(b, target, optimize, "src/assets"));
 
-        const run_step = b.step("run", "Run demo");
-        run_step.dependOn(&run_cmd.step);
+    _ = addExecutableWithRun(
+        b,
+        target,
+        optimize,
+        vish,
+        "ws-echo",
+        "src/ws_echo.zig",
+        "ws-echo",
+        "Run the WebSocket client probe (demo2's /ws by default)",
+    );
+}
+
+/// Add an executable rooted at `source` that imports `vish_module`,
+/// install it with the default step, and register `step_name` to run
+/// it with the arguments given after `--`. Returns the compile step so
+/// further imports can be added.
+fn addExecutableWithRun(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    vish_module: *std.Build.Module,
+    name: []const u8,
+    source: []const u8,
+    step_name: []const u8,
+    description: []const u8,
+) *std.Build.Step.Compile {
+    const exe = b.addExecutable(.{
+        .name = name,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(source),
+            .target = target,
+            .optimize = optimize,
+            .strip = optimize == .ReleaseSmall,
+        }),
+    });
+    exe.root_module.addImport("vish", vish_module);
+    b.installArtifact(exe);
+
+    const run_cmd = b.addRunArtifact(exe);
+    run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        run_cmd.addArgs(args);
     }
 
-    {
-        const assets = addStaticAssets(b, target, optimize, "src/assets");
-
-        const exe = b.addExecutable(.{
-            .name = "demo2",
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("src/demo2.zig"),
-                .target = target,
-                .optimize = optimize,
-                .strip = optimize == .ReleaseSmall,
-            }),
-        });
-        exe.root_module.addImport("vish", vish);
-        exe.root_module.addImport("assets", assets);
-        b.installArtifact(exe);
-
-        const run_cmd = b.addRunArtifact(exe);
-        run_cmd.step.dependOn(b.getInstallStep());
-        if (b.args) |args| {
-            run_cmd.addArgs(args);
-        }
-
-        const run_step = b.step("run2", "Run demo2");
-        run_step.dependOn(&run_cmd.step);
-    }
-
-    {
-        const exe = b.addExecutable(.{
-            .name = "ws-echo",
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("src/ws_echo.zig"),
-                .target = target,
-                .optimize = optimize,
-                .strip = optimize == .ReleaseSmall,
-            }),
-        });
-        exe.root_module.addImport("vish", vish);
-        b.installArtifact(exe);
-
-        const run_cmd = b.addRunArtifact(exe);
-        run_cmd.step.dependOn(b.getInstallStep());
-        if (b.args) |args| {
-            run_cmd.addArgs(args);
-        }
-
-        const run_step = b.step("ws-echo", "Run the WebSocket client probe (demo2's /ws by default)");
-        run_step.dependOn(&run_cmd.step);
-    }
+    const run_step = b.step(step_name, description);
+    run_step.dependOn(&run_cmd.step);
+    return exe;
 }
 
 /// Build a module that exposes the contents of `dir` as a static asset

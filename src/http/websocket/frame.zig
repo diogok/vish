@@ -1,7 +1,6 @@
 //! WebSocket frame codec (RFC 6455 §5): header decode and encode,
 //! payload masking, opcodes and close codes, and the handshake's
-//! accept-key derivation (§4.2.2). Shared by the server session in
-//! `websocket.zig` and the client in `websocket/client.zig`.
+//! accept-key derivation (§4.2.2).
 
 /// Frame opcode (RFC 6455 §5.5). Tags 3-7 and 11-15 are reserved
 /// and never named: `readHeader` rejects them.
@@ -61,8 +60,9 @@ pub const Header = struct {
 
 pub const DecodeError = error{
     /// An RSV bit set (no extension is ever negotiated), a reserved
-    /// opcode, a fragmented or over-long control frame, or a length
-    /// beyond the address space (RFC 6455 §5.2, §5.5).
+    /// opcode, a fragmented or over-long control frame, or a 64-bit
+    /// length with its top bit set or beyond the address space (RFC
+    /// 6455 §5.2, §5.5).
     ProtocolViolation,
 } || std.Io.Reader.Error;
 
@@ -72,22 +72,26 @@ pub fn readHeader(reader: *std.Io.Reader) DecodeError!Header {
     const head = try reader.take(2);
     const fin = head[0] & 0x80 != 0;
     const rsv = (head[0] >> 4) & 0x07;
-    const op = head[0] & 0x0F;
+    const opcode_bits = head[0] & 0x0F;
     const masked = head[1] & 0x80 != 0;
     var len: usize = head[1] & 0x7F;
     if (len == 126) {
-        const ext = try reader.take(2);
-        len = @as(usize, ext[0]) * 256 + ext[1];
+        const extended = try reader.take(2);
+        len = @as(usize, extended[0]) * 256 + extended[1];
     } else if (len == 127) {
-        const ext = try reader.take(8);
+        const extended = try reader.take(8);
         var len64: u64 = 0;
-        for (ext) |byte| len64 = (len64 << 8) | byte;
+        for (extended) |byte| len64 = (len64 << 8) | byte;
+        // The top bit MUST be 0 (§5.2): a malformed header, not a
+        // large payload, so it is refused here rather than by the
+        // payload cap.
+        if (len64 >> 63 != 0) return error.ProtocolViolation;
         if (len64 > @as(u64, std.math.maxInt(usize))) return error.ProtocolViolation;
         len = @intCast(len64);
     }
     // Reserved opcodes are rejected before the enum conversion.
-    if (rsv != 0 or (op >= 3 and op <= 7) or op >= 11) return error.ProtocolViolation;
-    const opcode: OpCode = @enumFromInt(op);
+    if (rsv != 0 or (opcode_bits >= 3 and opcode_bits <= 7) or opcode_bits >= 11) return error.ProtocolViolation;
+    const opcode: OpCode = @enumFromInt(opcode_bits);
     if (opcode.control() and (!fin or len > control_payload_max)) return error.ProtocolViolation;
     return .{ .fin = fin, .opcode = opcode, .masked = masked, .len = len };
 }
@@ -198,6 +202,7 @@ test "readHeader rejects reserved bits, reserved opcodes and malformed control f
         &.{ 0x8b, 0x00 }, // opcode 11, reserved
         &.{ 0x09, 0x00 }, // ping without FIN
         &.{ 0x89, 0x7e, 0x00, 0x7e }, // ping with a 126-byte payload
+        &.{ 0x82, 0x7f, 0x80, 0, 0, 0, 0, 0, 0, 0 }, // 64-bit length with the top bit set
     };
     for (bad) |bytes| {
         var reader = std.Io.Reader.fixed(bytes);

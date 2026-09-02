@@ -1,5 +1,34 @@
 # Progress — WebSocket client
 
+## Session 2 — review fixes (2026-09-02)
+
+The review of V1-V3 applied in one commit. Comments: the `//!`
+headers of `websocket.zig`, `websocket/client.zig`,
+`websocket/frame.zig` and `root.zig` cut to orientation only; one
+`///` per client field; the session's `io` doc names the mask key.
+Code: `defaultPort` below the public methods; the client's duplicate
+`allocator` / `io` fields removed (read through `session`);
+`offered` → `findOffered`; `n` → `chunk_len`, `op` / `ext` →
+`opcode_bits` / `extended`; the TLS start's `catch` in switch form;
+`build.zig` grew `addExecutableWithRun` for demo, demo2 and ws-echo
+(steps unchanged). Correctness: `next()` reads `failed` and `closed`
+under `write_mutex` (`hasFailed` / `isClosed`, never a nested hold);
+the client fails a 101 carrying `Sec-WebSocket-Extensions` with
+`HandshakeInvalid` (§4.1 step 5); `readHeader` refuses a 64-bit
+length with bit 63 set as a protocol violation (§5.2), so it gets
+1002 rather than the payload cap's 1009. Tests: `ping` / `pong` are
+exercised in the client storm test (the pong read raw off
+`client.session.reader` while the socket is quiet); new: the canned
+extension test, a live raw-server extension test through
+`Client.connect` (`answerUpgradeOnce` on an `io.concurrent` future),
+the bit-63 live test on `WsClient`, and a bit-63 case in
+`frame.zig`. usage.md names both `SubprotocolMismatch` causes and
+the extension rule.
+
+Verified: `zig build test` 170/170 (167 before), `zig build` green
+(demo, demo2, ws-echo), `zig fmt --check` clean, and the live probe:
+demo2 in the background, `zig-out/bin/ws-echo` printed `hello`.
+
 ## Session 1 (continued) — V3 (2026-09-02)
 
 V3 landed. `Options.tls` (default false) and `Options.port: ?u16`

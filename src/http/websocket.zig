@@ -1,11 +1,7 @@
-//! WebSocket session (RFC 6455) for either end of a connection. On
-//! the server it lives inside the handler: `upgrade()` opens the
-//! handshake, `next()` blocks for the next complete message, and the
-//! loop closes the connection when the handler returns. The client
-//! in `websocket/client.zig` embeds the same session in the client
-//! role. Frame writes are serialized by a mutex, so any number of
-//! tasks may send while one task blocks in `next()`; the payloads
-//! `next()` returns belong to that one task.
+//! WebSocket session (RFC 6455) for either end of a connection. Frame
+//! writes are serialized by a mutex, so any number of tasks may send
+//! while one task blocks in `next()`; the payloads `next()` returns
+//! belong to that reader task until its next call.
 
 pub const OpCode = frame.OpCode;
 pub const CloseCode = frame.CloseCode;
@@ -37,8 +33,8 @@ writer: *std.Io.Writer,
 transport_writer: ?*std.Io.Writer = null,
 allocator: std.mem.Allocator,
 role: Role = .server,
-/// The connection's `Io`: backs the write mutex and the idle
-/// deadline.
+/// The connection's `Io`: backs the write mutex, the idle deadline
+/// and the per-frame mask key.
 io: std.Io,
 /// The connection's socket, taken from the request; null outside a
 /// live connection (tests), which disables the idle deadline.
@@ -84,7 +80,8 @@ violated: bool = false,
 max_payload: usize = max_payload_default,
 /// Serializes frame writes: `next()` writes pongs and Close frames
 /// from the reader task while sender tasks write data frames. The
-/// state checks that gate a write run under the same hold.
+/// `closed` and `failed` gates are read and written under the same
+/// hold.
 write_mutex: std.Io.Mutex = .init,
 
 const key_b64_len = frame.key_b64_len;
@@ -216,7 +213,7 @@ pub fn upgrade(req: Request, res: *Response) !@This() {
 /// `idle_timeout_in_millis` set, a silent peer is sent Close 1001
 /// and `next()` returns `error.Timeout`.
 pub fn next(self: *@This()) !Message {
-    if (self.failed) return error.ReadFailed;
+    if (self.hasFailed()) return error.ReadFailed;
     if (self.violated) return error.ProtocolError;
     while (true) {
         try self.waitForFrame();
@@ -300,7 +297,7 @@ pub fn next(self: *@This()) !Message {
                 self.frag_len = 0;
                 // Sent before the peer saw our Close: legal, and
                 // discarded (§1.4) while its Close is awaited.
-                if (self.closed) continue;
+                if (self.isClosed()) continue;
                 if (message_opcode == .text) {
                     if (!std.unicode.utf8ValidateSlice(message)) {
                         return self.failProtocol(.invalid_payload, "");
@@ -354,12 +351,29 @@ fn sendData(self: *@This(), opcode: OpCode, payload: []const u8) void {
     // §5.5). Over-length input is dropped whole: a truncated pong
     // would no longer match its ping.
     if ((opcode == .ping or opcode == .pong) and payload.len > control_payload_max) return;
+
     self.write_mutex.lockUncancelable(self.io);
     defer self.write_mutex.unlock(self.io);
     // Checked under the lock: a Close going out on another task
     // must not be followed by this frame.
     if (self.closed or self.failed) return;
     self.writeFrame(true, opcode, &[_][]const u8{payload}) catch {};
+}
+
+/// `closed` as seen under the write lock, where sender tasks set it.
+/// For the reader task, which holds no lock while it reads frames.
+fn isClosed(self: *@This()) bool {
+    self.write_mutex.lockUncancelable(self.io);
+    defer self.write_mutex.unlock(self.io);
+    return self.closed;
+}
+
+/// `failed` as seen under the write lock, where a failed write on
+/// any task latches it.
+fn hasFailed(self: *@This()) bool {
+    self.write_mutex.lockUncancelable(self.io);
+    defer self.write_mutex.unlock(self.io);
+    return self.failed;
 }
 
 /// Wait for the first byte of the next frame under the idle
@@ -480,12 +494,12 @@ fn writeFrameParts(self: *@This(), fin: bool, opcode: OpCode, parts: []const []c
         for (parts) |part| {
             var rest = part;
             while (rest.len > 0) {
-                const n = @min(rest.len, chunk.len);
-                @memcpy(chunk[0..n], rest[0..n]);
-                frame.mask(chunk[0..n], mask_key, offset);
-                try self.writer.writeAll(chunk[0..n]);
-                offset += n;
-                rest = rest[n..];
+                const chunk_len = @min(rest.len, chunk.len);
+                @memcpy(chunk[0..chunk_len], rest[0..chunk_len]);
+                frame.mask(chunk[0..chunk_len], mask_key, offset);
+                try self.writer.writeAll(chunk[0..chunk_len]);
+                offset += chunk_len;
+                rest = rest[chunk_len..];
             }
         }
     } else {
@@ -1607,8 +1621,8 @@ const WsEchoHandler = struct {
         while (true) {
             const msg = ws.next() catch return;
             switch (msg) {
-                .text => |t| self.echo(&ws, .text, t),
-                .binary => |b| self.echo(&ws, .binary, b),
+                .text => |text| self.echo(&ws, .text, text),
+                .binary => |binary| self.echo(&ws, .binary, binary),
                 .close => return,
             }
         }
@@ -2212,9 +2226,96 @@ test "integration: a client sender task and the client's pongs share the socket 
     }
     senders.await(io) catch {};
 
+    // The socket is quiet now, so the pong answering a ping can be read
+    // off the wire before `next()` would discard it. An unsolicited
+    // pong is a heartbeat the server ignores (RFC 6455 §5.5.3).
+    client.ping("probe");
+    const pong_frame = try readUnmaskedFrame(client.session.reader, allocator);
+    defer allocator.free(pong_frame.payload);
+    try testing.expectEqual(@as(u8, 0xA), pong_frame.opcode);
+    try testing.expectEqualStrings("probe", pong_frame.payload);
+    client.pong("heartbeat");
+    client.sendText("after");
+    try testing.expectEqualStrings("after", (try client.next()).text);
+
     client.close(.normal_closure, "");
     try testing.expectEqual(@as(u16, 1000), (try client.next()).close.code);
     try testing.expectError(error.EndOfStream, client.next());
+}
+
+test "integration: a 64-bit length with its top bit set gets Close 1002, not 1009" {
+    // RFC 6455 §5.2: the most significant bit of a 64-bit payload
+    // length MUST be 0. Such a header is malformed, so the answer is
+    // 1002 rather than the 1009 an over-cap length gets.
+    const io = testing.io;
+    const allocator = testing.allocator;
+
+    var ts: WsTestServer = undefined;
+    try ts.start(io, allocator, .{});
+    defer ts.stop();
+    var client: WsClient = .{ .stream = undefined };
+    try client.open(io, &ts);
+    defer client.stream.close(io);
+
+    // FIN + binary; mask bit + 127; the length 2^63; a mask key.
+    const header = [_]u8{ 0x82, 0xff, 0x80, 0, 0, 0, 0, 0, 0, 0, 0x37, 0xfa, 0x21, 0x3d };
+    try client.writer.interface.writeAll(&header);
+    try client.writer.interface.flush();
+    const closing = try readUnmaskedFrame(&client.reader.interface, allocator);
+    defer allocator.free(closing.payload);
+    try testing.expectEqual(@as(u8, 0x8), closing.opcode);
+    try testing.expectEqual(@as(u16, 1002), std.mem.readInt(u16, closing.payload[0..2], .big));
+    try testing.expectError(error.EndOfStream, client.reader.interface.take(1));
+}
+
+/// A one-shot raw server for client handshake tests: accepts one
+/// connection, answers its upgrade request with a 101 carrying the
+/// right accept key plus `extra_headers`, and waits for the client to
+/// hang up.
+fn answerUpgradeOnce(io: std.Io, server: *std.Io.net.Server, extra_headers: []const u8) anyerror!void {
+    var stream = try server.accept(io);
+    defer stream.close(io);
+    var rbuf: [4096]u8 = undefined;
+    var reader = stream.reader(io, &rbuf);
+    var head_buf: [8192]u8 = undefined;
+    const head = try readHandshake(&reader.interface, &head_buf);
+    const key_prefix = "Sec-WebSocket-Key: ";
+    const key_at = (std.mem.indexOf(u8, head, key_prefix) orelse return error.KeyMissing) + key_prefix.len;
+    const accept = frame.acceptKey(head[key_at..][0..frame.key_b64_len]);
+    var wbuf: [1024]u8 = undefined;
+    var writer = stream.writer(io, &wbuf);
+    try writer.interface.print(
+        "HTTP/1.1 101 Switching Protocols\r\n" ++
+            "Upgrade: websocket\r\n" ++
+            "Connection: Upgrade\r\n" ++
+            "Sec-WebSocket-Accept: {s}\r\n" ++
+            "{s}\r\n",
+        .{ &accept, extra_headers },
+    );
+    try writer.interface.flush();
+    _ = reader.interface.take(1) catch {};
+}
+
+test "integration: the client fails a 101 that names an extension it did not request" {
+    // RFC 6455 §4.1 step 5: the client requests no extension, so any
+    // `Sec-WebSocket-Extensions` in the 101 fails the handshake.
+    const io = testing.io;
+    const allocator = testing.allocator;
+
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(io, .{});
+    defer server.deinit(io);
+    var server_task = try io.concurrent(answerUpgradeOnce, .{ io, &server, "Sec-WebSocket-Extensions: permessage-deflate\r\n" });
+    defer server_task.cancel(io) catch {};
+
+    var result = Client.connect(io, allocator, .{
+        .host = "127.0.0.1",
+        .port = server.socket.address.getPort(),
+        .path = "/ws",
+    });
+    defer if (result) |*client| client.deinit() else |_| {};
+    try testing.expectError(error.HandshakeInvalid, result);
+    try server_task.await(io);
 }
 
 const std = @import("std");

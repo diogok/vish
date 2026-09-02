@@ -1,27 +1,26 @@
-//! WebSocket client (RFC 6455 §4.1). `connect` opens the TCP
-//! connection — with TLS layered over it on request — runs the
-//! opening handshake and returns a client whose `next()` and send
-//! methods follow the server session's contract, every outbound
-//! frame masked. The client owns its socket and buffers; `deinit`
-//! releases them.
+//! WebSocket client (RFC 6455 §4.1). `connect` opens the connection,
+//! plain or over TLS, runs the opening handshake and returns a client
+//! whose `next()` and send methods follow the session's contract, every
+//! outbound frame masked. It owns its socket and buffers until `deinit`.
 
 /// The session. Its `max_payload` and `idle_timeout_in_millis` come
 /// from `Options` and may still be changed before the first `next()`.
 session: WebSocket,
-allocator: std.mem.Allocator,
-io: std.Io,
 stream: std.Io.net.Stream,
-/// Heap objects: the session holds pointers to their interfaces, so
-/// a client returned by value stays valid.
+/// The socket's read end, heap-allocated: the session holds a pointer
+/// to its interface, so a client returned by value stays valid.
 stream_reader: *std.Io.net.Stream.Reader,
+/// The socket's write end, heap-allocated for the same reason as
+/// `stream_reader`.
 stream_writer: *std.Io.net.Stream.Writer,
 read_buffer: []u8,
 write_buffer: []u8,
 /// TLS state when `Options.tls` was set: the session then reads and
 /// writes through it. Heap-allocated like the stream ends.
 tls: ?*std.crypto.tls.Client = null,
-/// Plaintext buffers of the TLS layer; empty without TLS.
+/// Plaintext read buffer of the TLS layer; empty without TLS.
 tls_read_buffer: []u8 = &.{},
+/// Plaintext write buffer of the TLS layer; empty without TLS.
 tls_write_buffer: []u8 = &.{},
 /// The subprotocol the server selected — one of those offered — or
 /// null when none was offered. Owned by the client.
@@ -53,10 +52,11 @@ pub const Options = struct {
     max_payload: usize = WebSocket.max_payload_default,
     /// See `WebSocket.idle_timeout_in_millis`. Ignored over TLS.
     idle_timeout_in_millis: u32 = 0,
-    /// Socket buffers; over TLS, the plaintext buffers in front of
-    /// the records instead (the write one capped at one record). A
-    /// handshake response line must fit the read buffer.
+    /// Socket read buffer; over TLS, the plaintext read-ahead in front
+    /// of the records instead. A handshake response line must fit it.
     read_buffer_size: usize = 8 * 1024,
+    /// Socket write buffer; over TLS, the plaintext write buffer
+    /// instead, capped at one record.
     write_buffer_size: usize = 8 * 1024,
 };
 
@@ -64,7 +64,8 @@ pub const Options = struct {
 /// the socket's and the allocator's. `HandshakeRejected`: a status
 /// other than 101. `HandshakeInvalid`: a 101 without
 /// `Upgrade: websocket`, `Connection: Upgrade` or the expected
-/// `Sec-WebSocket-Accept`, or a malformed response.
+/// `Sec-WebSocket-Accept`, one naming a `Sec-WebSocket-Extensions`
+/// (none is ever requested), or a malformed response.
 /// `SubprotocolMismatch`: subprotocols were offered and the server
 /// selected none of them, or one that was not offered. A peer that
 /// closes mid-handshake is `error.EndOfStream`.
@@ -77,11 +78,6 @@ const tls_record_max = std.crypto.tls.Client.min_buffer_len;
 /// Largest plaintext write buffer over TLS: a flush must fit in one
 /// record.
 const tls_plaintext_write_max = std.crypto.tls.max_ciphertext_inner_record_len;
-
-/// The port implied by the scheme (RFC 6455 §3).
-fn defaultPort(tls_on: bool) u16 {
-    return if (tls_on) 443 else 80;
-}
 
 /// Connect, handshake and return the open session. Returns the
 /// `HandshakeError`s, `error.EndOfStream` for a peer that closed
@@ -159,8 +155,6 @@ pub fn connect(io: std.Io, allocator: std.mem.Allocator, options: Options) !@Thi
             .max_payload = options.max_payload,
             .idle_timeout_in_millis = if (options.tls) 0 else options.idle_timeout_in_millis,
         },
-        .allocator = allocator,
-        .io = io,
         .stream = stream,
         .stream_reader = stream_reader,
         .stream_writer = stream_writer,
@@ -178,20 +172,21 @@ pub fn connect(io: std.Io, allocator: std.mem.Allocator, options: Options) !@Thi
 /// `next()` returns `.close` or fails, then `deinit`. Over TLS a
 /// `close_notify` is sent best effort.
 pub fn deinit(self: *@This()) void {
+    const allocator = self.session.allocator;
     self.session.deinit();
     if (self.tls) |client| {
         client.end() catch {};
         self.stream_writer.interface.flush() catch {};
-        self.allocator.destroy(client);
+        allocator.destroy(client);
     }
-    self.stream.close(self.io);
-    if (self.subprotocol) |name| self.allocator.free(name);
-    self.allocator.free(self.tls_read_buffer);
-    self.allocator.free(self.tls_write_buffer);
-    self.allocator.free(self.read_buffer);
-    self.allocator.free(self.write_buffer);
-    self.allocator.destroy(self.stream_reader);
-    self.allocator.destroy(self.stream_writer);
+    self.stream.close(self.session.io);
+    if (self.subprotocol) |name| allocator.free(name);
+    allocator.free(self.tls_read_buffer);
+    allocator.free(self.tls_write_buffer);
+    allocator.free(self.read_buffer);
+    allocator.free(self.write_buffer);
+    allocator.destroy(self.stream_reader);
+    allocator.destroy(self.stream_writer);
 }
 
 /// Read the next complete message; the contract is `WebSocket.next`.
@@ -229,12 +224,18 @@ pub fn close(self: *@This(), code: CloseCode, reason: []const u8) void {
     self.session.close(code, reason);
 }
 
+/// The port implied by the scheme (RFC 6455 §3).
+fn defaultPort(tls_on: bool) u16 {
+    return if (tls_on) 443 else 80;
+}
+
 /// Connect to `host`:`port`: an IP literal directly, a name through
 /// the resolver.
 fn connectTcp(io: std.Io, host: []const u8, port: u16) !std.Io.net.Stream {
     if (std.Io.net.IpAddress.parse(host, port)) |address| {
         return std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream });
     } else |_| {}
+
     const name = try std.Io.net.HostName.init(host);
     return name.connect(io, port, .{ .mode = .stream });
 }
@@ -275,11 +276,12 @@ fn startTls(
         .entropy = &entropy,
         .realtime_now = now,
         .alert = &alert,
-    }) catch |err| {
-        if (err == error.TlsAlert) {
+    }) catch |err| switch (err) {
+        error.TlsAlert => {
             log.debug("TLS handshake alert: {t} {t}", .{ alert.level, alert.description });
-        }
-        return err;
+            return err;
+        },
+        else => |other| return other,
     };
     return client;
 }
@@ -345,7 +347,11 @@ fn handshake(
         } else if (std.ascii.eqlIgnoreCase(name, "Sec-WebSocket-Protocol")) {
             // §4.1 step 6: a subprotocol that was not offered fails
             // the handshake.
-            selected = offered(options.subprotocols, value) orelse return error.SubprotocolMismatch;
+            selected = findOffered(options.subprotocols, value) orelse return error.SubprotocolMismatch;
+        } else if (std.ascii.eqlIgnoreCase(name, "Sec-WebSocket-Extensions")) {
+            // §4.1 step 5: an extension the client did not request —
+            // it requests none — fails the handshake.
+            if (value.len > 0) return error.HandshakeInvalid;
         }
     }
     if (!upgrade_ok or !connection_ok or !accept_ok) return error.HandshakeInvalid;
@@ -385,7 +391,7 @@ fn hasToken(list: []const u8, token: []const u8) bool {
 
 /// The offered subprotocol equal to `value` — byte-wise: subprotocol
 /// names are case-sensitive tokens — or null.
-fn offered(subprotocols: []const []const u8, value: []const u8) ?[]const u8 {
+fn findOffered(subprotocols: []const []const u8, value: []const u8) ?[]const u8 {
     for (subprotocols) |name| {
         if (std.mem.eql(u8, name, value)) return name;
     }
@@ -512,6 +518,15 @@ test "handshake accepts a Connection token list and mixed-case names" {
         .{ .host = "h" },
     );
     try testing.expect(selected == null);
+}
+
+test "handshake rejects a 101 that names an extension" {
+    // No extension is ever requested (RFC 6455 §4.1 step 5); an
+    // empty header names none and passes.
+    const with_extension = valid_101[0 .. valid_101.len - 2] ++ "Sec-WebSocket-Extensions: permessage-deflate\r\n\r\n";
+    try testing.expectError(error.HandshakeInvalid, handshakeAgainst(with_extension, .{ .host = "h" }));
+    const with_empty = valid_101[0 .. valid_101.len - 2] ++ "Sec-WebSocket-Extensions:\r\n\r\n";
+    try testing.expect(try handshakeAgainst(with_empty, .{ .host = "h" }) == null);
 }
 
 test "handshake rejects a malformed header line" {
