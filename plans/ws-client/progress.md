@@ -1,5 +1,35 @@
 # Progress — WebSocket client
 
+## Session 1 (continued) — V3 (2026-09-02)
+
+V3 landed. `Options.tls` (default false) and `Options.port: ?u16`
+(null = 80, or 443 with `tls`). `connect` sizes the socket ends at
+`min_buffer_len` under TLS, allocates the plaintext buffers
+(`read_buffer_size` + a record; `write_buffer_size` capped at one
+record), runs `startTls` — system CA bundle via
+`Certificate.Bundle.rescan`, `host = .{ .explicit }`, entropy from
+`io.randomSecure`, a TLS alert logged at debug — and hands the TLS
+client's reader/writer to the session with the socket writer as
+`WebSocket.transport_writer`, flushed after every frame (the
+stdlib's TLS writer leaves records in the socket buffer). The idle
+deadline is off under TLS. `deinit` sends `close_notify` best
+effort. `ws_echo.zig` takes `wss://` and logs vish at debug.
+
+Verified: `zig build test` 167/167 (one new port test; the plain
+path's tests unchanged), `zig build` green, `zig fmt` clean. Live,
+through `zig-out/bin/ws-echo`: `wss://ws.postman-echo.com/raw`
+echoed `hello from vish`; `wss://echo.websocket.org/` printed its
+greeting then the echo; both ran the close handshake and exited 0.
+Negative: `wss://wrong.host.badssl.com/` → `CertificateHostMismatch`,
+`wss://self-signed.badssl.com/` → `TlsCertificateNotVerified`,
+`wss://expired.badssl.com/` → `CertificateExpired`. Not verified:
+TLS under the unit suite (no stdlib TLS server), large (> one
+record) payloads over TLS, and a server that drops TLS without
+`close_notify` (expected: `ReadFailed` from `next()`, since
+`allow_truncation_attacks` stays false).
+
+Plan complete; merging is the user's call.
+
 ## Session 1 (continued) — V2 (2026-09-02)
 
 V2 landed. `src/http/websocket/frame.zig` holds the codec (`OpCode`,

@@ -1,8 +1,9 @@
 //! WebSocket client (RFC 6455 §4.1). `connect` opens the TCP
-//! connection, runs the opening handshake and returns a client whose
-//! `next()` and send methods follow the server session's contract,
-//! every outbound frame masked. The client owns its socket and
-//! buffers; `deinit` releases them.
+//! connection — with TLS layered over it on request — runs the
+//! opening handshake and returns a client whose `next()` and send
+//! methods follow the server session's contract, every outbound
+//! frame masked. The client owns its socket and buffers; `deinit`
+//! releases them.
 
 /// The session. Its `max_payload` and `idle_timeout_in_millis` come
 /// from `Options` and may still be changed before the first `next()`.
@@ -16,6 +17,12 @@ stream_reader: *std.Io.net.Stream.Reader,
 stream_writer: *std.Io.net.Stream.Writer,
 read_buffer: []u8,
 write_buffer: []u8,
+/// TLS state when `Options.tls` was set: the session then reads and
+/// writes through it. Heap-allocated like the stream ends.
+tls: ?*std.crypto.tls.Client = null,
+/// Plaintext buffers of the TLS layer; empty without TLS.
+tls_read_buffer: []u8 = &.{},
+tls_write_buffer: []u8 = &.{},
 /// The subprotocol the server selected — one of those offered — or
 /// null when none was offered. Owned by the client.
 subprotocol: ?[]const u8 = null,
@@ -24,11 +31,17 @@ pub const Message = WebSocket.Message;
 pub const CloseCode = WebSocket.CloseCode;
 
 pub const Options = struct {
-    /// Host name or IP literal to connect to; also the `Host` header.
+    /// Host name or IP literal to connect to; also the `Host` header
+    /// and, over TLS, the name the server certificate must match.
     host: []const u8,
-    port: u16 = default_port,
+    /// Null: the scheme's default, 80 or 443 with `tls`.
+    port: ?u16 = null,
     /// Request target of the handshake.
     path: []const u8 = "/",
+    /// Layer TLS over the connection (`wss://`): the server
+    /// certificate is verified against the system CA bundle and must
+    /// match `host`. The idle deadline is not available over TLS.
+    tls: bool = false,
     /// Additional request headers (`Authorization`, `Cookie`), sent
     /// as given.
     headers: []const ExtraHeader = &.{},
@@ -38,10 +51,11 @@ pub const Options = struct {
     subprotocols: []const []const u8 = &.{},
     /// See `WebSocket.max_payload`.
     max_payload: usize = WebSocket.max_payload_default,
-    /// See `WebSocket.idle_timeout_in_millis`.
+    /// See `WebSocket.idle_timeout_in_millis`. Ignored over TLS.
     idle_timeout_in_millis: u32 = 0,
-    /// Socket buffers. A handshake response line must fit the read
-    /// buffer.
+    /// Socket buffers; over TLS, the plaintext buffers in front of
+    /// the records instead (the write one capped at one record). A
+    /// handshake response line must fit the read buffer.
     read_buffer_size: usize = 8 * 1024,
     write_buffer_size: usize = 8 * 1024,
 };
@@ -56,46 +70,94 @@ pub const Options = struct {
 /// closes mid-handshake is `error.EndOfStream`.
 pub const HandshakeError = error{ HandshakeRejected, HandshakeInvalid, SubprotocolMismatch };
 
-/// The port implied by `ws://` (RFC 6455 §3).
-const default_port = 80;
 /// Bytes of a refused status line that make it into the debug log.
 const status_log_max = 64;
+/// Socket buffer size over TLS: each end must hold a whole record.
+const tls_record_max = std.crypto.tls.Client.min_buffer_len;
+/// Largest plaintext write buffer over TLS: a flush must fit in one
+/// record.
+const tls_plaintext_write_max = std.crypto.tls.max_ciphertext_inner_record_len;
+
+/// The port implied by the scheme (RFC 6455 §3).
+fn defaultPort(tls_on: bool) u16 {
+    return if (tls_on) 443 else 80;
+}
 
 /// Connect, handshake and return the open session. Returns the
 /// `HandshakeError`s, `error.EndOfStream` for a peer that closed
-/// mid-handshake, and the resolver's, socket's and allocator's errors.
+/// mid-handshake, the TLS handshake's errors (certificate
+/// verification included) with `tls`, and the resolver's, socket's
+/// and allocator's errors.
 pub fn connect(io: std.Io, allocator: std.mem.Allocator, options: Options) !@This() {
-    const read_buffer = try allocator.alloc(u8, options.read_buffer_size);
+    const socket_read_size = if (options.tls) tls_record_max else options.read_buffer_size;
+    const socket_write_size = if (options.tls) tls_record_max else options.write_buffer_size;
+    const read_buffer = try allocator.alloc(u8, socket_read_size);
     errdefer allocator.free(read_buffer);
-    const write_buffer = try allocator.alloc(u8, options.write_buffer_size);
+    const write_buffer = try allocator.alloc(u8, socket_write_size);
     errdefer allocator.free(write_buffer);
+    // The plaintext reader must hold a whole decrypted record plus the
+    // read-ahead asked for.
+    const tls_read_buffer: []u8 = if (options.tls)
+        try allocator.alloc(u8, tls_record_max + options.read_buffer_size)
+    else
+        &.{};
+    errdefer allocator.free(tls_read_buffer);
+    const tls_write_buffer: []u8 = if (options.tls)
+        try allocator.alloc(u8, @min(options.write_buffer_size, tls_plaintext_write_max))
+    else
+        &.{};
+    errdefer allocator.free(tls_write_buffer);
     const stream_reader = try allocator.create(std.Io.net.Stream.Reader);
     errdefer allocator.destroy(stream_reader);
     const stream_writer = try allocator.create(std.Io.net.Stream.Writer);
     errdefer allocator.destroy(stream_writer);
 
-    const stream = try connectTcp(io, options.host, options.port);
+    const port = options.port orelse defaultPort(options.tls);
+    const stream = try connectTcp(io, options.host, port);
     errdefer stream.close(io);
     stream_reader.* = stream.reader(io, read_buffer);
     stream_writer.* = stream.writer(io, write_buffer);
+
+    // The socket's own error is what explains a `ReadFailed` or
+    // `WriteFailed` out of the TLS or WebSocket handshake.
+    errdefer {
+        if (stream_reader.err) |err| log.debug("WebSocket connect: socket read failed: {t}", .{err});
+        if (stream_writer.err) |err| log.debug("WebSocket connect: socket write failed: {t}", .{err});
+    }
+
+    var reader: *std.Io.Reader = &stream_reader.interface;
+    var writer: *std.Io.Writer = &stream_writer.interface;
+    var transport: ?*std.Io.Writer = null;
+    var tls_client: ?*std.crypto.tls.Client = null;
+    errdefer if (tls_client) |client| allocator.destroy(client);
+    if (options.tls) {
+        const client = try startTls(io, allocator, reader, writer, tls_read_buffer, tls_write_buffer, options.host);
+        tls_client = client;
+        reader = &client.reader;
+        writer = &client.writer;
+        transport = &stream_writer.interface;
+    }
 
     var key_raw: [frame.key_raw_len]u8 = undefined;
     io.random(&key_raw);
     var key: [frame.key_b64_len]u8 = undefined;
     _ = std.base64.standard.Encoder.encode(&key, &key_raw);
-    const selected = try handshake(&stream_reader.interface, &stream_writer.interface, &key, options);
+    const selected = try handshake(reader, writer, transport, &key, options);
     const subprotocol: ?[]const u8 = if (selected) |name| try allocator.dupe(u8, name) else null;
 
     return .{
         .session = .{
-            .reader = &stream_reader.interface,
-            .writer = &stream_writer.interface,
+            .reader = reader,
+            .writer = writer,
+            .transport_writer = transport,
             .allocator = allocator,
             .io = io,
-            .stream = stream,
+            // The idle deadline peeks the socket, which under TLS may
+            // hold a record the session has not decrypted yet: off.
+            .stream = if (options.tls) null else stream,
             .role = .client,
             .max_payload = options.max_payload,
-            .idle_timeout_in_millis = options.idle_timeout_in_millis,
+            .idle_timeout_in_millis = if (options.tls) 0 else options.idle_timeout_in_millis,
         },
         .allocator = allocator,
         .io = io,
@@ -104,17 +166,28 @@ pub fn connect(io: std.Io, allocator: std.mem.Allocator, options: Options) !@Thi
         .stream_writer = stream_writer,
         .read_buffer = read_buffer,
         .write_buffer = write_buffer,
+        .tls = tls_client,
+        .tls_read_buffer = tls_read_buffer,
+        .tls_write_buffer = tls_write_buffer,
         .subprotocol = subprotocol,
     };
 }
 
-/// Close the socket and free the client's memory. Runs no close
-/// handshake: for an orderly shutdown call `close`, read until
-/// `next()` returns `.close` or fails, then `deinit`.
+/// Close the socket and free the client's memory. Runs no WebSocket
+/// close handshake: for an orderly shutdown call `close`, read until
+/// `next()` returns `.close` or fails, then `deinit`. Over TLS a
+/// `close_notify` is sent best effort.
 pub fn deinit(self: *@This()) void {
     self.session.deinit();
+    if (self.tls) |client| {
+        client.end() catch {};
+        self.stream_writer.interface.flush() catch {};
+        self.allocator.destroy(client);
+    }
     self.stream.close(self.io);
     if (self.subprotocol) |name| self.allocator.free(name);
+    self.allocator.free(self.tls_read_buffer);
+    self.allocator.free(self.tls_write_buffer);
     self.allocator.free(self.read_buffer);
     self.allocator.free(self.write_buffer);
     self.allocator.destroy(self.stream_reader);
@@ -166,20 +239,69 @@ fn connectTcp(io: std.Io, host: []const u8, port: u16) !std.Io.net.Stream {
     return name.connect(io, port, .{ .mode = .stream });
 }
 
+/// Run the TLS handshake over the socket ends. The server certificate
+/// is verified against the system CA bundle, loaded for this
+/// connection, and must match `host`.
+fn startTls(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    input: *std.Io.Reader,
+    output: *std.Io.Writer,
+    read_buffer: []u8,
+    write_buffer: []u8,
+    host: []const u8,
+) !*std.crypto.tls.Client {
+    var bundle: std.crypto.Certificate.Bundle = .empty;
+    defer bundle.deinit(allocator);
+    const now = std.Io.Clock.real.now(io);
+    try bundle.rescan(allocator, io, now);
+    var bundle_lock: std.Io.RwLock = .init;
+    var entropy: [std.crypto.tls.Client.Options.entropy_len]u8 = undefined;
+    try io.randomSecure(&entropy);
+
+    const client = try allocator.create(std.crypto.tls.Client);
+    errdefer allocator.destroy(client);
+    var alert: std.crypto.tls.Alert = undefined;
+    client.* = std.crypto.tls.Client.init(input, output, .{
+        .host = .{ .explicit = host },
+        .ca = .{ .bundle = .{
+            .gpa = allocator,
+            .io = io,
+            .lock = &bundle_lock,
+            .bundle = &bundle,
+        } },
+        .read_buffer = read_buffer,
+        .write_buffer = write_buffer,
+        .entropy = &entropy,
+        .realtime_now = now,
+        .alert = &alert,
+    }) catch |err| {
+        if (err == error.TlsAlert) {
+            log.debug("TLS handshake alert: {t} {t}", .{ alert.level, alert.description });
+        }
+        return err;
+    };
+    return client;
+}
+
 /// Send the opening handshake carrying `key` and validate the
 /// response (RFC 6455 §4.1, §4.2.2). Returns the subprotocol the
 /// server selected — a member of `options.subprotocols` — or null.
 /// The reader is left at the first byte after the response head.
+/// `transport` is flushed after `writer` when given (TLS).
 fn handshake(
     reader: *std.Io.Reader,
     writer: *std.Io.Writer,
+    transport: ?*std.Io.Writer,
     key: *const [frame.key_b64_len]u8,
     options: Options,
 ) (HandshakeError || std.Io.Reader.Error || std.Io.Writer.Error)!?[]const u8 {
     try writer.print("GET {s} HTTP/1.1\r\nHost: {s}", .{ options.path, options.host });
-    // The default port is implied by the scheme; any other one is
-    // spelled out (§4.1).
-    if (options.port != default_port) try writer.print(":{d}", .{options.port});
+    // The scheme's default port is implied; any other one is spelled
+    // out (§4.1).
+    if (options.port) |port| {
+        if (port != defaultPort(options.tls)) try writer.print(":{d}", .{port});
+    }
     try writer.writeAll("\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ");
     try writer.writeAll(key);
     try writer.writeAll("\r\nSec-WebSocket-Version: 13\r\n");
@@ -194,6 +316,7 @@ fn handshake(
     for (options.headers) |header| try writer.print("{s}: {s}\r\n", .{ header.name, header.value });
     try writer.writeAll("\r\n");
     try writer.flush();
+    if (transport) |socket_writer| try socket_writer.flush();
 
     const status_line = try takeLine(reader);
     if (!statusIs101(status_line)) {
@@ -283,14 +406,14 @@ fn handshakeAgainst(response_bytes: []const u8, options: Options) !?[]const u8 {
     var out: [512]u8 = undefined;
     var request = std.Io.Writer.fixed(&out);
     var reader = std.Io.Reader.fixed(response_bytes);
-    return handshake(&reader, &request, sample_key, options);
+    return handshake(&reader, &request, null, sample_key, options);
 }
 
 test "handshake sends the request and accepts a valid 101" {
     var out: [512]u8 = undefined;
     var request = std.Io.Writer.fixed(&out);
     var reader = std.Io.Reader.fixed(valid_101 ++ "\x81");
-    const selected = try handshake(&reader, &request, sample_key, .{
+    const selected = try handshake(&reader, &request, null, sample_key, .{
         .host = "example.com",
         .port = 8080,
         .path = "/chat",
@@ -323,7 +446,7 @@ test "handshake omits the default port from Host and lists the offered subprotoc
             "Sec-WebSocket-Protocol: chat\r\n" ++
             "\r\n",
     );
-    const selected = try handshake(&reader, &request, sample_key, .{
+    const selected = try handshake(&reader, &request, null, sample_key, .{
         .host = "example.com",
         .subprotocols = &.{ "chat", "superchat" },
     });
@@ -331,6 +454,23 @@ test "handshake omits the default port from Host and lists the offered subprotoc
     const sent = out[0..request.end];
     try testing.expect(std.mem.indexOf(u8, sent, "Host: example.com\r\n") != null);
     try testing.expect(std.mem.indexOf(u8, sent, "Sec-WebSocket-Protocol: chat, superchat\r\n") != null);
+}
+
+/// The request `handshake` sends for `options`, written into `out`.
+fn requestFor(out: *[512]u8, options: Options) ![]const u8 {
+    var request = std.Io.Writer.fixed(out);
+    var reader = std.Io.Reader.fixed(valid_101);
+    _ = try handshake(&reader, &request, null, sample_key, options);
+    return out[0..request.end];
+}
+
+test "handshake spells out the port only when it is not the scheme's default" {
+    var out: [512]u8 = undefined;
+    try testing.expect(std.mem.indexOf(u8, try requestFor(&out, .{ .host = "h", .port = 80 }), "Host: h\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, try requestFor(&out, .{ .host = "h", .port = 443 }), "Host: h:443\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, try requestFor(&out, .{ .host = "h", .tls = true }), "Host: h\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, try requestFor(&out, .{ .host = "h", .tls = true, .port = 443 }), "Host: h\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, try requestFor(&out, .{ .host = "h", .tls = true, .port = 8443 }), "Host: h:8443\r\n") != null);
 }
 
 test "handshake rejects a status other than 101" {

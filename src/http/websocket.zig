@@ -31,6 +31,10 @@ pub const Message = union(enum) {
 
 reader: *std.Io.Reader,
 writer: *std.Io.Writer,
+/// Flushed after `writer` on every frame when set: a TLS layer
+/// leaves its records buffered in the socket writer underneath. Null
+/// when `writer` writes to the socket itself.
+transport_writer: ?*std.Io.Writer = null,
 allocator: std.mem.Allocator,
 role: Role = .server,
 /// The connection's `Io`: backs the write mutex and the idle
@@ -488,6 +492,7 @@ fn writeFrameParts(self: *@This(), fin: bool, opcode: OpCode, parts: []const []c
         for (parts) |part| try self.writer.writeAll(part);
     }
     try self.writer.flush();
+    if (self.transport_writer) |transport| try transport.flush();
 }
 
 const Frame = struct {

@@ -1,7 +1,7 @@
 //! Live probe for the WebSocket client: connect to an echo endpoint,
 //! send one text message and print what comes back. Usage:
-//! `ws-echo [ws://host[:port][/path]] [message]`; the defaults target
-//! demo2's `/ws` route with `hello`.
+//! `ws-echo [ws://host[:port][/path] | wss://...] [message]`; the
+//! defaults target demo2's `/ws` route with `hello`.
 
 pub fn main(init: std.process.Init) u8 {
     run(init) catch |err| {
@@ -23,6 +23,7 @@ fn run(init: std.process.Init) !void {
         .host = target.host,
         .port = target.port,
         .path = target.path,
+        .tls = target.tls,
     });
     defer client.deinit();
     log.info("connected to {s}", .{url});
@@ -54,34 +55,38 @@ fn run(init: std.process.Init) !void {
 
 const Target = struct {
     host: []const u8,
-    port: u16,
+    port: ?u16,
     path: []const u8,
+    tls: bool,
 };
 
-/// `ws://host[:port][/path]`; the host is passed through as given.
+/// `ws://host[:port][/path]` or `wss://...`; the host is passed
+/// through as given.
 fn parseUrl(url: []const u8) !Target {
-    const scheme = "ws://";
-    if (!std.mem.startsWith(u8, url, scheme)) return error.UnsupportedScheme;
-    const rest = url[scheme.len..];
+    const tls_on = std.mem.startsWith(u8, url, "wss://");
+    if (!tls_on and !std.mem.startsWith(u8, url, "ws://")) return error.UnsupportedScheme;
+    const rest = url[std.mem.indexOf(u8, url, "://").? + 3 ..];
     const slash = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
     const authority = rest[0..slash];
     const path: []const u8 = if (slash < rest.len) rest[slash..] else "/";
     var host = authority;
-    var port: u16 = 80;
+    var port: ?u16 = null;
     if (std.mem.lastIndexOfScalar(u8, authority, ':')) |colon| {
         host = authority[0..colon];
         port = try std.fmt.parseInt(u16, authority[colon + 1 ..], 10);
     }
     if (host.len == 0) return error.MissingHost;
-    return .{ .host = host, .port = port, .path = path };
+    return .{ .host = host, .port = port, .path = path, .tls = tls_on };
 }
 
 const std = @import("std");
 const vish = @import("vish");
 const log = std.log.scoped(.ws_echo);
 
+// A probe: the library's debug lines (the socket's error behind a
+// failed handshake, a TLS alert) are the point of running it.
 pub const std_options: std.Options = .{
     .log_scope_levels = &[_]std.log.ScopeLevel{
-        .{ .scope = .vish, .level = .warn },
+        .{ .scope = .vish, .level = .debug },
     },
 };

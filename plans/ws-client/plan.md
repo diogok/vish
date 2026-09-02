@@ -66,13 +66,17 @@ TLS. Server behaviour stays unchanged; the existing suite stays green.
       concurrent sender test.
 - [x] V2 — codec split, client session, tests migrated to the real
       client, in-process round-trip tests, `ws-echo` live probe.
-- [ ] V3 — `tls` connect option over `std.crypto.tls.Client`; live
+- [x] V3 — `tls` connect option over `std.crypto.tls.Client`; live
       probe against a public `wss://` echo if the network allows.
 
 ## Open risks
 
 - Under TLS the idle deadline peeks the raw socket, so a record that
   is buffered but not yet decrypted could be missed. V3 disables the
-  deadline under TLS rather than misreport a silent peer.
+  deadline under TLS rather than misreport a silent peer; a TLS
+  client that must detect a silent server pings from a timer.
 - The client's `next()` slices point into the session's receive
   buffer, like the server's: a sender task must copy before sharing.
+- The TLS path has no unit test (the stdlib has no TLS server); it
+  is covered by the `ws-echo` probes recorded in progress.md and
+  would regress silently in `zig build test`.

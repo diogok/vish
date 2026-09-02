@@ -55,7 +55,7 @@ CombinedRouter: Chains multiple handlers together, attempting each in order unti
   frames, ping/pong, and close over the upgraded connection
 - WebSocket client via `WebSocketClient.connect` — the same session
   contract from the connecting side: masked frames, subprotocols, extra
-  headers such as `Authorization`
+  headers such as `Authorization`, optionally over TLS (`wss://`)
 
 ### Compression
 

@@ -1,25 +1,27 @@
 # Handover — WebSocket client
 
-**Status: V1 and V2 committed; V3 next.** Branch `ws-client` from
-`main` at `84a0db0`.
+**Status: complete.** V1, V2 and V3 are committed on branch
+`ws-client` (from `main` at `84a0db0`); the tree is clean. No next
+task. Merging into `main` is the user's call.
 
-## Next: V3 — the `tls` option
+## Final state
 
-- Plan: `src/http/websocket/client.zig` (`connect`, the buffers,
-  `deinit`), `/home/diogo/workspace/zig/lib/std/crypto/tls/Client.zig`
-  (`Options`, `init`, `min_buffer_len`, `end`), plan.md "Verified
-  facts" (buffers, CA bundle, entropy, clock).
-- Do: `tls: bool = false` on `Options` (default port 443 when set);
-  a heap-allocated `std.crypto.tls.Client` initialised over the
-  socket reader/writer before the handshake, with the system CA
-  bundle (`Certificate.Bundle.rescan`) and `host = .{ .explicit }`;
-  the session's reader/writer become the TLS client's; the idle
-  deadline is disabled under TLS (the peek would miss a buffered
-  record); `deinit` sends `close_notify` best effort and frees the
-  TLS state; `ws_echo.zig` accepts `wss://`.
-- Verify: `zig build test --summary all` (the plain path unchanged),
-  `zig build`, `zig fmt --check src`; a live probe against a public
-  `wss://` echo if the network allows — record what was and was not
-  verified in progress.md.
+- `src/http/websocket.zig`: the session for either role; `io`
+  required; `write_mutex` around every frame write; `role`;
+  `transport_writer` for a TLS layer underneath.
+- `src/http/websocket/frame.zig`: the shared codec.
+- `src/http/websocket/client.zig` (`vish.WebSocketClient`):
+  `connect(io, allocator, Options)`, `next`, `sendText`,
+  `sendBinary`, `ping`, `pong`, `close`, `deinit`; `Options.tls`.
+- `src/ws_echo.zig`, `zig build ws-echo`: the live probe.
+- Verification of the last commit: `zig build test` 167/167,
+  `zig build` green, `zig fmt --check src` clean, and the live
+  `ws://` and `wss://` probes recorded in progress.md.
+
+## Out of scope / sanctioned
+
+- No TLS on the server side (terminate at a proxy).
+- The idle deadline is off over TLS (plan.md "Open risks").
+- No unit coverage of the TLS path (plan.md "Open risks").
 
 Baseline command: `zig build test --summary all`.
